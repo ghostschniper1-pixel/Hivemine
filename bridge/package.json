@@ -1,0 +1,19 @@
+{
+  "name": "hivemind-bridge",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Node hosts for Minecraft Hivemind: Mineflayer bots driven by the Python conductor over TCP + msgpack (see PROTOCOL.md). Game version pinned to Java Edition 1.21.1.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "3.1.3",
+    "mineflayer": "4.39.0",
+    "mineflayer-armor-manager": "2.0.1",
+    "mineflayer-auto-eat": "5.0.3",
+    "mineflayer-collectblock": "1.6.0",
+    "mineflayer-pathfinder": "2.4.5",
+    "mineflayer-tool": "1.2.0"
+  }
+}

@@ -34,3 +34,4 @@ __all__ = [
     "ToolRule",
     "load_rules",
 ]
+def load_concepts(path=None, verify=True): return __import__("hivemind.rules.classes", fromlist=["_"]).load_concepts(path, verify)  # lazy, so `python -m hivemind.rules.classes` runs without a double import
