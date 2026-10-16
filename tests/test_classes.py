@@ -93,10 +93,15 @@ def test_ids_and_reserved_classes(concepts: Concepts) -> None:
     ids = [c.id for c in concepts.block_classes]
     assert len(ids) == len(set(ids)) and max(ids) == 255
     assert all(0 <= i <= 254 for i in ids[:-1])
-    air, buried = concepts.block_class(0), concepts.block_class(255)
+    air, unseen = concepts.block_class(0), concepts.block_class(255)
     assert air.name == "air" and air.phrase == ("air",)
     assert set(air.members) == {"air", "cave_air", "void_air"}
-    assert buried.name == "buried" and buried.phrase == ("buried",) and buried.members == ()
+    # draft 0.5: a window cell the agent does not see is "unseen" ("buried" is false for a cave)
+    assert unseen.name == "unseen" and unseen.phrase == ("unseen",) and unseen.members == ()
+    assert C.UNSEEN_ID == 255 and not hasattr(C, "BURIED_ID")
+    assert concepts.block_class("unseen") is unseen and concepts.class_by_phrase("block", ("unseen",)) is unseen
+    assert not any("buried" in c.phrase or c.name == "buried" for c in concepts.block_classes)
+    assert "surface-only" in concepts.raw["block_classes"][-1]["note"]
     assert concepts.item_class(0).name == "none" and concepts.item_class_of("air").id == 0
     assert concepts.state_class.dtype == np.uint8
     for kind in ("item_classes", "entity_classes"):
@@ -104,7 +109,7 @@ def test_ids_and_reserved_classes(concepts: Concepts) -> None:
 
 
 def test_class_counts_match_the_design(concepts: Concepts) -> None:
-    curated = [c for c in concepts.block_classes if not c.fallback and c.name not in ("air", "buried")]
+    curated = [c for c in concepts.block_classes if not c.fallback and c.name not in ("air", "unseen")]
     assert 100 <= len(curated) + 1 <= 140
     resources = [c for c in concepts.block_classes if c.resource]
     assert 30 <= len(resources) <= 50  # DESIGN.md resource memory: about 40
@@ -177,7 +182,7 @@ def test_fallback_entity_kinds() -> None:
     assert kind("ghast", "mob", "Hostile mobs") == ("hostile", None)  # type "mob" says nothing
     assert kind("boat", "other", "Vehicles") == ("other", None)
     assert kind("new_mob", None, None) == ("other", None)
-    k, problem = kind("new_beast", "animal", "Hostile mobs")
+    _k, problem = kind("new_beast", "animal", "Hostile mobs")
     assert problem and "ENTITY_KIND_OVERRIDES" in problem
 
 
@@ -344,6 +349,84 @@ def test_block_and_entity_phrases_are_disjoint(concepts: Concepts) -> None:
     blocks = {c.phrase for c in concepts.block_classes}
     entities = {c.phrase for c in concepts.entity_classes}
     assert not blocks & entities
+
+
+# -- biomes ------------------------------------------------------------------------------------
+
+
+def test_biome_table_covers_every_1_21_1_biome(concepts: Concepts, rules) -> None:
+    assert len(concepts.biomes) == 64
+    assert [b.id for b in concepts.biomes] == list(range(64))
+    assert [b.name for b in concepts.biomes] == list(rules.biomes)  # registry order: ids are vanilla ids
+    for b in concepts.biomes:
+        vanilla = rules.biome(b.name)
+        assert b.id == vanilla.id and b.members == (b.name,) and not b.fallback
+        assert b.dimension == vanilla.dimension
+        assert b.overworld == rules.in_tag("worldgen/biome", b.name, "is_overworld") == (b.dimension == "overworld")
+        assert concepts.biome(b.name) is b and concepts.biome(b.id) is b and concepts.biome_of(b.name) is b
+        assert concepts.biome_overworld[b.id] == b.overworld
+    assert sum(b.overworld for b in concepts.biomes) == 53
+    assert concepts.biome("minecraft:plains") is concepts.biome_of("minecraft:plains")
+    assert not concepts.biome("nether_wastes").overworld and not concepts.biome("the_void").overworld
+    assert {"deep_dark", "lush_caves", "dripstone_caves", "cherry_grove"} <= {
+        b.name for b in concepts.biomes if b.overworld}
+    with pytest.raises(KeyError):
+        concepts.biome("pale_garden")  # 1.21.4
+    with pytest.raises(KeyError):
+        concepts.biome(64)
+
+
+@pytest.mark.parametrize("name,phrase", [
+    ("birch_forest", "birch forest"),
+    ("plains", "plains"),
+    ("old_growth_pine_taiga", "old growth pine taiga"),
+    ("windswept_gravelly_hills", "windswept gravelly hills"),
+    ("deep_dark", "deep dark"),
+    ("the_void", "the void"),
+])
+def test_biome_phrases(concepts: Concepts, name: str, phrase: str) -> None:
+    assert " ".join(concepts.biome(name).phrase) == phrase
+
+
+def test_biome_phrases_are_true_unique_and_invertible(concepts: Concepts, rules) -> None:
+    """Each phrase is its biome's English name (language.json), lower-cased and split: true of the
+    one member. Phrases are unique and name no curated block, item or entity class."""
+    phrases = [b.phrase for b in concepts.biomes]
+    assert len(phrases) == len(set(phrases))
+    others = {c.phrase for c in (*concepts.block_classes, *concepts.entity_classes) if not c.fallback}
+    others |= {c.phrase for c in concepts.item_classes if c.v1}
+    for b in concepts.biomes:
+        assert b.phrase == C.words(rules.biome(b.name).display_name), b.name
+        assert all(re.fullmatch(r"[a-z0-9]+", w) for w in b.phrase), b.name
+        assert concepts.class_by_phrase("biome", b.phrase) is b
+        assert b.phrase not in others, b.name
+
+
+def test_planted_biome_phrase_collision_is_detected(rules, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A biome phrase that equals a curated class phrase (or another biome's) fails the build."""
+    real = C._Builder.assign_biomes
+
+    def planted(self) -> None:
+        real(self)
+        self.biome_phrase["beach"] = ("stone",)  # the block class stone
+        self.biome_phrase["river"] = ("plains",)  # another biome
+    monkeypatch.setattr(C._Builder, "assign_biomes", planted)
+    found = {(v.kind, v.cls, v.check) for v in C.build(rules).violations}
+    assert ("biome", "beach", "phrase") in found and ("biome", "river", "phrase") in found
+
+
+# -- approximations of the class model ----------------------------------------------------------
+
+
+def test_class_level_stacking_is_a_listed_approximation(concepts: Concepts) -> None:
+    """Any two stacks of one item class merge in the simulator; the game stacks only identical
+    items. The exceptions list says so, with the gameplay effect and the M7 check."""
+    (e,) = [e for e in concepts.exceptions if e["check"] == "stacking"]
+    assert e["kind"] == "item" and e["class"] == "*"
+    assert "same components" in e["justification"]
+    assert "oak and birch logs" in e["approximation"] and "M7" in e["approximation"]
+    log = concepts.item_class("log")
+    assert {"oak_log", "birch_log"} <= set(log.members) and log.stack_size == 64  # what makes it true
 
 
 def test_fallbacks(concepts: Concepts, rules) -> None:

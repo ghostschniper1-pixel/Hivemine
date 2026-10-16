@@ -1,4 +1,4 @@
-"""Agent-level class tables: block, item and entity classes with English phrases (contracts 3).
+"""Agent-level class tables: block, item, entity and biome classes with English phrases (contracts 3).
 
 Usage::
 
@@ -12,6 +12,8 @@ Usage::
     concepts.entity_class_of("cave_spider").phrase # ('cave', 'spider')
     concepts.class_by_phrase("block", ("hanging", "lantern")).name  # 'other_hanging_lantern'
     concepts.hardness[concepts.block_class("stone").id]   # 1.5 (NumPy arrays for the simulator)
+    concepts.block_class(255).phrase               # ('unseen',): a window cell the agent does not see
+    concepts.biome("birch_forest").phrase          # ('birch', 'forest'); .id 4, .overworld True
 
 The build reads only ``data/rules-1.21.1.json`` (no network, no raw sources) and writes
 ``data/concepts-1.21.1.json`` and ``data/block_classes-1.21.1.csv`` (one row per block state).
@@ -43,7 +45,7 @@ no longer matches a violation also fails, so the list stays exact):
   combination of class members (e.g. ``planks <- log`` holds for every log, because each wood
   type has its own recipe). Correlated slots fail this check: a bed needs three wool of one
   colour, which the class ``wool`` cannot express.
-- Phrases: unique among the curated classes of each kind (``none``, air and buried included),
+- Phrases: unique among the curated classes of each kind (``none``, air and unseen included),
   so ``phrase`` is invertible for everything a command can name (contracts 4.4); no block-class
   phrase equals an entity-class phrase (they meet in ``go to the nearest {block}`` vs
   ``go to the nearest {entity}``). Fallback phrases must be true of every member, because their
@@ -69,6 +71,21 @@ size only, with distinct phrases. Entities outside the curated list fall into ``
 ``ENTITY_KIND_OVERRIDES`` decides (skeleton horse: animal, evoker fangs: object). Fallbacks
 are never resources and never v1 items.
 
+Reserved block classes. ``air`` is id 0 (air, cave air, void air). ``unseen`` is id 255 and
+has no members: a cell of the voxel window that the agent does not see this tick (draft 0.5,
+surface-only vision: no straight segment from the eyes reaches the cell through see-through
+cells). It is never stored in a world. Draft 0.4 called it ``buried``, which is false for a
+cave behind a wall; the id is unchanged.
+
+Biomes. ``biomes`` lists every 1.21.1 biome (the rules file's ``biomes``, i.e. the
+worldgen/biome registry) as a class of its own: ``id`` (the vanilla registry id, 0..63),
+``name``, ``phrase`` (the English name's words, from ``language.json``
+``biome.minecraft.<name>``: "birch forest", "plains", "the void"), ``members`` (the biome
+itself), ``overworld`` (in the biome tag ``is_overworld``) and ``dimension``. The debug-screen
+inputs name the biome at the agent's feet by its phrase (DESIGN.md 6.2, draft 0.5), and test
+worlds assign one biome per column. The build checks that biome phrases are lower-case words,
+unique, and equal no curated block, item or entity phrase.
+
 Representation choices not fixed by the contract (all additive):
 
 - ``collision_height`` is a height class: 0 (no collision), 0.5 (anything up to the 0.6-block
@@ -80,7 +97,10 @@ Representation choices not fixed by the contract (all additive):
   null when no tool is needed), and ``drops`` = ``{source, state, table, items}``: the class-level
   loot table (item names replaced by item-class names) evaluated at ``state``.
 - The file also lists the class-level ``recipes`` (the recipe book the checks verified) and the
-  ``exceptions`` with their approximations, plus ``rules_hash`` and ``csv_sha256``.
+  ``exceptions`` with their approximations, plus ``rules_hash`` and ``csv_sha256``. Besides the
+  tolerated violations, ``exceptions`` lists approximations built into the class model itself
+  (``_fixed_approximations``), such as class-level stacking: any two stacks of one item class
+  merge in the simulator, while the game stacks only identical items.
 """
 
 from __future__ import annotations
@@ -108,8 +128,8 @@ DEFAULT_CONCEPTS_PATH = REPO_ROOT / "data" / f"concepts-{GAME_VERSION}.json"
 DEFAULT_CSV_PATH = REPO_ROOT / "data" / f"block_classes-{GAME_VERSION}.csv"
 
 AIR_ID = 0
-BURIED_ID = 255
-MAX_BLOCK_CLASS_ID = 254  # ids 1..254 for curated and fallback classes; 255 is "buried"
+UNSEEN_ID = 255  # reserved block class "unseen": a window cell the agent cannot see (perception only)
+MAX_BLOCK_CLASS_ID = 254  # ids 1..254 for curated and fallback classes; 255 is "unseen"
 NONE_ITEM_ID = 0
 NONE_ENTITY_ID = 0
 
@@ -199,7 +219,7 @@ SMALL_FLOWERS = ("dandelion", "poppy", "blue_orchid", "allium", "azure_bluet", "
 WOODEN_DOORS = tuple(f"{w}_door" for w in (*WOODS, *WOOD_SETS))
 WOODEN_FENCES = tuple(f"{w}_fence" for w in (*WOODS, *WOOD_SETS))
 
-# Block classes in id order (air is 0, fallbacks follow, buried is 255). resource=True marks
+# Block classes in id order (air is 0, fallbacks follow, unseen is 255). resource=True marks
 # useful mine/goto targets (the notebook's resource memory).
 BLOCK_SPECS: tuple[BlockSpec, ...] = (
     B("air", "air", "cave_air", "void_air", phrase="air"),
@@ -1235,7 +1255,7 @@ class _Builder:
         self.block_spec: dict[str, BlockSpec | None] = {}
         self.block_states: dict[str, list[int]] = defaultdict(list)
         for spec in self.block_specs:
-            if spec.name in self.block_spec or spec.name == "buried":
+            if spec.name in self.block_spec or spec.name == "unseen":
                 raise BuildError(f"duplicate or reserved block class {spec.name}")
             if (spec.name == "air") != (not self.block_order):
                 raise BuildError("air must be the first block class")
@@ -1604,12 +1624,26 @@ class _Builder:
                                                                  "disagree; remove it from ENTITY_KIND_OVERRIDES")
         self.entity_id = {n: i for i, n in enumerate(self.entity_order)}
 
+    # -- biomes ----------------------------------------------------------------------------
+
+    def assign_biomes(self) -> None:
+        """One class per 1.21.1 biome, with the vanilla registry id (see the module docstring)."""
+        r = self.r
+        overworld = frozenset(r.tag("worldgen/biome", "is_overworld"))
+        biomes = sorted(r.biomes.values(), key=lambda b: b.id)
+        if [b.id for b in biomes] != list(range(len(biomes))) or len(biomes) > 256:
+            raise BuildError(f"biome ids are not 0..{len(biomes) - 1} or do not fit one byte")
+        self.biome_phrase: dict[str, tuple[str, ...]] = {b.name: words(b.display_name) for b in biomes}
+        self.biome_entries = [{"id": b.id, "name": b.name, "phrase": list(self.biome_phrase[b.name]),
+                               "members": [b.name], "overworld": b.name in overworld, "dimension": b.dimension}
+                              for b in biomes]
+
     # -- phrases ---------------------------------------------------------------------------
 
     def check_phrases(self) -> None:
         """Contracts 3: phrases are lower-case words, unique among the curated classes of each
         kind; a fallback phrase may repeat but never equals a curated phrase of its kind; air =
-        ``air`` and buried = ``buried``."""
+        ``air`` and unseen = ``unseen``."""
 
         def unique(kind: str, phrases: Mapping[str, tuple[str, ...]], fallback: Callable[[str], bool]) -> None:
             curated: dict[tuple[str, ...], str] = {}
@@ -1625,15 +1659,26 @@ class _Builder:
                     self.fail(kind, cls, "phrase", f"fallback phrase {' '.join(p)!r} equals curated class {curated[p]}")
 
         unique("block", self.block_phrase, lambda c: c in self.fallback_phrase)
-        if self.block_phrase["air"] != ("air",) or self.block_phrase["buried"] != ("buried",):
-            self.fail("block", "air", "phrase", "air must be 'air' and buried 'buried'")
+        if self.block_phrase["air"] != ("air",) or self.block_phrase["unseen"] != ("unseen",):
+            self.fail("block", "air", "phrase", "air must be 'air' and unseen 'unseen'")
         unique("item", self.item_phrase, lambda c: c.startswith("other_item_"))
         unique("entity", self.entity_phrase, lambda c: False)
+        unique("biome", self.biome_phrase, lambda c: False)
         entity_phrases = {p: c for c, p in self.entity_phrase.items()}
         for c, p in self.block_phrase.items():
             if p in entity_phrases:
                 self.fail("block", c, "phrase", f"block phrase {' '.join(p)!r} equals entity class "
                                                 f"{entity_phrases[p]}")
+        # A biome phrase is read in the debug-screen inputs, next to block phrases (the targeted
+        # block) and entity phrases (the targeted entity): it must not name a curated class too.
+        others = {}
+        for kind, phrases, fallback in (("block", self.block_phrase, lambda c: c in self.fallback_phrase),
+                                        ("item", self.item_phrase, lambda c: not self.item_v1[c]),
+                                        ("entity", self.entity_phrase, lambda c: False)):
+            others.update({p: f"{kind} class {c}" for c, p in phrases.items() if not fallback(c)})
+        for c, p in self.biome_phrase.items():
+            if p in others:
+                self.fail("biome", c, "phrase", f"biome phrase {' '.join(p)!r} equals {others[p]}")
 
     # -- assemble ---------------------------------------------------------------------------
 
@@ -1643,8 +1688,9 @@ class _Builder:
         self.assign_items()
         self.assign_blocks()
         self.assign_entities()
+        self.assign_biomes()
         self.block_phrase = {c: self.block_phrase_of(c) for c in self.block_order}
-        self.block_phrase["buried"] = ("buried",)
+        self.block_phrase["unseen"] = ("unseen",)
         self.check_blocks()
         self.check_items()
         recipes = self.class_recipes()
@@ -1664,12 +1710,15 @@ class _Builder:
 
         block_classes = [self._block_entry(c) for c in self.block_order]
         block_classes.append({
-            "id": BURIED_ID, "name": "buried", "phrase": ["buried"], "members": [], "fallback": False,
+            "id": UNSEEN_ID, "name": "unseen", "phrase": ["unseen"], "members": [], "fallback": False,
             "resource": False, "state_ranges": [], "n_states": 0, "hardness": -1.0, "mineable": [],
             "requires_tool": False, "needs_tier": None, "tool_speeds": {}, "harvest_tools": None, "drops": None,
             "flags": {"solid": True, "collision_height": 1.0, "transparent": False, "liquid": False,
                       "climbable": False, "hazard": False, "gravity": False, "replaceable": False, "light": 0},
-            "note": "perception only: an unexposed cell in the voxel window (DESIGN.md 6.1); never in a world"})
+            "note": ("perception only: a cell of the voxel window that the agent does not see this tick (no "
+                     "straight line from the eyes reaches it through see-through cells; DESIGN.md 6.1, draft 0.5 "
+                     "surface-only vision); never in a world. Its content is unknown (stone, ore, or the air of a "
+                     "cave behind a wall), so the flags are conservative placeholders: solid, opaque, unbreakable")})
         item_classes = [self._item_entry(c) for c in self.item_order]
         entity_classes = [self._entity_entry(c) for c in self.entity_order]
 
@@ -1689,6 +1738,7 @@ class _Builder:
             "block_classes": block_classes,
             "item_classes": item_classes,
             "entity_classes": entity_classes,
+            "biomes": self.biome_entries,
             "recipes": recipes,
             "exceptions": [{"kind": e.kind, "class": e.cls, "check": e.check, "justification": e.justification,
                             "approximation": e.approximation,
@@ -1701,12 +1751,17 @@ class _Builder:
         concepts["hash"] = concepts_hash(concepts)
         n_res = sum(1 for c in block_classes if c["resource"])
         self.notes.append(f"block classes: {len(block_classes)} ({self.curated_count} curated incl. air, "
-                          f"{len(self.block_order) - self.curated_count} fallback, buried); {n_res} resources")
+                          f"{len(self.block_order) - self.curated_count} fallback, unseen); {n_res} resources")
         n_v1 = sum(1 for c in item_classes if c["v1"])
         self.notes.append(f"item classes: {len(item_classes)} ({n_v1} v1, none, "
                           f"{len(item_classes) - n_v1 - 1} fallback)")
         self.notes.append(f"entity classes: {len(entity_classes)} ({len(self.entity_specs)} curated, none, "
                           f"{len(ENTITY_FALLBACKS)} fallback)")
+        n_over = sum(b["overworld"] for b in self.biome_entries)
+        self.notes.append(f"biomes: {len(self.biome_entries)} ({n_over} overworld); words in biome phrases: "
+                          f"{len({w for b in self.biome_entries for w in b['phrase']})} "
+                          f"({len({w for b in self.biome_entries if b['overworld'] for w in b['phrase']})} in "
+                          "overworld biome phrases)")
         self.notes.append(f"class-level recipes: {len(recipes)}")
         self.notes.append(f"fallback block classes with approximated light, solid or drops: "
                           f"{len(self.fallback_approx)} (listed in exceptions)")
@@ -1720,6 +1775,15 @@ class _Builder:
              "justification": "items outside v1 are grouped by stack size only",
              "approximation": "non-v1 items cannot be crafted with, eaten, worn, placed or used as tools in the "
                               "simulator; a non-v1 tool (netherite, mace, trident) mines like an empty hand"},
+            {"kind": "item", "class": "*", "check": "stacking",
+             "justification": "inventories hold item-class counts, so in the simulator any two stacks of the same "
+                              "item class merge (up to the class's stack size); in the game only identical items "
+                              "stack: the same vanilla item with the same components [mem]",
+             "approximation": "members of one class share a slot in the simulator but not in the game: oak and birch "
+                              "logs (class log), or white and red wool (class wool), fill one slot in the simulator "
+                              "and two in the game, so a real inventory fills up sooner and 'inventory full' can "
+                              "come earlier than in the simulator; unstackable items (stack size 1: tools, armor) "
+                              "are unaffected. The M7 sim-to-real check measures it"},
             {"kind": "block", "class": "*", "check": "unreachable wall states",
              "justification": "wall states with no post and no sides have no collision box but cannot occur "
                               "in normal play",
@@ -1922,6 +1986,17 @@ class EntityClass:
     height: float | None
 
 
+@dataclass(frozen=True)
+class BiomeClass:
+    id: int  # the vanilla registry id (0..63 in 1.21.1)
+    name: str
+    phrase: tuple[str, ...]  # the English name's words: ("birch", "forest")
+    members: tuple[str, ...]  # the vanilla biome itself
+    overworld: bool  # in the biome tag is_overworld
+    dimension: str | None  # "overworld" | "nether" | "end"; None for the_void
+    fallback: bool = False  # biomes are never merged (kept for symmetry with the other classes)
+
+
 def _block_class(d: dict) -> BlockClass:
     f = d["flags"]
     return BlockClass(
@@ -1948,6 +2023,11 @@ def _entity_class(d: dict) -> EntityClass:
                        phrase=tuple(d["phrase"]), members=tuple(d["members"]))
 
 
+def _biome_class(d: dict) -> BiomeClass:
+    return BiomeClass(id=d["id"], name=d["name"], phrase=tuple(d["phrase"]), members=tuple(d["members"]),
+                      overworld=d["overworld"], dimension=d["dimension"])
+
+
 class Concepts:
     """Typed, read-only access to the concepts file, with NumPy arrays for the simulator.
 
@@ -1963,8 +2043,10 @@ class Concepts:
     ``max_damage``, ``fuel_ticks``, ``nutrition`` (int32, 0 = none), ``saturation``,
     ``attack_damage``, ``attack_speed`` (float32 modifiers, 0 = none), ``armor_points`` (int32),
     ``v1`` (bool). Entity arrays by entity-class id: ``max_health``, ``entity_armor``,
-    ``entity_attack_damage`` (float32, NaN = unknown). ``class_by_phrase(kind, words)`` inverts
-    ``phrase`` (phrases are unique within each kind).
+    ``entity_attack_damage`` (float32, NaN = unknown). Biome arrays by biome id:
+    ``biome_overworld`` (bool). ``class_by_phrase(kind, words)`` inverts ``phrase`` for kind
+    "block", "item", "entity" or "biome" (phrases are unique within each kind). Biomes:
+    ``biomes`` (in id order), ``biome(name | id)``, ``biome_of(vanilla_biome)``.
     """
 
     def __init__(self, raw: dict, path: Path | None = None):
@@ -1978,16 +2060,19 @@ class Concepts:
         self.block_classes: tuple[BlockClass, ...] = tuple(_block_class(d) for d in raw["block_classes"])
         self.item_classes: tuple[ItemClass, ...] = tuple(_item_class(d) for d in raw["item_classes"])
         self.entity_classes: tuple[EntityClass, ...] = tuple(_entity_class(d) for d in raw["entity_classes"])
+        self.biomes: tuple[BiomeClass, ...] = tuple(_biome_class(d) for d in raw["biomes"])
         self.recipes: tuple[dict, ...] = tuple(raw["recipes"])
         self.exceptions: tuple[dict, ...] = tuple(raw["exceptions"])
         self._blocks = {**{c.name: c for c in self.block_classes}, **{c.id: c for c in self.block_classes}}
         self._items = {**{c.name: c for c in self.item_classes}, **{c.id: c for c in self.item_classes}}
         self._entities = {**{c.name: c for c in self.entity_classes}, **{c.id: c for c in self.entity_classes}}
+        self._biomes = {**{c.name: c for c in self.biomes}, **{c.id: c for c in self.biomes}}
+        self._biome_of = {m: c for c in self.biomes for m in c.members}
         self._item_of = {m: c for c in self.item_classes for m in c.members}
         self._entity_of = {m: c for c in self.entity_classes for m in c.members}
         self._by_phrase: dict[str, dict[tuple[str, ...], Any]] = {}
         for kind, classes in (("block", self.block_classes), ("item", self.item_classes),
-                              ("entity", self.entity_classes)):
+                              ("entity", self.entity_classes), ("biome", self.biomes)):
             counts = Counter(c.phrase for c in classes)
             if any(counts[c.phrase] > 1 for c in classes if not c.fallback):
                 raise ValueError(f"concepts file has repeated curated {kind} phrases (rebuild it)")
@@ -1996,7 +2081,7 @@ class Concepts:
 
     def __repr__(self) -> str:
         return (f"Concepts(version={self.version!r}, hash={self.hash[:12]}, blocks={len(self.block_classes)}, "
-                f"items={len(self.item_classes)}, entities={len(self.entity_classes)})")
+                f"items={len(self.item_classes)}, entities={len(self.entity_classes)}, biomes={len(self.biomes)})")
 
     # -- lookups --------------------------------------------------------------------
 
@@ -2035,8 +2120,21 @@ class Concepts:
         except KeyError:
             raise KeyError(f"unknown entity {vanilla_entity!r}") from None
 
-    def class_by_phrase(self, kind: str, phrase: Sequence[str]) -> BlockClass | ItemClass | EntityClass:
-        """The class of a kind ("block", "item" or "entity") with this phrase (the inverse of
+    def biome(self, key: str | int) -> BiomeClass:
+        """A biome class by name (``plains`` or ``minecraft:plains``) or id."""
+        try:
+            return self._biomes[key.removeprefix("minecraft:") if isinstance(key, str) else key]
+        except KeyError:
+            raise KeyError(f"unknown biome {key!r}") from None
+
+    def biome_of(self, vanilla_biome: str) -> BiomeClass:
+        try:
+            return self._biome_of[vanilla_biome.removeprefix("minecraft:")]
+        except KeyError:
+            raise KeyError(f"unknown biome {vanilla_biome!r}") from None
+
+    def class_by_phrase(self, kind: str, phrase: Sequence[str]) -> BlockClass | ItemClass | EntityClass | BiomeClass:
+        """The class of a kind ("block", "item", "entity" or "biome") with this phrase (the inverse of
         ``phrase``). Defined for every curated class; a phrase shared by several fallback
         classes names none of them and raises KeyError."""
         try:
@@ -2047,7 +2145,7 @@ class Concepts:
     # -- arrays ------------------------------------------------------------------------
 
     def _build_arrays(self) -> None:
-        n = BURIED_ID + 1
+        n = UNSEEN_ID + 1
         self.block_classes_by_id: dict[int, BlockClass] = {c.id: c for c in self.block_classes}
         self.hardness = np.full(n, -1.0, np.float32)  # unused ids stay unbreakable
         self.collision_height = np.zeros(n, np.float32)
@@ -2060,7 +2158,7 @@ class Concepts:
             setattr(self, f, np.zeros(n, bool))
         self.block_defined = np.zeros(n, bool)
         n_states = 1 + max(hi for c in self.block_classes for _, hi in c.state_ranges)
-        self.state_class = np.full(n_states, BURIED_ID, np.uint8)
+        self.state_class = np.full(n_states, UNSEEN_ID, np.uint8)
         assigned = np.zeros(n_states, bool)
         for c in self.block_classes:
             i = c.id
@@ -2111,6 +2209,10 @@ class Concepts:
                 self.tool_speed[self._items[item].id, b.id] = speed
             for item in b.harvest_tools or ():
                 self.can_harvest[self._items[item].id, b.id] = True
+
+        self.biome_overworld = np.zeros(len(self.biomes), bool)
+        for c in self.biomes:
+            self.biome_overworld[c.id] = c.overworld
 
         k = len(self.entity_classes)
         self.max_health = np.full(k, np.nan, np.float32)
