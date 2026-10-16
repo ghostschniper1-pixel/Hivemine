@@ -889,12 +889,12 @@ In Gathering and Wolfpack, most of the dilemmas found were Prisoner's Dilemmas [
 
 Chat is off in the core plan. It belongs to M8, and enters the team stage only as a one-factor variant. Per-run budgets and throughput are stated once, in section 13.
 
-| Phase | Cells | Seeds | Per run | Runs | Machine time [est] |
+| Phase | Cells | Seeds | Per run | Runs | Machine time, network S / M [est] |
 |---|---|---|---|---|---|
-| Pilot and convergence check | scarcity {0.25, 2} × τ {0, 1} | 2 | 1.5B, with checkpoints at 0.5B and 1.0B | 8 | ~7 days |
-| Main grid | scarcity {0.25, 0.5, 1, 2} × τ {0, 1} | 8 | 0.5B | 64 | ~19 days |
-| Controls | {PvP off, keepInventory} × scarcity {0.25, 2}, τ = 0 | 8 | 0.5B | 32 | ~9 days |
-| Variants | τ = 0.5; shared network; team size 5 and 20; area; chat global vs team | 4, at scarcity 0.25 and 2 | 0.5B | ~48 | ~14 days |
+| Pilot and convergence check | scarcity {0.25, 2} × τ {0, 1} | 2 | 1.5B, with checkpoints at 0.5B and 1.0B | 8 | ~6 / ~10 days |
+| Main grid | scarcity {0.25, 0.5, 1, 2} × τ {0, 1} | 8 | 0.5B | 64 | ~15 / ~26 days |
+| Controls | {PvP off, keepInventory} × scarcity {0.25, 2}, τ = 0 | 8 | 0.5B | 32 | ~7 / ~13 days |
+| Variants | τ = 0.5; shared network; team size 5 and 20; area; chat global vs team | 4, at scarcity 0.25 and 2 | 0.5B | ~48 | ~11 / ~20 days |
 
 **Statistics:**
 - With 8 seeds, t(0.975, 7) = 2.36, so a 95% interval is ±0.83 SD of the seed spread. With 3 seeds it would be ±2.5 SD (t = 4.30).
@@ -988,7 +988,7 @@ Every statistic (spawns, ore exposure, furnace timing, despawns) is measured und
 Telemetry is compressed JSONL per bot per session:
 - `session.json`: versions, jar hash, seed, lag profile, shim seed.
 - Per action: the command (text and parsed form), start snapshot (voxels, inventory, entities, health, food), result (code and words), `tick0`/`tick1`, wall ms, round trips, path length, replans, search ms, items gained, damage, corrections and ping.
-- Every 5 ticks: position, velocity, health, food, held item.
+- Every 5 ticks: position, facing (yaw and pitch, for the F3 group of 6.2), velocity, health, food, held item.
 - Every 10 s: server MSPT and Node event-loop delay.
 - The harness log of server-side break ticks.
 
@@ -1034,11 +1034,11 @@ Effort is in focused weeks at about WAI's pace [est].
 | # | Milestone | Exit criteria | Effort |
 |---|---|---|---|
 | M0 | Pin version, build rules, freeze server config | Rules JSON built from the pinned sources (loot from the generator only); cross-check and break-time checks pass; block, item and entity class tables with phrases, homogeneity checks pass (4.4); vocabulary built (`data/vocab-1.21.1.json`); `server.properties` and gamerules frozen | 2–3 wk |
-| M1 | Reference simulator | 4.3 formulas unit-tested; 20 verbs as English commands (`store` and `take` behind the `containers` flag, `plan` behind `goals`); grammar round-trip tests pass (`parse(render(c)) == c` for every v1 command); notebook with honesty tests and unit-tested event attribution rules (6.3); perception; chunk ticking; furnace events; text and top-down viewer | 5–7 wk |
+| M1 | Reference simulator | 4.3 formulas unit-tested; 20 verbs as English commands (`store` and `take` behind the `containers` flag, `plan` behind `goals`); grammar round-trip tests pass (`parse(render(c)) == c` for every v1 command); notebook with honesty tests and unit-tested event attribution rules (6.3); visible-only perception with `unseen` and its honesty tests, and the semantic panorama (6.1); the F3 fields and biome classes, with biomes per column in the test worlds (6.2, contracts 3); chunk ticking; furnace events; text and top-down viewer | 6–8 wk |
 | M2 | Minimal bridge, rule check, duration and lag fits | Harness mod; server-logged digs within ±1 tick; recipes 100%; goto, mine and craft durations fitted (log-RMSE ≤ 0.2); wrapper durations and failures measured under profiles A–C | 2–3 wk |
 | M3 | Worlds | 50 seeds imported (Y ≤ 191 areas); per-Y ore and exposure histograms; spawn rates in walled areas under the frozen config; density knob; pool | 2–3 wk |
-| M4 | Fast core | ≥30k decisions/s on 24 threads; differential test clean over 1M actions, including the notebook and the slot options behind the grammar masks; exact replays | 6–10 wk |
-| M5 | Single-agent PPO | Held-out, no X-ray: iron pickaxe ≥80%, first night ≥80%; Crafter score; learner throughput measured; word model vs opaque-id ablation reported (RQ5); LLM-port identity test passes (6.5) | 4–7 wk |
+| M4 | Fast core | ≥30k decisions/s on 24 threads, with the visible-only window, the panorama and the F3 fields inside the CPU budget (section 13); differential test clean over 1M actions, including perception, the notebook and the slot options behind the grammar masks; exact replays | 6–10 wk |
+| M5 | Single-agent PPO | Held-out, no X-ray: iron pickaxe ≥80%, first night ≥80%; Crafter score; learner throughput measured; S and M trained for the same wall-clock hours and compared, the better kept (D24); word model vs opaque-id ablation reported (RQ5); LLM-port identity test passes (6.5) | 4–7 wk |
 | M6 | Lag randomization, using the M2 fits | ≤10% score drop in profile C | 1–2 wk |
 | M7 | Full bridge, calibration, evaluation orchestration | 11.4 thresholds pass in profiles A–C; scripted gift, theft and fight scenes write the same notebook events in the real game and the simulator (6.3); areas, resets and instances automated; 40-bot ramp test (MSPT p95 < 40 ms, Node loop delay p99 < 20 ms) | 6–10 wk |
 | M8 | Chat with helpers | Request success ≥70%; causal influence with a 95% interval excluding 0; drift stable; nonce words learned within episodes; held-out request combinations above chance; owner ≥15 of 20; no-imitation and instruction-following arms reported | 3–5 wk |
@@ -1046,48 +1046,55 @@ Effort is in focused weeks at about WAI's pace [est].
 | M10 | Two teams of 10–20 | Pilot, main grid and controls done with ≥8 seeds; payoff analysis per scarcity level; real-game spot checks | 4–8 wk |
 | M11 | LLM coupling (optional; kept last by the owner's choice so that training starts sooner, though it needs only M5) | The four stages of 6.6 done. The agent plus the LLM completes long tasks the agent alone does not (for example "build a shelter, then get full iron armor") and beats the text route alone, at pass rates set before the run [est]. Through the neural link, the LLM answers "what are you doing and why?" correctly, checked against what the agent does next | 4–8 wk [est] |
 
-Total: about 39–65 focused weeks [est] for M0–M10, plus 4–8 for the optional M11. M0–M5 (about 21–33 weeks) clear the owner's "first big hurdle", and are worth doing even if the team stage never happens.
+Total: about 40–66 focused weeks [est] for M0–M10, plus 4–8 for the optional M11. M0–M5 (about 22–34 weeks) clear the owner's "first big hurdle", and are worth doing even if the team stage never happens. Draft 0.5 adds a week to M1 for the visible-only perception, the panorama, the F3 fields and biomes.
 
 ## 13. Hardware and compute budget
 
-The machine: Threadripper 3970X (32 cores, 64 threads), 64 GB DDR4, 2× RTX 3090 (48 GB VRAM in total), Windows 11.
+The machine (the owner's upgraded PC, section 1): Threadripper 3970X (32 cores, 64 threads), 64 GB DDR4, 2× RTX 3090 (48 GB VRAM in total), Windows 11.
 
 | Resource | Simulator training | Real-game evaluation, 40 bots [est] |
 |---|---|---|
 | CPU | core 24–28 threads; actors and learners 2–4 | core 8–12; 4 server instances 12–16; Node hosts ~6; conductor 1–2 |
 | GPU 0 | run 1, or population A | inference |
 | GPU 1 | run 2, or population B | learner or idle |
-| RAM | worlds 8–16 GB (2,048 single-agent worlds = 8 GiB); rollouts 2–6 GB | + 4 servers at `-Xmx5G`; Node 4–10 GB |
+| RAM | worlds 8–16 GB (2,048 single-agent worlds = 8 GiB); rollouts 2–6 GB (an M observation is about 25 KB, half of it the panorama [est]) | + 4 servers at `-Xmx5G`; Node 4–10 GB |
 | Disk | world pool, tens of GB [est]; checkpoints (below) | telemetry ~0.4 GB/h uncompressed |
 
 MineLand measured 6.3 GB for 64 agents and 9.0 GB for 128, without vision [34].
 
 **Learner cost [est].**
-- One decision costs one forward pass to act, plus, in each of E PPO epochs, a forward and a backward pass (about 3 forward-equivalents).
-- With the network in 6.4 (≈56 MFLOP) and E = 4, that is 13 × 56 ≈ 0.73 GFLOP per decision.
-- The 3090's dense FP32/TF32 peak is about 35.6 TFLOPS [mem]. Small-batch RL with a GRU sustains perhaps a sixth to a quarter of that (about 6–9 TFLOPS). The word-by-word decoder adds up to ~10 short sequential steps per decision, which may lower this further [est]. Its masks are built on the GPU from slot options exported once per decision (section 5), so it does not wait on the CPU between words; the export costs under 1 KB per decision [est].
-- Result: **about 8–12k decisions/s per 3090** [est] (draft 0.3: 10–15k at ≈47 MFLOP). At MAPPO's 10 epochs [67], 31 forward-equivalents, it would be about 3.5–5k.
-- The learner sets the rate. Acting is 1/13 of the work, so the actor shares its run's GPU, as in WAI. M5 measures the real number.
+- One decision costs one policy forward pass to act. Then, in each of E = 4 PPO epochs, the policy and the critic each take a forward and a backward pass (about 3 forward-equivalents), and the critic takes one more forward pass for the values: 13 forward-equivalents in all.
+- The decoder's share depends on the command's length. The learner sees real commands, about 6 words on average [est] (`mine 4 iron ore.` is 5), not the 10-word maximum of 6.4.
+- **S** (6.4): 54 MFLOP per policy forward and 3 for the critic: 54 + 12 × 57 + 3 ≈ 0.74 GFLOP per decision (draft 0.4, without the critic's own trunk: 13 × 56 ≈ 0.73).
+- **M** (6.4): 150 and 14: 150 + 12 × 164 + 14 ≈ 2.1 GFLOP per decision, about 2.8 times S.
+- **Precision.** The 3090's dense FP32/TF32 peak is about 35.6 TFLOPS; its bf16 tensor rate with fp32 accumulation is about 71 TFLOPS, twice that [mem]. Training uses bf16 autocast: matrix products in bf16 with fp32 accumulation, and weights, optimizer state and losses in fp32 [design]. Small-batch RL with a GRU sustains perhaps a sixth to a quarter of peak: about 6–9 TFLOPS in FP32, 12–18 in bf16 [est]. The word-by-word decoder adds up to ~10 short sequential steps per decision, which may lower this further [est]. Its masks are built on the GPU from slot options exported once per decision (section 5), so it does not wait on the CPU between words; the export costs under 1 KB per decision [est].
+- Result: **M about 5.5–8.5k decisions/s per 3090** (2.1 GFLOP at 12–18 TFLOPS) [est]. **S about 10–15k** [est]: in FP32 its arithmetic gives draft 0.4's 8–12k, and bf16 helps it less than twofold, because its narrow layers (64 to 512 wide) keep the tensor cores less busy [est]. (Draft 0.3: 10–15k at ≈47 MFLOP in FP32.) At MAPPO's 10 epochs [67], 31 forward-equivalents, both drop about 2.4×.
+- The learner sets the rate. Acting is about 1/14 of the work, so the actor shares its run's GPU, as in WAI. M5 measures the real numbers for both presets.
+
+**CPU cost of vision [est].** The fast core builds each observation inside the ≤800 µs of CPU per decision of 4.6.
+- **Panorama:** 2,304 rays of up to 64 blocks, cast once per decision (6.1). Rays below the horizon stop on the ground within a few blocks; rays above it can cross 64 blocks of air. On open ground that is about 85,000 cell steps, about 0.1–0.2 ms in C++ at 1–2 ns per step [est].
+- **Window (M):** about 2,600 short rays at the surface (one per see-through cell, up to three per exposed opaque cell), about 0.05 ms [est]. During a macro it is recast every 20 ticks while the eye moves (6.1), so a 100-tick walk adds about 0.25 ms [est].
+- Together about 0.15–0.25 ms per decision plus the walk's window casts: a fifth to a half of the 800 µs budget, leaving the rest for world ticks. M4 measures it. If it does not fit, the in-macro window casts are thinned first (every 40 ticks), then the core gets more threads at the cost of the actors' share [est].
 
 **Using two GPUs:**
 1. **One run per GPU**: two seeds or two experiments in parallel. This is the default for single-agent work and for grid seeds.
 2. **One population per GPU**: in team runs, population A learns on GPU 0 and B on GPU 1. Total work is the same as one shared network, because each team's decisions train only its own network.
-3. **One run over both GPUs**: data parallel over gloo. Windows supports every PyTorch collective backend except NCCL, and gloo all-reduce works on CUDA tensors; Windows support is labeled prototype [71]. All-reducing about 20 MB of gradients per update is cheap next to the update [est]. Use this for a long single-population run.
+3. **One run over both GPUs**: data parallel over gloo. Windows supports every PyTorch collective backend except NCCL, and gloo all-reduce works on CUDA tensors; Windows support is labeled prototype [71]. All-reducing about 25 MB (S) or 100 MB (M) of gradients per update is cheap next to the update [est]. Use this for a long single-population run.
 
 Never put two runs on one GPU; WAI saw illegal-memory-access crashes. If WAI is still training, give this project a whole GPU.
 
 **Per-run budgets** (the only place they are stated; section 10.5 uses them):
 
-| Run | Agent-decisions | Throughput [est] | Wall time [est] |
+| Run | Agent-decisions | Throughput, S / M [est] | Wall time, S / M [est] |
 |---|---|---|---|
-| Single agent, wood → stone pickaxe | 1–10M | ~10k/s on one GPU | minutes |
-| Single agent, iron pickaxe and the night (M5) | 50–300M | ~10k/s | 1.5–8 h |
-| Single agent, diamond and armor | 0.3–1B | ~10k/s | 8–28 h |
-| Team grid run, 10v10, two populations | 0.5B | ~20k/s on both GPUs | ~7 h |
-| Pilot and convergence run | 1.5B | ~20k/s | ~21 h |
-| Showcase, 20v20 | 3B | ~20k/s | ~1.7 days |
+| Single agent, wood → stone pickaxe | 1–10M | ~12k / ~7k per s on one GPU | minutes |
+| Single agent, iron pickaxe and the night (M5) | 50–300M | ~12k / ~7k | 1–7 h / 2–12 h |
+| Single agent, diamond and armor | 0.3–1B | ~12k / ~7k | 7–23 h / 12–40 h |
+| Team grid run, 10v10, two populations | 0.5B | ~25k / ~14k on both GPUs | ~5.5 h / ~10 h |
+| Pilot and convergence run | 1.5B | ~25k / ~14k | ~17 h / ~30 h |
+| Showcase, 20v20 | 3B | ~25k / ~14k | ~1.4 / ~2.5 days |
 
-The team-stage plan in 10.5 then needs about **7 weeks of machine time** [est]: 7 + 19 + 9 + 14 days. If the pilot shows that 0.5B is not enough, the grid shrinks in cells, not seeds.
+The team-stage plan in 10.5 then needs about **6 weeks of machine time with S** (6 + 15 + 7 + 11 days) and about **10 weeks with M** (10 + 26 + 13 + 20 days) [est]; over M's throughput range, 8 to 12 weeks. The network for the team stage is settled at M5 (D24); if M does not pay for its cost there, the team grid runs with S (section 14). If the pilot shows that 0.5B is not enough, the grid shrinks in cells, not seeds.
 
 For comparison:
 - PPO on Craftax-Classic ran 1B steps in under an hour on one GPU, reaching about 90% of the optimal reward [40].
@@ -1096,10 +1103,10 @@ For comparison:
 - A 3090 is roughly 50–70% of a 4090 [mem].
 
 **Checkpoints [est]:**
-- A snapshot is about 20 MB of weights, plus about 40 MB of Adam state.
-- Keep weights for every snapshot, since the league needs them. Keep Adam state only for the last 3.
-- A 0.5B grid run with a snapshot every 10M decisions keeps 50 snapshots across its two populations, about 1 GB. A 1.5B pilot run keeps about 3 GB. The whole plan in 10.5 needs about 170 GB.
-- A 10B run would need 20–60 GB.
+- A league snapshot holds the policy's weights: about 20 MB for S in fp32, and for M about 72 MB in fp32, stored as 36 MB in bf16 [design]. A full checkpoint adds the critic and the Adam state, about 3× the weights.
+- Keep weights for every snapshot, since the league needs them. Keep full checkpoints only for the last 3.
+- A 0.5B grid run with a snapshot every 10M decisions keeps 50 snapshots across its two populations: about 1 GB with S, 1.8 GB with M. A 1.5B pilot run keeps about 3 GB (S) or 5.4 GB (M). The whole plan in 10.5 needs about 170 GB with S, 300 GB with M.
+- A 10B run would need 20–60 GB with S, 36–110 GB with M.
 
 **A bigger rig** would:
 - run the grid in days instead of weeks, or with more seeds and longer runs;
@@ -1114,7 +1121,10 @@ For comparison:
 | Sim-to-real gap (movement, combat, mobs) | Calibration from M2 on; pathfinder rules ported into the nav grid; models fitted to telemetry; lag and failure noise |
 | Mineflayer hangs or reports success early (dig resolves locally; window waits have no timeout) [74][75] | Deadlines with cleanup; re-read after RT + 2 ticks; server-side logs |
 | Agents exploit simulator bugs [57] | Invariants, speed bounds, real-game checks of surprising strategies |
-| Hidden X-ray (`findBlocks`) inflates competence | One perception function on both sides; X-ray only as a labeled ablation |
+| Hidden X-ray (`findBlocks`, or cells shown behind a wall) inflates competence | One visible-only perception function on both sides (6.1); honesty tests that change unseen cells; X-ray only as a labelled ablation, never used for an agent that is evaluated or deployed |
+| Visible-only vision makes the task harder than draft 0.4's (no cave seen through a wall) | The X-ray ablation measures the cost; the panorama sees 64 blocks and the notebook keeps what was seen; `descend` and `strip_mine` open ore up |
+| A bigger network slows every experiment (M costs about 2.8 times S per decision, 13) | bf16 autocast; S and M trained for the same wall-clock hours at M5, the better kept (D24); fall back to S for the team grid if M does not pay |
+| The panorama and the visibility rays overrun the core's CPU budget | Cast the panorama once per decision; cost measured in M4 against the 800 µs budget (13); thin the in-macro window casts first |
 | Statistics measured under the wrong server config | Config frozen at M0; all statistics re-measured on any change |
 | Stale plugins (pathfinder 2023, pvp 2022) [9] | Own wrappers; nightly smoke suite; time set aside for patches |
 | Macros hide too much: the agent learns the tech tree, not Minecraft | Acceptable for the social questions; finer verbs later |
@@ -1148,7 +1158,7 @@ For comparison:
 | D12 | Team networks | Two independent populations; a shared network as a variant |
 | D13 | Server config | View and simulation distance 10, frozen at M0 |
 | D14 | Night skip | `playersSleepingPercentage` 100 (vanilla), simulated |
-| D15 | Perception | Exposed face in line of sight within 24 blocks; X-ray only as an ablation |
+| D15 | Perception (owner request in draft 0.5) | Visible-only: a cell is seen only when a straight segment from the eye reaches it through see-through cells; all other window cells show `unseen`; resource sightings from seen cells and panorama pixels, up to 64 blocks (6.1). X-ray only as a labelled ablation that measures what honesty costs, never used for an agent that is evaluated or deployed |
 | D16 | Evaluation | Profiles A–C; 250 episodes per profile for full checks |
 | D17 | Emergent language (9.1) | Run it as its own arm next to the grounded chat; team-only channel first, global as a variant |
 | D18 | Natural language everywhere (owner request) | Yes: every action is an English command, written word by word under a grammar mask with tied word embeddings; every observed symbol is named in the same words (5, 6.2) |
@@ -1157,6 +1167,9 @@ For comparison:
 | D21 | Containers | `store` and `take` and their words in the vocabulary now; enabled at the team stage (M9). Whether learners may take from other players' chests is decided at M9 (10.1) |
 | D22 | Goal section (owner request) | Reserve the three goal slots, the goal words and the `plan` verb now, all off; goal-following training, hindsight relabelling and the feasibility query come in M11, which stays last so that training starts sooner (6.6). Self-set goals never pay |
 | D23 | One AI from the agent and an LLM (owner request) | Two clocks joined by trained adapters and the shared goal slots (6.6); initializing the agent's words from an LLM only inside M11, never in M1–M10 |
+| D24 | Network size (owner request) | Two presets: S (about 5M parameters, draft 0.4) and M (about 25M with the critic: panorama, 21 × 21 × 9 window, GRU 1024; 6.4), trained with bf16 autocast. M is the default; settled at M5 by training both for the same wall-clock hours and keeping the better |
+| D25 | Semantic panorama (owner request) | Yes, in M: a world-aligned 360° image, 96 × 24 pixels, ray-cast up to 64 blocks; blocks and entities read through their word vectors, not as colours (6.1, 6.2, 6.4); also cast in S, for the notebook only |
+| D26 | F3 debug inputs (owner request) | Yes, in both presets: x and z relative to home, y absolute (absolute x and z would be noise across evaluation areas); facing, targeted block, fluid and entity, time of day and its word, day number, episode ticks, biome and light as F3 shows them (6.2) |
 
 **Open questions:**
 - Will sharing words give transfer? Does learning `iron ore` help with `deepslate iron ore` and `raw iron`, or does the network treat each phrase as an opaque symbol anyway (RQ5)?
@@ -1165,6 +1178,7 @@ For comparison:
 - Can teams trade with only `give` and chat, or is a trade verb needed?
 - Do roles depend on the slot input, and do they survive slot shuffling?
 - Is 0.5B agent-decisions per run enough for the social metrics to settle?
+- Does M's size and panorama beat S at equal wall-clock time (M5), and does the answer hold at the team stage, where M nearly halves the number of runs per week?
 
 ## 15. Lessons carried over from WAI
 
@@ -1193,7 +1207,10 @@ For comparison:
 - **Payoff analysis (EGTA):** estimating a game's payoff matrix by playing sets of learned policies against each other.
 - **τ:** the share of reward pooled across a team.
 - **Crafter score:** the geometric mean of achievement success rates.
-- **Perception, X-ray:** what an agent may know about blocks; X-ray means seeing blocks with no exposed face in view.
+- **Perception, X-ray:** what an agent may know about blocks; X-ray means knowing blocks the agent's eyes cannot see.
+- **Unseen:** the reserved block class 255 (`unseen`) shown for window cells the agent cannot see at that tick; draft 0.4's `buried`.
+- **Semantic panorama:** a low-resolution 360° image ray-cast from the eye, in which each pixel names the first block or entity its ray hits, with distance, face and light; the network reads the names through word vectors.
+- **F3 debug inputs:** the facts of Minecraft's debug screen given as inputs: position (x and z relative to home, y absolute), facing, targeted block, fluid and entity, time of day, day number, biome and light.
 - **Concept, class:** a set of vanilla blocks, items or entities that behave the same in v1 and share one phrase (all eight log types are the class `log`).
 - **Phrase:** the English words that name a concept or a player (`deepslate iron ore`, `my furnace 2`, `blue 7`).
 - **Grammar mask:** the set of words allowed next while a command is written, given the grammar and the game state.
@@ -1336,3 +1353,9 @@ For comparison:
 99. Baars (1988), "A cognitive theory of consciousness", Cambridge University Press — the global workspace [mem]
 100. Driess et al. (2023), "PaLM-E: an embodied multimodal language model", ICML [mem]
 101. Brohan et al. (2023), "RT-2: vision-language-action models transfer web knowledge to robotic control" [mem]
+
+**Added in draft 0.5** (from memory, not checked yet [mem]; arXiv is not reachable from the build machine)
+
+102. Espeholt et al. (2018), "IMPALA: scalable distributed deep-RL with importance weighted actor-learner architectures", ICML — the ResNet encoder — https://arxiv.org/abs/1802.01561 [mem]
+103. Hilton, Tang & Schulman (2023), "Scaling laws for single-agent reinforcement learning", arXiv preprint [mem]
+104. Schwarzer et al. (2023), "Bigger, better, faster: human-level Atari with human-level efficiency", ICML — BBF [mem]
