@@ -22,7 +22,8 @@ the CPU between words. This module compiles the templates, once, into the tables
     ``transition``      int32 [n_states, n_words], next state or -1 (dense)
     ``states[s]``       the NFA items the state stands for (several where templates share a
                         prefix: after ``go to the nearest iron`` both ``iron ore`` (block) and
-                        ``iron golem`` (entity) are live)
+                        ``iron golem`` (entity) are live, and after ``tell team where is iron``
+                        both forms of ``where``, ``iron ingot`` (item) and ``iron ore`` (block))
     ``moves[(s, w)]``   tuple of ``Move(src, dst, atoms)``: item ``src`` of state ``s`` goes,
                         on word ``w``, to item ``dst`` of state ``transition[s, w]`` if every
                         atom holds

@@ -81,7 +81,8 @@ EXAMPLES = [
     ("tell red 1 where is iron ingot.",
      Command("chat", (("addressee", "red_1"), ("sentence", Sentence("where", item="iron_ingot"))))),
     ("tell team where is log.", Command("chat", (("addressee", "team"), ("sentence", Sentence("where", block="log"))))),
-    ("tell team where is coal.", Command("chat", (("addressee", "team"), ("sentence", Sentence("where", item="coal"))))),
+    ("tell team where is coal.",
+     Command("chat", (("addressee", "team"), ("sentence", Sentence("where", item="coal"))))),
     ("tell team where is coal ore.",
      Command("chat", (("addressee", "team"), ("sentence", Sentence("where", block="coal_ore"))))),
     ("tell human thanks.", Command("chat", (("addressee", "human"), ("sentence", Sentence("thanks"))))),
@@ -149,15 +150,8 @@ def test_every_verb_slot_value_appears_in_the_sample(lang: Language, sample: lis
     assert SLOT_DOMAIN_TABLE[("chat", "need", "item")] == "chat_item"
 
 
-def run_slow(request: pytest.FixtureRequest) -> None:
-    """Exhaustive checks run only when selected with ``-m slow`` (no conftest skips them by default)."""
-    if "slow" not in (request.config.getoption("markexpr") or "") or "not slow" in request.config.getoption("markexpr"):
-        pytest.skip("exhaustive check: run with -m slow")
-
-
-@pytest.mark.slow
-def test_round_trip_over_every_command(lang: Language, request: pytest.FixtureRequest) -> None:
-    run_slow(request)
+@pytest.mark.slow  # tests/conftest.py skips it unless slow tests are selected (-m slow or HIVEMIND_SLOW=1)
+def test_round_trip_over_every_command(lang: Language) -> None:
     n = 0
     for c in lang.enumerate_commands(lang.full_provider(), Flags.all()):
         assert lang.parse(lang.render(c)) == c
@@ -469,7 +463,8 @@ def test_static_grammar() -> None:
     assert G.first_words()["hold"] == "equip" and G.first_words()["wear"] == "equip"
     assert G.compile_template("go to the {ordinal} {entity}")[-1] == G.Slot("entity", "entity_ref")
     assert G.domain_of("item", "sentence") == "chat_item" and G.domain_of("entity", "goal") == "entity_class"
-    assert G.domain_of("item", "sentence", "where") == "where_item" and G.domain_of("item", "sentence", "need") == "chat_item"
+    assert G.domain_of("item", "sentence", "where") == "where_item"
+    assert G.domain_of("item", "sentence", "need") == "chat_item"
     assert G.domain_of("block", "sentence", "where") == "block"
     with pytest.raises(ValueError):
         G.compile_template("go to the {ordinal}")
@@ -482,7 +477,8 @@ def test_sentence_forms() -> None:
     assert G.frame_form("sentence", "where", {"item"}) == item_form
     assert G.frame_form("sentence", "where", ["block"]) == block_form
     assert item_form[-1] == G.Slot("item", "where_item") and block_form[-1] == G.Slot("block", "block")
-    assert G.frame_form("sentence", "need", {"bogus"}) == G.SENTENCE_ELEMENTS["need"][0]  # one form: the renderer reports
+    # an intent with one form returns it whatever the slots (the renderer reports the mismatch)
+    assert G.frame_form("sentence", "need", {"bogus"}) == G.SENTENCE_ELEMENTS["need"][0]
     for slots in ((), ("item", "block"), ("item_count", "item")):
         with pytest.raises(ValueError, match="where"):
             G.frame_form("sentence", "where", slots)

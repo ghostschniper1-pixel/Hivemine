@@ -53,7 +53,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from hivemind.lang import grammar as G
-from hivemind.lang.grammar import Choice, Element, Lit, Slot
+from hivemind.lang.grammar import Choice, Lit, Slot
 from hivemind.lang.language import Language, TrieNode, assemble, build_trie
 from hivemind.lang.types import Command, DeadEndError, EntityRef, Flags
 

@@ -19,6 +19,9 @@ def reader(lang: Language) -> HumanReader:
     return lang._human_reader()
 
 
+SLOT_VALUES = {"item_count": 2, "item": "bread", "block": "iron_ore"}  # a value per sentence slot
+
+
 def show(lang: Language, x: Command | Sentence | None) -> str | None:
     if x is None:
         return None
@@ -31,9 +34,16 @@ CASES = [
     ("red 0, mine 4 iron ore", "human", "mine 4 iron ore.", "red_0"),
     ("can you give me 3 breads?", "human", "give me 3 bread", None),
     ("i need three iron ingots", "human", "i need 3 iron ingot", None),
-    ("where is the iron ore", "human", None, None),  # where takes items; iron ore is a block
-    ("red 0, where is the iron ore", "human", None, "red_0"),
+    ("where is the iron ore", "human", "where is iron ore", None),  # draft 0.5: the block form
+    ("red 0, where is the iron ore", "human", "where is iron ore", "red_0"),
     ("where are the sticks?", "human", "where is stick", None),
+    ("where's the stone", "human", "where is stone", None),  # the block (test_where_reads_blocks_as_blocks)
+    ("where is the oak log", "human", "where is log", None),  # a member name: the block log
+    ("where is some wood", "human", "where is log", None),
+    ("where is the coal", "human", "where is coal", None),  # the item
+    ("where is the coal ore", "human", "where is coal ore", None),  # the block
+    ("where are the diamonds", "human", "where is diamond", None),
+    ("where is the iron", "human", None, None),  # raw iron, iron ingot, iron ore? no guess
     # addressees
     ("everyone, i need 3 iron ingot", "human", "i need 3 iron ingot", "everyone"),
     ("Team, follow me!", "human", "follow me", "team"),
@@ -161,7 +171,8 @@ NORMALIZE = [
     ("mine an iron ore", "mine 1 iron ore"),  # ... or a resource block
     ("attack a zombie", "attack <unk> zombie"),
     ("a workbench", "1 crafting table"),
-    ("spruce logs and oak planks", "log and oak planks"),  # member names with a word outside the vocabulary
+    ("stripped spruce logs and oak planks", "log and oak planks"),  # member names with a word outside the vocabulary
+    ("spruce logs", "spruce log"),  # only vocabulary words ("spruce" is a biome word): kept as typed
     ("white wool", "wool"),
     ("plank", "planks"),
     ("ores", "ore"),
@@ -182,7 +193,8 @@ NORMALIZE = [
     ("3x bread", "3 bread"),
     ("i have 0 sticks", "i have 0 stick"),  # the true number, though it does not parse
     ("wood", "log"),
-    ("dark oak wood", "log"),
+    ("stripped dark oak wood", "log"),
+    ("dark oak wood", "dark oak log"),  # "dark" is a biome word now: vocabulary words are kept, "wood" -> "log"
     ("wood planks", "<unk> planks"),  # a modifier: not "log planks"
     ("retreat", "flee"),
     ("i need 3 carrots", "i need 3 carrots"),  # a vocabulary word is kept (context-free; see content_words)
@@ -226,11 +238,11 @@ def test_every_synonym_takes_effect(lang: Language) -> None:
         if dst != ("pick_up",):  # picking up is not a command: stays unknown
             assert lang.normalize_human(" ".join(src)) == list(dst), src
     for intent, words in SENTENCE_OPTIONAL.items():  # every optional sentence word can be left out
-        slots = G.slot_names(G.SENTENCE_ELEMENTS[intent])
-        s = Sentence(intent, **{k: v for k, v in (("item_count", 2), ("item", "bread")) if k in slots})
-        for w in words:
-            short = " ".join(x for x in lang.to_words(s) if x != w)
-            assert lang.parse_human(short) == s, (intent, short)
+        for els in G.SENTENCE_ELEMENTS[intent]:
+            s = Sentence(intent, **{k: SLOT_VALUES[k] for k in G.slot_names(els)})
+            for w in words:
+                short = " ".join(x for x in lang.to_words(s) if x != w)
+                assert lang.parse_human(short) == s, (intent, short)
 
 
 def test_variants_point_to_known_words(reader: HumanReader) -> None:
@@ -263,7 +275,35 @@ def test_canonical_text_reads_as_itself(lang: Language) -> None:
     for text in sample:
         assert lang.parse_human(text, "human") == lang.parse(text), text
     assert lang.parse_human("i need 3 iron ingot", "human") == Sentence("need", item_count=3, item="iron_ingot")
-    for intent in G.INTENTS:
-        s = Sentence(intent, **{k: v for k, v in (("item_count", 2), ("item", "bread"))
-                                if k in G.slot_names(G.SENTENCE_ELEMENTS[intent])})
-        assert lang.parse_human(" ".join(lang.to_words(s)), "human") == s
+    for intent, forms in G.SENTENCE_ELEMENTS.items():
+        for els in forms:
+            s = Sentence(intent, **{k: SLOT_VALUES[k] for k in G.slot_names(els)})
+            assert lang.parse_human(" ".join(lang.to_words(s)), "human") == s
+
+
+def test_where_reads_blocks_as_blocks(lang: Language) -> None:
+    """Draft 0.5: "where is ..." names a resource block with the block form and an item with the
+    item form, from the canonical phrase or a member name, and never maps a word to another
+    class. The 17 resource blocks that share their phrase with an item are read as the block,
+    the place to go (contracts 4.3)."""
+    blocks, where_items = lang.domains["block"], lang.domains["where_item"]
+    for b in blocks:
+        phrase = " ".join(lang.phrase("block", b))
+        assert lang.parse_human(f"where is the {phrase}") == Sentence("where", block=b), phrase
+    for i in where_items:
+        phrase = " ".join(lang.value_words("where_item", i))
+        assert lang.parse_human(f"where is {phrase}") == Sentence("where", item=i), phrase
+    shared = [i for i in lang.domains["item"] if i not in where_items]
+    assert len(shared) == 17
+    for i in shared:  # the item log is named "log", and so is the block: read as the block
+        b = lang.concept("block", lang.phrase("item", i))
+        assert lang.parse_human(f"where is the {' '.join(lang.phrase('item', i))}") == Sentence("where", block=b)
+    # member names: a block member's name gives that block class, an item member's that item class
+    for a, b in lang.aliases["block"].items():
+        assert lang.parse_human(f"where is the {a}") == Sentence("where", block=b), a
+    for a, i in lang.aliases["item"].items():
+        got = lang.parse_human(f"where is the {a}")
+        if i in where_items:
+            assert got == Sentence("where", item=i), a
+        else:  # an item named like a block: its member names read as the block they also name, or not at all
+            assert got is None or (got.get("block") is not None and a in lang.aliases["block"]), (a, got)

@@ -1,4 +1,4 @@
-"""The reference world: voxels, light, entity slots, clock and chunk ticking (contracts 5).
+"""The reference world: voxels, light, biomes, entity slots, clock and chunk ticking (contracts 5).
 
 DESIGN.md 4.4 (world model), 4.2 (what is exact) and 4.5 (tick model). Usage::
 
@@ -7,6 +7,8 @@ DESIGN.md 4.4 (world model), 4.2 (what is exact) and 4.5 (tick model). Usage::
     world.set(10, 64, 10, stone_id)             # tracked: world.changes_since(cursor)
     world.get(-1, 64, 0)                        # outside the edge: the barrier class
     world.block_light_at(x, y, z), world.sky_light(x, y, z)
+    world.biome_at(10.5, 7.2)                   # biome id of the column (a biome class, contracts 3)
+    slot = world.alloc_agent((5.5, 64.0, 7.5), yaw=180.0)  # home defaults to the spawn position
     slot = world.mobs.alloc(cls=zombie_id, pos=(5.5, 64.0, 7.5))
     world.ticking_chunks()                      # bool[chunks_x, chunks_z]
 
@@ -44,12 +46,26 @@ the filter of most of their states.
 The day-night level of sky light is ``mechanics.surface_sky_light``; the arrays here hold the raw
 value. ``set`` relights only the box of cells within 15 of the change (a change cannot alter light
 farther away), which gives exactly the result of a full recomputation (tested).
+``light_points`` reads both kinds of light at many cells at once (the panorama and the F3 group).
+
+**Biomes** (draft 0.5; DESIGN.md 4.4, contracts 3): one biome id per column,
+``biome_map[x, z]`` (uint8, the vanilla registry id of a biome class), ``plains`` unless set
+[design] (``set_biome_map``; worldgen assigns a true biome per column). The M3 importer will keep
+the game's 3-D biome cells instead.
 
 **Entities** live in fixed slot tables with in-use flags (DESIGN.md 4.4; Craftax caps entity
 counts the same way [40]): agents <= 40, mobs <= 32, dropped items <= 64, furnaces <= 16, and
-chests <= 8 per agent slot (320; contracts 4.3: ``my chest 1``-``8``). Each table is a structure
-of arrays; the modules that own a kind (mobs, inventory, actions) may add fields with
-``SlotTable.add_field``.
+chests <= 8 per agent slot (320; contracts 4.3: ``my chest 1``-``8``; the chest table is sized
+from the agent count [design], used from M9). Each table is a structure of arrays; the modules
+that own a kind (mobs, inventory, actions) may add fields with ``SlotTable.add_field``.
+
+The agent table holds, besides position, health, team, number and the alive flag, what the F3
+group reads (``debug_info.py``; DESIGN.md 6.2): ``yaw`` and ``pitch`` (float32 degrees in
+Minecraft's convention [mem]: yaw 0 faces south (+z), 90 west, 180 north, -90 east; pitch -90
+looks straight up, +90 straight down; the look vector is (-sin yaw cos pitch, -sin pitch,
+cos yaw cos pitch)), and ``home`` (float64 x, y, z: the agent's spawn point, or from M9 its
+team's base, where ``go home`` leads). ``home`` starts as NaN, so a slot whose home was never set
+cannot leak absolute coordinates; ``alloc_agent`` sets it to the spawn position by default.
 
 **Clock.** ``tick`` counts game ticks since the episode began; ``day_time`` is the game's day
 time (``/time query daytime`` [mem]), which the night skip can move forward without ticking.
@@ -90,9 +106,10 @@ SIMULATION_DISTANCE = 10  # DESIGN.md 11.2: simulation-distance 10, the Java mul
 MAX_LIGHT = 15  # [mem] light levels 0..15 (4 bits, DESIGN.md 4.4)
 DEFAULT_SIZE = 128  # DESIGN.md 4.4: a 128 x 128 single-agent world
 AIR = 0  # contracts 3: class 0 is air
-BURIED = 255  # contracts 3: class 255 is "buried" (perception only, never stored in a world)
+UNSEEN = 255  # contracts 3: class 255 is "unseen" (perception only, never stored in a world)
+DEFAULT_BIOME = "plains"  # [design] the biome of every column until a biome map is set
 
-CHESTS_PER_AGENT = 8  # DESIGN.md 4.4: from M9 chests <= 8 per agent (contracts 4.3: my chest 1-8)
+CHESTS_PER_AGENT = 8  # [design] DESIGN.md 4.4: from M9 chests <= 8 per agent (contracts 4.3: my chest 1-8)
 # Fixed entity slot capacities (DESIGN.md 4.4); chests scale with the agent slots.
 ENTITY_CAPACITY: dict[str, int] = {"agents": 40, "mobs": 32, "items": 64, "furnaces": 16,
                                    "chests": CHESTS_PER_AGENT * 40}
@@ -180,7 +197,9 @@ def _entity_tables(capacity: Mapping[str, int]) -> dict[str, SlotTable]:
     pos = FieldSpec(np.float64, (3,), 0.0)
     ipos = FieldSpec(np.int32, (3,), 0)
     specs: dict[str, dict[str, FieldSpec]] = {
+        # yaw and pitch: Minecraft's convention (module docstring); home: NaN until set.
         "agents": {"pos": pos, "yaw": FieldSpec(np.float32), "pitch": FieldSpec(np.float32),
+                   "home": FieldSpec(np.float64, (3,), np.nan),
                    "health": FieldSpec(np.float32, (), 20.0),  # [mem] max health 20
                    "team": FieldSpec(np.int8), "number": FieldSpec(np.int16), "alive": FieldSpec(bool, (), True)},
         "mobs": {"cls": FieldSpec(np.int16), "pos": pos, "health": FieldSpec(np.float32),
@@ -213,7 +232,7 @@ def light_filter_table(concepts: Concepts) -> np.ndarray:
             votes.setdefault(cls, {})
             votes[cls][b.filter_light] = votes[cls].get(b.filter_light, 0) + 1
             first.setdefault((cls, b.filter_light), state)
-    table = np.full(BURIED + 1, MAX_LIGHT, np.uint8)
+    table = np.full(UNSEEN + 1, MAX_LIGHT, np.uint8)
     for cls, counts in votes.items():
         table[cls] = max(counts, key=lambda f: (counts[f], -first[(cls, f)]))
     table.setflags(write=False)
@@ -250,6 +269,7 @@ class World:
         self.blocks = np.zeros((self.size_x, HEIGHT, self.size_z), np.uint8)
         self.block_light = np.zeros_like(self.blocks)
         self.heightmap = np.full((self.size_x, self.size_z), MIN_Y - 1, np.int16)
+        self.biome_map = np.full((self.size_x, self.size_z), c.biome(DEFAULT_BIOME).id, np.uint8)
         self.tick = 0
         self.day_time = int(day_time)
         self.generation = 0
@@ -302,7 +322,7 @@ class World:
         """Set a cell's class (tracked); returns the old class. The edge cannot be changed."""
         if not self.in_bounds(x, y, z):
             raise IndexError(f"({x}, {y}, {z}) is outside the world")
-        if not 0 <= cls < BURIED or not self.concepts.block_defined[cls]:
+        if not 0 <= cls < UNSEEN or not self.concepts.block_defined[cls]:
             raise ValueError(f"{cls} is not a block class a world can hold")
         old = int(self.blocks[x, y - MIN_Y, z])
         if old == cls:
@@ -339,7 +359,7 @@ class World:
             raise ValueError(f"expected shape {self.blocks.shape}, got {blocks.shape}")
         if blocks.dtype != np.uint8:
             raise TypeError("voxels must be uint8")
-        if not self.concepts.block_defined[blocks].all() or (blocks == BURIED).any():
+        if not self.concepts.block_defined[blocks].all() or (blocks == UNSEEN).any():
             raise ValueError("voxels hold ids that are not block classes")
         self.blocks = np.ascontiguousarray(blocks).copy()
         self._log.clear()
@@ -427,6 +447,28 @@ class World:
         """max(block light, raw sky light) of a cell."""
         return max(self.block_light_at(x, y, z), self.sky_light(x, y, z))
 
+    def light_points(self, cells: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(raw sky light, block light) as uint8 arrays for integer cells (n, 3), each exactly
+        ``sky_light`` and ``block_light_at`` of its cell, computed for all cells at once."""
+        cells = np.asarray(cells, np.int64).reshape(-1, 3)
+        x, y, z = cells[:, 0], cells[:, 1], cells[:, 2]
+        sky = np.zeros(len(cells), np.uint8)
+        block = np.zeros(len(cells), np.uint8)
+        inside = (x >= 0) & (x < self.size_x) & (z >= 0) & (z < self.size_z)
+        sky[inside & (y > MAX_Y)] = MAX_LIGHT
+        col = np.flatnonzero(inside & (y >= MIN_Y) & (y <= MAX_Y))
+        if col.size:
+            cx, cy, cz = x[col], y[col] - MIN_Y, z[col]
+            block[col] = self.block_light[cx, cy, cz]
+            lit = cy + MIN_Y > self.heightmap[cx, cz]  # at or below the heightmap: 0
+            if lit.any():
+                cx, cy, cz, idx = cx[lit], cy[lit], cz[lit], col[lit]
+                # Filters from each cell up to the top of its column: a masked row sum.
+                f = self.light_filter[self.blocks[cx, :, cz]].astype(np.int32)
+                f[np.arange(HEIGHT)[None, :] < cy[:, None]] = 0
+                sky[idx] = np.clip(MAX_LIGHT - f.sum(axis=1), 0, MAX_LIGHT)
+        return sky, block
+
     def recompute_light(self) -> None:
         """Block light of the whole world from scratch (the bounding box of all sources)."""
         self.block_light = np.zeros_like(self.blocks)
@@ -472,6 +514,37 @@ class World:
         """``day_time`` within the day, 0..23999 [15]."""
         return time_of_day(self.day_time)
 
+    # -- biomes ---------------------------------------------------------------------------------
+
+    def biome_at(self, x: float, z: float) -> int:
+        """The biome id of the column containing (x, z); outside the world's sides, the nearest
+        column's (the barrier edge has no biome of its own)."""
+        ix = min(max(math.floor(x), 0), self.size_x - 1)
+        iz = min(max(math.floor(z), 0), self.size_z - 1)
+        return int(self.biome_map[ix, iz])
+
+    def set_biome_map(self, biomes: np.ndarray) -> None:
+        """Replace the biome of every column (uint8 [size_x, size_z] of biome-class ids)."""
+        biomes = np.asarray(biomes)
+        if biomes.shape != (self.size_x, self.size_z):
+            raise ValueError(f"expected shape {(self.size_x, self.size_z)}, got {biomes.shape}")
+        if biomes.dtype != np.uint8:
+            raise TypeError("biome ids must be uint8")
+        if (biomes >= len(self.concepts.biomes)).any():
+            raise ValueError("biome map holds ids that are not biome classes")
+        self.biome_map = np.ascontiguousarray(biomes).copy()
+
+    # -- agents ---------------------------------------------------------------------------------
+
+    def alloc_agent(self, pos: Sequence[float], *, yaw: float = 0.0, pitch: float = 0.0,
+                    home: Sequence[float] | None = None, **fields: Any) -> int:
+        """Take the lowest free agent slot at feet position ``pos``, facing ``yaw``/``pitch``
+        (degrees, Minecraft's convention), with ``home`` (default: ``pos``, the spawn point).
+        Other agent fields (team, number, health, ...) may be given too."""
+        if not -90.0 <= pitch <= 90.0:
+            raise ValueError(f"pitch must lie in [-90, 90], got {pitch}")
+        return self.agents.alloc(pos=pos, yaw=yaw, pitch=pitch, home=pos if home is None else home, **fields)
+
     # -- chunk ticking ------------------------------------------------------------------------
 
     @staticmethod
@@ -509,6 +582,7 @@ class World:
         w.blocks = self.blocks.copy()
         w.block_light = self.block_light.copy()
         w.heightmap = self.heightmap.copy()
+        w.biome_map = self.biome_map.copy()
         w._log = []
         w._log_offset = 0
         for kind in ("agents", "mobs", "items", "furnaces", "chests"):
