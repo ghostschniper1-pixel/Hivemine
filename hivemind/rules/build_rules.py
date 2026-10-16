@@ -28,9 +28,10 @@ Representation choices not fixed by the contract:
 - Names carry no ``minecraft:`` namespace, except inside the verbatim loot tables.
 - ``states``: ``[{name, type, values}]`` in minecraft-data's order (the first property
   varies slowest); boolean values are ``["true", "false"]`` (index 0 = true).
-- ``collision``: ``{"shared": boxes}`` when every state has the same shape, else
-  ``{"per_state": [boxes, ...]}`` indexed by ``state - min_state``; a box is
-  ``[x0, y0, z0, x1, y1, z1]`` in block units.
+- ``collision``: ``{"shapes": [boxes, ...], "by_state": [i, ...] | null}``: the block's
+  distinct collision shapes, and for each state (index ``state - min_state``) the index of
+  its shape; ``by_state`` is null when every state uses ``shapes[0]``. A shape is a list of
+  boxes ``[x0, y0, z0, x1, y1, z1]`` in block units (empty = no collision).
 - ``tool.rules``: ``[{blocks, speed, correct_for_drops}]`` in game order; ``blocks`` is
   ``"#tag"`` or a list of block names; ``speed`` is the speed on ``#mineable/<kind>`` for
   digging tools and null for swords, shears, mace and trident. ``tool.damage_per_block``
@@ -48,11 +49,13 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import sys
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from hivemind.rules import constants as C
 from hivemind.rules.fetch_sources import DEFAULT_DEST, DEFAULT_SOURCES_JSON, load_pins, verify_all
@@ -99,15 +102,19 @@ TOLERATED_TOOL_SPEED = {
 
 # Blocks where minecraft-data's harvestTools and the needs_*_tool tags disagree.
 TOLERATED_HARVEST = {
-    "crafter": "in needs_stone_tool, but minecraft-data (generated from the game code) has no "
-               "harvestTools, i.e. no tool is required for drops, so the tier tag has no effect. "
-               "Kept as requires_tool=false; UNVERIFIED, check in the real game (M2)",
+    "crafter": "in needs_stone_tool, but minecraft-data lists no harvestTools (no tool required for "
+               "drops), in which case the tier tag has no effect on drops. Kept as requires_tool=false "
+               "(minecraft-data); UNVERIFIED, check in the real game (M2)",
 }
 
 # Display names: minecraft-data names wall-mounted blocks after the item that places them
 # ("Torch" for wall_torch), while the language file has "Wall Torch" or no key at all.
 # Tolerated when the minecraft-data name equals the standing variant's language name.
 TOLERATED_WALL_DISPLAY_NAME = "minecraft-data uses the standing variant's (item's) name for wall-mounted blocks"
+
+# Entity display names that differ between minecraft-data 1.20.5 and the 1.21.1 language
+# file (none for the pinned sources).
+TOLERATED_ENTITY_DISPLAY_NAMES: dict[str, str] = {}
 
 # Recipes present in only one source. minecraft-data recipes are keyed by
 # (result, sorted ingredient names); mcmeta recipes by id.
@@ -136,7 +143,7 @@ class BuildError(RuntimeError):
 
 def strip_ns(name: str) -> str:
     """``minecraft:stone`` -> ``stone`` (other namespaces are kept)."""
-    return name[len("minecraft:"):] if name.startswith("minecraft:") else name
+    return name.removeprefix("minecraft:")
 
 
 def canonical_json(obj: Any) -> str:
@@ -372,16 +379,15 @@ def _states(md_states: list[dict]) -> list[dict]:
 
 
 def _collision(name: str, n_states: int, shapes: dict) -> dict:
-    ref = shapes["blocks"].get(name)
-    if ref is None:
-        raise BuildError(f"no collision shape for {name}")  # see check in build_blocks
+    ref = shapes["blocks"][name]
     if isinstance(ref, int):
-        return {"shared": shapes["shapes"][str(ref)]}
+        return {"shapes": [shapes["shapes"][str(ref)]], "by_state": None}
     if len(ref) != n_states:
         raise BuildError(f"{name}: {len(ref)} collision shapes for {n_states} states")
-    if len(set(ref)) == 1:
-        return {"shared": shapes["shapes"][str(ref[0])]}
-    return {"per_state": [shapes["shapes"][str(i)] for i in ref]}
+    distinct = list(dict.fromkeys(ref))  # shape ids in order of first appearance
+    if len(distinct) == 1:
+        return {"shapes": [shapes["shapes"][str(ref[0])]], "by_state": None}
+    return {"shapes": [shapes["shapes"][str(i)] for i in distinct], "by_state": [distinct.index(i) for i in ref]}
 
 
 # Blocks whose loot table is another block's ("dropsLike" in the game code) [mem]: wall
@@ -399,7 +405,7 @@ def _loot_table_for(name: str, loot: dict[str, Any]) -> tuple[str | None, bool]:
 
 # Default collision for 1.21.1 blocks without a 1.20.5 shape: a full cube [est]. The
 # build lists such blocks; for the pinned sources there are none.
-DEFAULT_COLLISION = {"shared": [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]}  # [est]
+DEFAULT_COLLISION = {"shapes": [[[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]], "by_state": None}  # [est]
 
 
 def build_blocks(src: Sources, block_tags: dict[str, list[str]], item_names: dict[int, str],
@@ -673,8 +679,6 @@ def build_entities(src: Sources) -> dict[str, dict]:
 
 
 def build_constants() -> dict[str, dict]:
-    import re
-
     pattern = re.compile(C.SOURCE_LABELS_PATTERN)
     out = {}
     for name, const in sorted(C.all_constants().items()):
@@ -759,7 +763,8 @@ def check_harvest_tools(blocks: dict[str, dict], items: dict[str, dict],
             if name in TOLERATED_HARVEST:
                 chk.tolerated.append(f"{name}: {TOLERATED_HARVEST[name]}")
             else:
-                chk.mismatches.append(f"{name}: in needs_{b['needs_tier']}_tool but minecraft-data has no harvest tools")
+                chk.mismatches.append(f"{name}: in needs_{b['needs_tier']}_tool but minecraft-data "
+                                      "has no harvest tools")
     return chk
 
 
@@ -793,7 +798,8 @@ def check_tool_speeds(src: Sources, items: dict[str, dict], block_tags: dict[str
                 chk.tolerated.append(f"{name} with {tool_name}: {expected} vs {real}: "
                                      f"{TOLERATED_TOOL_SPEED[(name, kind)]}")
             else:
-                chk.mismatches.append(f"{name} ({material}) with {tool_name}: materials.json {expected} vs rules {real}")
+                chk.mismatches.append(f"{name} ({material}) with {tool_name}: "
+                                      f"materials.json {expected} vs rules {real}")
     for material, n in sorted(substituted.items()):
         chk.tolerated.append(f"{n} blocks with material {material!r} compared as their mineable tag: "
                              f"{TOLERATED_MATERIAL_SUBSTITUTION[material]}")
@@ -817,92 +823,88 @@ def _md_recipe_forms(src: Sources) -> list[tuple[str, int, str, Any]]:
     return out
 
 
-def _match_shapeless(concrete: tuple[str, ...], alts: list[frozenset[str]]) -> list[int] | None:
-    """Assign each concrete ingredient to a distinct alternative set; returns the assignment."""
-    if len(concrete) != len(alts):
-        return None
-    assign: list[int] = []
-    used = [False] * len(alts)
+def trim_pattern(pattern: list[str]) -> list[str]:
+    """Remove empty edge rows and columns, as the game does when it loads a shaped recipe."""
+    width = max(len(row) for row in pattern)
+    rows = [row.ljust(width) for row in pattern]
+    filled = [i for i, row in enumerate(rows) if row.strip()]
+    cols = [c for c in range(width) if any(row[c] != " " for row in rows)]
+    if not filled:
+        return []
+    return [row[cols[0]: cols[-1] + 1] for row in rows[filled[0]: filled[-1] + 1]]
 
-    def go(i: int) -> bool:
-        if i == len(concrete):
-            return True
-        for j, a in enumerate(alts):
-            if not used[j] and concrete[i] in a:
-                used[j] = True
-                assign.append(j)
-                if go(i + 1):
-                    return True
-                used[j] = False
-                assign.pop()
-        return False
 
-    return assign if go(0) else None
+def _shaped_grid(r: dict) -> tuple[tuple[frozenset[str] | None, ...], ...]:
+    return tuple(tuple(frozenset(r["key"][ch]) if ch != " " else None for ch in row)
+                 for row in trim_pattern(r["pattern"]))
 
 
 def check_recipes(src: Sources, recipes: list[dict]) -> CrossCheck:
-    """Crafting recipes in both sources: result, count and ingredient alternatives per slot.
-
-    minecraft-data expands every tag ingredient into one recipe per member, so each of its
-    recipes must be an instance of an mcmeta recipe, and the union of instances must cover
-    every alternative of every slot of every mcmeta crafting recipe.
-    """
+    """Crafting recipes in both sources: result, count and ingredients (see the notes at
+    TOLERATED_RECIPES_ONLY_IN_MD for how minecraft-data represents alternatives)."""
     chk = CrossCheck("recipes: minecraft-data vs mcmeta (crafting)")
-    by_result: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    forms: dict[str, Any] = {}
+    shaped: dict[tuple[str, int], list[tuple[str, Any]]] = defaultdict(list)
     for r in recipes:
         if r["type"] == "crafting_shaped":
-            grid = tuple(tuple(frozenset(r["key"][ch]) if ch != " " else None for ch in row) for row in r["pattern"])
-            forms[r["id"]] = grid
-            by_result[(r["result"]["item"], "shaped")].append(r)
-        elif r["type"] == "crafting_shapeless":
-            forms[r["id"]] = [frozenset(a) for a in r["ingredients"]]
-            by_result[(r["result"]["item"], "shapeless")].append(r)
-    seen: dict[str, list[set[str]]] = {}  # mcmeta id -> per-slot items seen in minecraft-data
+            shaped[(r["result"]["item"], r["result"]["count"])].append((r["id"], _shaped_grid(r)))
+
+    def tolerate_md(res: str, names: Iterable[str | None]) -> bool:
+        key = (res, tuple(sorted({n for n in names if n is not None})))
+        if key in TOLERATED_RECIPES_ONLY_IN_MD:
+            chk.tolerated.append(f"minecraft-data {key}: {TOLERATED_RECIPES_ONLY_IN_MD[key]}")
+            return True
+        return False
+
+    # Shaped: every minecraft-data recipe is an instance of an mcmeta recipe, and the
+    # instances cover every alternative of every slot.
+    seen: dict[str, list[set[str]]] = {}
+    md_shapeless: Counter = Counter()
     for res, count, form, data in _md_recipe_forms(src):
+        if form == "shapeless":
+            md_shapeless[(res, count, tuple(sorted(data)))] += 1
+            continue
         chk.compared += 1
         matched = False
-        for r in by_result.get((res, form), []):
-            if r["result"]["count"] != count:
+        for rid, grid in shaped.get((res, count), []):
+            if len(grid) != len(data) or any(len(a) != len(b) for a, b in zip(grid, data, strict=True)):
                 continue
-            if form == "shaped":
-                grid = forms[r["id"]]
-                if len(grid) != len(data) or any(len(a) != len(b) for a, b in zip(grid, data)):
-                    continue
-                cells = [(a, b) for ra, rb in zip(grid, data) for a, b in zip(ra, rb)]
-                if all((a is None and b is None) or (a is not None and b in a) for a, b in cells):
-                    slots = seen.setdefault(r["id"], [set() for _ in cells])
-                    for k, (_a, b) in enumerate(cells):
-                        if b is not None:
-                            slots[k].add(b)
-                    matched = True
-            else:
-                assign = _match_shapeless(data, forms[r["id"]])
-                if assign is not None:
-                    slots = seen.setdefault(r["id"], [set() for _ in forms[r["id"]]])
-                    for item, j in zip(data, assign):
-                        slots[j].add(item)
-                    matched = True
-        if not matched:
-            if res in TOLERATED_RECIPES_ONLY_IN_MD:
-                chk.tolerated.append(f"{res}: {TOLERATED_RECIPES_ONLY_IN_MD[res]}")
-            else:
-                chk.mismatches.append(f"minecraft-data recipe for {count} {res} ({form}) {data} has no mcmeta match")
+            cells = [(a, b) for ra, rb in zip(grid, data, strict=True) for a, b in zip(ra, rb, strict=True)]
+            if all((a is None and b is None) or (a is not None and b in a) for a, b in cells):
+                slots = seen.setdefault(rid, [set() for _ in cells])
+                for k, (_a, b) in enumerate(cells):
+                    if b is not None:
+                        slots[k].add(b)
+                matched = True
+        if not matched and not tolerate_md(res, (c for row in data for c in row)):
+            chk.mismatches.append(f"minecraft-data shaped recipe for {count} {res} {data} has no mcmeta match")
+    for (res, count), entries in sorted(shaped.items()):
+        for rid, grid in entries:
+            chk.compared += 1
+            if rid not in seen:
+                if rid in TOLERATED_RECIPES_ONLY_IN_MCMETA:
+                    chk.tolerated.append(f"{rid}: {TOLERATED_RECIPES_ONLY_IN_MCMETA[rid]}")
+                else:
+                    chk.mismatches.append(f"mcmeta recipe {rid} ({count} {res}) has no minecraft-data counterpart")
+                continue
+            cells = [a for row in grid for a in row]
+            for k, (alts, got) in enumerate(zip(cells, seen[rid], strict=True)):
+                if alts is not None and set(alts) != got:
+                    missing = sorted(set(alts) - got)
+                    chk.mismatches.append(f"mcmeta recipe {rid} slot {k}: minecraft-data lacks {missing}")
+
+    # Shapeless: minecraft-data holds exactly the first-alternative instance of each recipe.
+    raw_item_tags = src.tags["item"]
+    mc_shapeless: Counter = Counter()
     for r in recipes:
-        if r["id"] not in forms:
-            continue
+        if r["type"] == "crafting_shapeless":
+            first = tuple(sorted(first_alternative(ing, raw_item_tags) for ing in src.recipes[r["id"]]["ingredients"]))
+            mc_shapeless[(r["result"]["item"], r["result"]["count"], first)] += 1
+    for key in sorted(set(md_shapeless) | set(mc_shapeless)):
         chk.compared += 1
-        if r["id"] not in seen:
-            if r["id"] in TOLERATED_RECIPES_ONLY_IN_MCMETA:
-                chk.tolerated.append(f"{r['id']}: {TOLERATED_RECIPES_ONLY_IN_MCMETA[r['id']]}")
-            else:
-                chk.mismatches.append(f"mcmeta recipe {r['id']} has no minecraft-data counterpart")
-            continue
-        form = forms[r["id"]]
-        alts = [a for row in form for a in row] if r["type"] == "crafting_shaped" else form
-        for k, (a, got) in enumerate(zip(alts, seen[r["id"]])):
-            if a is not None and set(a) != got:
-                chk.mismatches.append(f"mcmeta recipe {r['id']} slot {k}: minecraft-data lacks {sorted(set(a) - got)}")
+        n_md, n_mc = md_shapeless[key], mc_shapeless[key]
+        if n_md != n_mc and not (n_mc == 0 and tolerate_md(key[0], key[2])):
+            chk.mismatches.append(f"shapeless {key[1]} {key[0]} from {list(key[2])}: "
+                                  f"{n_md} in minecraft-data, {n_mc} in mcmeta")
     return chk
 
 
@@ -916,8 +918,8 @@ def check_entities(src: Sources) -> CrossCheck:
         chk.compared += 1
         lang_name = lang.get(f"entity.minecraft.{name}")
         if lang_name is not None and lang_name != md[name]["displayName"]:
-            if name in TOLERATED_DISPLAY_NAMES:
-                chk.tolerated.append(f"{name}: {TOLERATED_DISPLAY_NAMES[name]}")
+            if name in TOLERATED_ENTITY_DISPLAY_NAMES:
+                chk.tolerated.append(f"{name}: {TOLERATED_ENTITY_DISPLAY_NAMES[name]}")
             else:
                 chk.mismatches.append(f"{name}: display name {md[name]['displayName']!r} vs language {lang_name!r}")
     return chk
@@ -1027,6 +1029,7 @@ def build(sources_dir: Path = DEFAULT_DEST, sources_json: Path = DEFAULT_SOURCES
         check_recipes(src, recipes),
         check_entities(src),
         check_display_names(src),
+        check_derived_loot(src, blocks),
         check_stale_loot(src, blocks),
     ]
     notes.append(f"recipes: {len(recipes)} ({sum(r['special'] for r in recipes)} flagged special); "

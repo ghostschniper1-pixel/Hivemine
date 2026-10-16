@@ -72,7 +72,9 @@ GAME: dict[str, Const] = {
     "starvation_floor_normal": Const(1.0, "[14]"),  # [14] stops at 1 HP on Normal
     "starvation_floor_hard": Const(0.0, "[14]"),  # [14] does not stop on Hard
     "sprint_requires_food_above": Const(6, "[14]"),  # [14] sprinting needs food > 6
-    "eat_saturation_factor": Const(2.0, "[14]"),  # [14] saturation += nutrition * ratio * 2 (pre-1.20.5 ratio form)
+    # [14] saturation += nutrition * ratio * 2, capped at the food level. The 1.21.1 food
+    # component already stores nutrition * ratio * 2 as "saturation" (bread: 5 * 0.6 * 2 = 6).
+    "eat_saturation_factor": Const(2.0, "[14]"),  # [14]
     "eat_ticks": Const(32, "[mem]"),  # [mem] default eating time (food component eat_seconds 1.6)
     # Clock [15], [73] (DESIGN 4.2, 4.3)
     "day_length_ticks": Const(24000, "[15]"),  # [15]
@@ -85,6 +87,8 @@ GAME: dict[str, Const] = {
     "bed_use_start_tick": Const(12542, "[15]"),  # [15]
     "bed_use_end_tick": Const(23460, "[15]"),  # [15]
     "players_sleeping_percentage": Const(100, "[73]"),  # [73] gamerule default
+    "bed_monster_check_horizontal": Const(8.0, "[mem]"),  # [mem] no sleep with a monster within 8 blocks
+    "bed_monster_check_vertical": Const(5.0, "[mem]"),  # [mem] ... and 5 blocks up or down
     # Combat [18] (DESIGN 4.3)
     "player_base_attack_damage": Const(1.0, "[18]"),  # [18] fist
     "player_base_attack_speed": Const(4.0, "[mem]"),  # [mem] attacks per second without an item
@@ -125,6 +129,9 @@ GAME: dict[str, Const] = {
     "smelt_ticks": Const(200, "[20]"),  # [20] per item in a furnace
     # Items on the ground (DESIGN 5)
     "item_toss_pickup_delay_ticks": Const(40, "[mem]"),  # [mem] after a player throws an item
+    "item_despawn_ticks": Const(6000, "[mem]"),  # [mem] dropped items vanish after 5 minutes of ticking
+    "item_pickup_reach_horizontal": Const(1.0, "[mem]"),  # [mem] player box grown by 1 block in x and z
+    "item_pickup_reach_vertical": Const(0.5, "[mem]"),  # [mem] ... and 0.5 in y
     # Chat (DESIGN 9)
     "chat_min_interval_ticks": Const(40, "[est]"),  # [est] design limit, below vanilla's spam kick
     "chat_message_cost": Const(-0.001, "[est]"),  # [est] reward per message
