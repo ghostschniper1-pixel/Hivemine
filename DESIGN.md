@@ -2,7 +2,7 @@
 
 Design document for two teams of 10–20 learning Minecraft agents.
 
-Draft 0.3, 2026-10-13. Status: design only, nothing built. Written to be picked up after the current project (WAI). Draft 0.2 applied an engineering review and an ML review of draft 0.1. Draft 0.3 adds section 9.1, the owner's emergent-language arm.
+Draft 0.4, 2026-10-16. Status: M0 started (rules build, class tables, vocabulary); see the repository. Nothing is trained yet. Written to be picked up after the current project (WAI). Draft 0.2 applied an engineering review and an ML review of draft 0.1. Draft 0.3 adds section 9.1, the owner's emergent-language arm. Draft 0.4 applies the owner's requests of 2026-10-16: natural language for all actions and observations (sections 5, 6.2, 9), explicit memory (6.3), inert ports for a later LLM (6.5), and container verbs (5, 10). The interfaces between modules are fixed in `docs/contracts.md` (cited below as "contracts").
 
 **Labels.** [n] points to the References. **[mem]** means written from memory and not checked against a source; verify it against the pinned game version before relying on it. **[est]** means an estimate that must be measured. Everything else is a design choice or comes from a cited source.
 
@@ -17,6 +17,17 @@ The owner's design ideas:
 - Use the owner's own high-level actions (craft pickaxe, mine block, chat).
 - No LLM.
 - Teach item meanings by chatting, and see whether the agent learns to ask for items.
+- Write every action as an English command (`mine 4 iron ore.`), in the same words that name what the agent sees, so it can learn what the words mean (added 2026-10-16).
+- Keep a couple of spare layers so an LLM can be hooked up later ("neural surgery"). Until then, no LLM is in the loop (6.5).
+- Give each agent an explicit memory: where things were, who is an enemy, how much is in a chest (6.3).
+
+In the owner's words:
+
+> "I want natural language to be used in all actions so that the model can hopefully learn the words associated with actions/items/blocks/entities/ect." (the owner, 2026-10-16)
+
+> "I want a couple extra layers of neurons available to hook up to a LLM eventually. Like neural surgery so that the LLM can use this to learn how to control Minecraft directly." (the owner, 2026-10-16)
+
+> "How do you plan on handling the memory? How will it remember where things were? Who is an enemy? How much stuff it put in a chest?" (the owner, 2026-10-16)
 
 ### 1.1 Research questions
 
@@ -26,6 +37,7 @@ The owner's design ideas:
 | RQ2 | When two teams share a world, do they fight, avoid each other or cooperate? How does that depend on scarcity and on reward sharing within a team? When they fight, is it a social dilemma or simply the best strategy? | The experiment plan, cross-play and payoff analysis (section 10) |
 | RQ3 | Can a fixed-vocabulary chat carry stable, human-readable meaning? Do agents start asking for items without being taught to? Can they pick up a new word from a partner during play? | Request success, a no-imitation arm, nonce-word episodes, drift checks, sessions with the owner (section 9) |
 | RQ4 | Does training with lag noise make the agents robust on laggy servers? | Real-game evaluation under three lag profiles |
+| RQ5 | Does naming every action, item, block and entity with shared English words help? Does it speed up learning, carry over between related words (`iron ore`, `deepslate iron ore`, `raw iron`), and let the agent understand the owner's typed commands and new combinations of known words? | An ablation with opaque ids instead of words (6.4); held-out word combinations; the owner's typed commands (9) |
 
 RQ2 has no yes/no answer. The expected result is a map of which settings lead to conflict, avoidance or cooperation, with error bars over seeds.
 - "Scarcity changes nothing" is a valid result, but only if the agents are competent. That is why RQ1 comes first.
@@ -38,6 +50,7 @@ RQ2 has no yes/no answer. The expected result is a map of which settings lead to
 | Rules | All recipes and smelts match the real game. Break times logged on the server match within ±1 tick |
 | One agent, simulator | On 1,000 held-out seeds, with honest perception (6.1): iron pickaxe in ≥80% of episodes; first night survived in ≥80% |
 | One agent, real game | Real/sim success ratio ≥0.8 per milestone in each of three evaluation profiles, at the fixed sample size in 11.5 |
+| Language | The word model matches or beats the opaque-id ablation on the single-agent exit test. Held-out word combinations (requests or commands whose pairing of words never occurred in training) are answered correctly above chance |
 | Chat | With scripted helpers, ≥70% of `need X` requests succeed. Nulling the messages lowers team return. Agents use a nonce word correctly within an episode. The owner gets ≥15 of 20 requests answered |
 | Teams | Two independently trained populations of 10–20 agents train stably. Metrics have 95% intervals over ≥8 seeds and differ from scripted baselines. There is a payoff matrix per scarcity level |
 
@@ -46,16 +59,17 @@ The thresholds are proposals [est], so that each stage has a finish line.
 ## 2. Design principles
 
 1. **Mechanics exact, randomness statistically right.** Deterministic rules are generated from game data and copied exactly. Random processes are sampled from the game's own tables, or from statistics measured on real worlds under one frozen server config. Emergent behavior (mob AI, ore exposed in caves) is measured, not derived.
-2. **High-level actions.** The policy picks a verb with arguments, such as `mine(iron_ore)` or `give(bread, 3, agent 7)`. Movement is scripted.
+2. **High-level actions, written in English.** The policy writes a command such as `mine 4 iron ore.` or `give 3 bread to red 7.`, word by word, from one shared vocabulary (section 5). The same words name what the agent sees (6.2) and what it says (9). Movement is scripted.
    - VPT reports that RL from scratch on raw controls never learned to collect logs reliably [35].
    - DreamerV3 needed a faster block-breaking setting from prior work, and 9 days on an A100 [36].
-3. **No LLM in the loop.** LLM agents such as Voyager [45] and Mindcraft [46] are slow (about 9.2 s per GPT-4o response in PillagerBench [48]) and learn no weights. Their social behavior comes from human text; Project Sid states that its institutions do not emerge from scratch [47]. They may serve as baselines, never as the learner.
+3. **No LLM in the loop.** LLM agents such as Voyager [45] and Mindcraft [46] are slow (about 9.2 s per GPT-4o response in PillagerBench [48]) and learn no weights. Their social behavior comes from human text; Project Sid states that its institutions do not emerge from scratch [47]. They may serve as baselines, never as the learner. The network reserves inert ports so an LLM can be coupled in later (6.5); until then they change nothing.
 4. **Simulator plus bridge, as in WAI.** Train in a fast simulator. Play the real game through Mineflayer, which takes the WormKit module's place. Keep checking one against the other, as WAI's dream-vs-WA checks do.
 5. **Lag is noise.** Stale observations, round trips, stretched durations and failed actions are randomized, so the policy must check results.
-6. **One featurizer, one perception function, one action contract.** The simulator and the bridge share observation code, perception, masks and failure codes. Two copies would drift apart.
-7. **The server is the ground truth.** Mineflayer's local view can be wrong; for example, it marks a block as broken before the server agrees [74]. Rule checks are therefore logged on the server.
-8. **Everything measurable.** Every stage has a numeric exit test with a fixed sample size. Statistical checks are equivalence tests, not "failed to reject". Social claims rest on metrics, controls and baselines, not on stories from logs.
-9. **Throughput first.** One process steps thousands of worlds, with no Python per world. Invalid actions are masked, not penalized.
+6. **One featurizer, one perception function, one action contract, one language.** The simulator and the bridge share observation code, perception, memory, masks, failure codes, and the vocabulary and parser. Two copies would drift apart.
+7. **Memory is explicit and honest.** Each agent keeps a notebook of places, players, chests and events (6.3). It holds only what the agent itself perceived, did or was told, never hidden state.
+8. **The server is the ground truth.** Mineflayer's local view can be wrong; for example, it marks a block as broken before the server agrees [74]. Rule checks are therefore logged on the server.
+9. **Everything measurable.** Every stage has a numeric exit test with a fixed sample size. Statistical checks are equivalence tests, not "failed to reject". Social claims rest on metrics, controls and baselines, not on stories from logs.
+10. **Throughput first.** One process steps thousands of worlds, with no Python per world. Invalid actions are masked, not penalized.
 
 ## 3. Architecture overview
 
@@ -63,15 +77,17 @@ The thresholds are proposals [est], so that each stage has a finish line.
 flowchart LR
   subgraph BUILD ["Built offline"]
     MD["minecraft-data 1.21.1<br/>blocks, items, foods, tool speeds"]
-    GEN["Vanilla data generator or mcmeta<br/>recipes, loot, tags, worldgen"]
+    GEN["Vanilla data generator or mcmeta 1.21.1-data<br/>recipes, loot, tags, worldgen"]
+    IC["mcmeta 1.21.1-summary<br/>item components"]
     RULES["rules-1.21.1.json<br/>compiled to lookup tables"]
-    BCLS["Block class table<br/>state to class, collision, hazard"]
+    BCLS["Concept classes<br/>block, item, entity classes and phrases"]
     CHUNKS["Pregenerated real worlds<br/>region files, frozen server config"]
     STATS["Measured statistics<br/>ores by Y, exposure, spawns"]
     POOL["World pool<br/>real chunks + statistical generator"]
     MD --> RULES
     GEN --> RULES
-    MD --> BCLS
+    IC --> RULES
+    RULES --> BCLS
     CHUNKS --> STATS
     CHUNKS --> POOL
     STATS --> POOL
@@ -82,11 +98,18 @@ flowchart LR
     EXEC["Action executor<br/>macros, masks, failure codes"]
     LAG["Lag model"]
     OBS["Perception + observation builder<br/>shared code"]
+    LANG["Language<br/>vocabulary, grammar, parser<br/>shared code"]
+    NOTE["Notebook memory<br/>places, players, chests, events<br/>shared code"]
     REW["Rewards and curriculum"]
     REF -. differential tests .- CORE
     LAG --> EXEC
     EXEC --> CORE
     CORE --> OBS
+    CORE -- perceived, done, told --> NOTE
+    NOTE --> OBS
+    NOTE -- masks --> EXEC
+    LANG --> OBS
+    LANG -- parsed command --> EXEC
     CORE --> REW
   end
   subgraph TRAIN ["Training"]
@@ -111,30 +134,37 @@ flowchart LR
   RULES --> CORE
   BCLS --> CORE
   BCLS --> OBS
+  BCLS --> LANG
   POOL --> CORE
   OBS --> ACT
   REW --> LRN
-  ACT --> EXEC
-  ACT --> COND
+  ACT -- command --> LANG
+  ACT -- command --> COND
   OBS -. same code .- COND
+  LANG -. same code .- COND
+  NOTE -. same code .- COND
   NODE --> CAL
   MC --> CAL
   CORE --> CAL
   CAL -- fixes --> CORE
 ```
 
-| Component | Proposed location and format |
+| Component | Location and format |
 |---|---|
-| Rules build: merge, cross-check, compile | `rules/build_rules.py` → `rules-1.21.1.json` → `rules-1.21.1.bin` |
-| Block class table, shared by the featurizer, perception and the nav grid | `rules/block_classes-1.21.1.csv` |
+| Interfaces between modules | `docs/contracts.md` |
+| Rules build: fetch pinned sources, merge, cross-check, compile | `hivemind/rules/` → `data/rules-1.21.1.json` (pins in `data/sources.json`) → `rules-1.21.1.bin` for the core (planned) |
+| Concept classes: block, item and entity classes with their phrases, shared by the featurizer, perception, the nav grid and the language | `hivemind/rules/` → `data/concepts-1.21.1.json`, `data/block_classes-1.21.1.csv` (one row per block state) |
+| Language: vocabulary, command grammar, parser, masked word-by-word decoding | `hivemind/lang/` → `data/vocab-1.21.1.json` |
 | World pool: pristine worlds, copied on reset | `worlds/seed-<n>.npz` (uint8 voxels plus metadata) |
-| Reference simulator: readable Python, the oracle | `sim/ref/` |
-| Fast core: batched, multithreaded C++ | `sim/core/`, C ABI called through ctypes or nanobind |
-| Perception and observation builder, shared by the simulator and the bridge | `features/` |
-| Rewards, curriculum, trainer, league | `train/` |
+| Reference simulator: readable Python, the oracle (includes the reference perception and the 19 verbs) | `hivemind/sim/ref/` |
+| Fast core: batched, multithreaded C++ | `sim/core/` (planned), C ABI called through ctypes or nanobind |
+| Observation builder and notebook memory, shared by the simulator and the bridge | `hivemind/features/` |
+| Rewards, curriculum, trainer, league | `train/` (planned) |
 | Bridge: conductor, Node hosts, server config, harness mod | `bridge/` |
-| Calibration: telemetry, replays, diff reports | `calib/` |
-| Run records: git hash, rules hash, world-pool hash, config | `runs/<id>/run.json` |
+| Calibration: telemetry, replays, diff reports | `calib/` (planned) |
+| Run records: git hash, rules hash, concepts and vocabulary hashes, world-pool hash, config | `runs/<id>/run.json` |
+
+The `hivemind/`, `data/` and `bridge/` directories exist in the repository; `sim/core/`, `train/` and `calib/` are planned; `worlds/` and `runs/` hold generated outputs and are git-ignored.
 
 ## 4. Simulator specification
 
@@ -148,12 +178,13 @@ flowchart LR
 
 | Source | Used for | Known problems |
 |---|---|---|
-| minecraft-data `pc/1.21.1` [1] | Hardness, `material` (tool tag), `harvestTools`, light, block states; stack sizes, durability; tool speeds (wood 2, stone 4, iron 6, diamond 8, netherite 9, gold 12); recipes; foods | **`blockLoot` and `entityLoot` point to the 1.20 files for every newer version [2] and contain errors.** Coal ore shows 1–2 coal at 0.5; gravel gives flint at 1/3, not 10%. It has no tags, smelting, fuel, mob stats or spawn lists |
+| minecraft-data `pc/1.21.1` [1] | Hardness, `material` (tool tag), `harvestTools`, light, block states; stack sizes, durability; tool speeds (wood 2, stone 4, iron 6, diamond 8, netherite 9, gold 12); recipes; foods | **`blockLoot` and `entityLoot` point to the 1.20 files for every newer version [2] and contain errors.** Coal ore shows 1–2 coal at 0.5; gravel gives flint at 1/3, not 10%. It has no tags, smelting, fuel, mob stats or spawn lists. Entities and block collision shapes point to the 1.20.5 files [2] |
 | Vanilla data generator [4] (`java -DbundlerMainClass="net.minecraft.data.Main" -jar server.jar --server`), or mcmeta `1.21.1-data` [3] | Recipes, including smelting `cookingtime` and `experience`; loot tables; tags (`mineable/*`, `needs_*_tool`); placed ore features; biome spawners | Hardness, fuel, and mob stats and AI live in Java code |
+| mcmeta `1.21.1-summary` [3], `item_components/data.json` | Per item: stack size, durability, food, tool rules and mining speeds, attack damage and attack speed (attribute modifiers) | No armor values and no fuel times (both hard-coded with labels). Attack values are modifiers on the player's base of 1 damage and 4 attacks/s [mem] |
 | minecraft.wiki [13–22][72][73] | Formulas, fuel values, mob stats, gamerules | Written by players; must be verified |
 | Real game, via the bridge and the harness mod | Final authority | Slow |
 
-The build script takes loot, recipes, tags and worldgen from the generator, and everything else from minecraft-data. Recipes exist in both, so it cross-checks them and fails on any disagreement.
+The build script (`hivemind/rules/`) takes loot, recipes, tags and worldgen from mcmeta `1.21.1-data`, item properties from the item components and minecraft-data, and everything else from minecraft-data. Where sources overlap it cross-checks them and fails on any disagreement: recipes in both; stack sizes, durability and food; harvest tools against tool rules plus the `needs_*_tool` tags; tool speeds. Known differences in representation are listed in the build script, each with a reason. The exact upstream commits are pinned in `data/sources.json` (contracts section 1). The built `data/rules-1.21.1.json` is committed, so the project builds offline.
 
 ### 4.2 Exact, approximate, skipped
 
@@ -219,8 +250,12 @@ Check values: stone with a wooden pickaxe 23 ticks; stone by hand 150 (no drop);
 
 ### 4.4 World model
 
-- **Voxels:** one byte per cell holding a block class. About 96 classes matter in v1. Y is trimmed to −64..191, i.e. 256 levels (D3). A 128×128 single-agent world is 4 MiB. A two-team world's side is `sqrt(agents × area per agent)`, e.g. 384² (36 MiB) for 40 agents at about 60² each.
-- **Block class table:** maps every 1.21.1 block state to a class and its flags. The featurizer, perception and the nav grid all read this one table. Flags:
+- **Voxels:** one byte per cell holding a block class: about 100–140 curated classes [est] plus fallback classes, with id 0 for air and 255 for `buried`. Y is trimmed to −64..191, i.e. 256 levels (D3). A 128×128 single-agent world is 4 MiB. A two-team world's side is `sqrt(agents × area per agent)`, e.g. 384² (36 MiB) for 40 agents at about 60² each.
+- **Classes** (contracts section 3). The simulator works on block and item classes, not on the 1,060 blocks and 1,333 items of 1.21.1 [1]. Voxels hold block-class ids, inventories hold item-class counts, and the bridge maps real names to classes. Every block state, item and entity maps to exactly one class, and each class has a phrase (6.2).
+  - **Homogeneous:** all members of a class share every property the simulator uses. For blocks: hardness, tool kinds, harvest requirement, collision, transparency, light, hazard, and drops after mapping items to classes. For items: stack size, durability, food, tool, armor, fuel and recipe roles. The build checks this and fails, except for listed and justified exceptions. So `iron ore` (hardness 3) and `deepslate iron ore` (hardness 4.5) are separate classes, while the eight log types (all hardness 2) form one class `log` [1].
+  - **Fallbacks:** rare or out-of-scope blocks fall into generic classes keyed by their physical signature, so break times stay exact. Fallback classes are never resources. Items outside the v1 tech tree fall into classes keyed by stack size.
+  - **Known approximations:** merging hides some real details. A bed needs three wool of one colour, but the class `wool` has no colour. The class builder lists every such case, and each is a sim-to-real check in M7.
+- **Block class table:** maps every 1.21.1 block state to a class and its flags (`data/block_classes-1.21.1.csv`, one row per state). The featurizer, perception and the nav grid all read this one table. Flags:
   - solid, collision height (slab 0.5, fence 1.5);
   - transparent, liquid, climbable (pathfinder can't use climbables [8]);
   - hazard: lava, fire, magma, cactus, cobweb, powder snow, sweet berry bush.
@@ -268,7 +303,7 @@ T_search = search_ms / tickTimeout      (pathfinder thinks tickTimeout ms per ph
 
 ### 4.6 Performance targets
 
-Environments built on Java Minecraft run at about 72 (MineDojo, one env) to 133 (MineRL, 8 workers) steps/s [39][40], so the real game cannot be the training ground. The simulator also does not need Craftax speed (267k–406k primitive steps/s on an RTX 4090 [40]). One decision here is a macro of about 20–400 ticks [est], and the learner caps training at about 10–15k decisions/s per RTX 3090 (section 13).
+Environments built on Java Minecraft run at about 72 (MineDojo, one env) to 133 (MineRL, 8 workers) steps/s [39][40], so the real game cannot be the training ground. The simulator also does not need Craftax speed (267k–406k primitive steps/s on an RTX 4090 [40]). One decision here is a macro of about 20–400 ticks [est], and the learner caps training at about 8–12k decisions/s per RTX 3090 (section 13).
 
 **Target:** ≥30k decisions/s on 24 threads, with 60k as a stretch goal. 30k is enough to feed two GPUs with headroom. It means ≤800 µs of CPU per decision, including all world ticks in between [est].
 
@@ -285,7 +320,7 @@ Core rules: one process; structure-of-arrays state; pinned observation buffers; 
 
 A **counter-based RNG** (Philox or SplitMix style) is keyed by seed, episode, tick, purpose and entity. It lets the reference and the core draw identical numbers.
 
-**Replays** store the seed, the actions, the lag samples and the rules hash, not states. With the counter-based RNG these replay exactly, and they are small.
+**Replays** store the seed, the actions (as command text), the lag samples and the rules, concepts and vocabulary hashes, not states. With the counter-based RNG these replay exactly, and they are small.
 
 **Tests:**
 1. **Unit tests** against the check values in 4.3.
@@ -305,74 +340,115 @@ A **counter-based RNG** (Philox or SplitMix style) is keyed by seed, episode, ti
 - A nightly Mineflayer smoke suite runs each verb against a local server.
 - Node dependencies are pinned in `package-lock.json`, Python dependencies in a lock file.
 
-## 5. Action set v1
+## 5. Action set v1: English commands
 
-Seventeen verbs. Three things are automatic rather than policy actions:
+Every action is an English command from one shared vocabulary (contracts section 4), such as `mine 4 iron ore.` or `give 3 bread to red 7.` The words are the same ones that name blocks, items, entities and players in the observation (6.2) and that make up chat (9). Players are named `red 0`–`red 19`, `blue 0`–`blue 19` and `human`; the single agent of M1–M5 is `red 0`.
+
+There are nineteen verb ids: the seventeen verbs of draft 0.3, plus `store` and `take` for chests. These two stay off until the team stage (M9; feature flag `containers`), but their words are in the vocabulary from the start, so turning them on does not change the network's input and output layers (D21).
+
+Three things are automatic rather than policy actions:
 - picking up items within 1 block;
 - choosing the best tool inside `mine`, as the `tool` plugin does;
 - respawning.
 
-In the Duration column, RT is one round trip in ticks (RTT/50 ms).
+In the templates, slots are in braces and every other word is literal; every command ends with `.`. In the Duration column, RT is one round trip in ticks (RTT/50 ms).
 
-| Action | Parameters | Mask (allowed when) | Duration | Failure codes | Mineflayer counterpart |
+| Verb id | Command template(s) | Mask (allowed when) | Duration | Failure codes | Mineflayer counterpart |
 |---|---|---|---|---|---|
-| goto | remembered resource class, entity, base, teammate, own furnace | target known and reachable | T_goto (4.5) | NO_PATH, PATH_TIMEOUT, STUCK, INTERRUPTED | pathfinder `goto(GoalNear)` [8] |
-| explore | direction (8) × {16, 32, 64} blocks | not facing the world edge | T_goto to the frontier | NO_PATH, STUCK | pathfinder `GoalXZ` [8] |
-| descend | target Y band {48, 16, 0, −16, −32, −54} | band below the agent; pickaxe held | staircase: per block, break ticks + 6 + one step | NO_PATH, DIG_FAILED, HAZARD, INTERRUPTED | own loop: `dig` + move [6] |
-| strip_mine | direction (4) × {16, 32} blocks, 2 high | pickaxe held | per block, break ticks + 6, plus walking | DIG_FAILED, HAZARD, INV_FULL, INTERRUPTED | own loop: `dig` + move [6] |
-| mine | block class × count bin | class perceived now or in memory (6.1) | per block: T_goto + break ticks + 6 + RT + pickup | NO_TARGET, NO_PATH, DIG_FAILED, INV_FULL, INTERRUPTED | pathfinder + `dig`, with targets from shared perception, never `findBlocks` [6] |
-| craft | item × count bin | recipe satisfiable; 3×3 needs a table within 16 blocks | walk + per item: n_clicks·RT + 2 ticks [est]; a pickaxe is about 8–10 clicks | MISSING_INGREDIENT, NO_STATION, TIMEOUT | `recipesFor`, `craft`, which crafts one item per loop pass [6][75] |
-| smelt_start | input × count bin (fuel chosen automatically) | furnace within 16; input and fuel held | walk + about 6 clicks·RT [est]; the agent is then free | NO_STATION, MISSING_INGREDIENT, TIMEOUT | `openFurnace`, `putFuel`, `putInput` [6] |
-| collect | own furnace (pointer) | that furnace has output ready | walk + about 3 clicks·RT [est] | NO_TARGET, NO_PATH, TIMEOUT | `openFurnace`, `takeOutput` [6] |
-| place | item × pattern {here, front, pillar, enclose, light} | enough items; target cells free | per block: RT + 2 ticks [est] | NO_TARGET, INTERRUPTED, TIMEOUT | `placeBlock` [6] |
-| attack | entity pointer | within 16 blocks | walk, then hit every T ticks until done | TARGET_LOST, DIED, INTERRUPTED | own loop on `attack` (mineflayer-pvp gets flagged as killaura [32]) |
-| flee | entity pointer | hostile or enemy within 16 | move 16–24 blocks away | STUCK | pathfinder, inverted goal [mem] |
-| eat | food item | food held, hunger < 20 | 32 ticks + RT [mem] | INTERRUPTED | `consume` [6] |
-| equip | item × slot | item held | 1–2 RT | TIMEOUT | `equip` [6] |
-| sleep | — | bed within 16, bed window, no hostile within 8 blocks [mem] | until the night is skipped or the agent wakes | NO_STATION, INTERRUPTED | `sleep` [6] |
-| give | item × count × agent pointer | item held; agent within 32 | walk to ≤3 blocks, toss (RT); pickup delay about 40 ticks [mem] | TARGET_LOST, NO_PATH | goto + `toss` [6] |
-| chat | intent, item, count, addressee (section 9) | ≤1 message per 40 ticks | 1 tick + RT/2 | — | `chat` [6] |
-| wait | {20, 100, 400} ticks | always | as chosen | INTERRUPTED | no-op |
+| goto | `go to the nearest {block}` · `go to the {ordinal} {entity}` · `go to {player}` · `go to my furnace {furnace}` · `go to my chest {chest}` · `go to my bed` · `go home` | target known and reachable: blocks from the notebook (6.3), entities from the visible list; chest and bed only when known | T_goto (4.5) | NO_PATH, PATH_TIMEOUT, STUCK, INTERRUPTED | pathfinder `goto(GoalNear)` [8] |
+| explore | `explore {dir8} {explore_dist} blocks`; dir8: `north`, `northeast`, … `northwest`; explore_dist: 16, 32, 64 | not facing the world edge | T_goto to the frontier | NO_PATH, STUCK | pathfinder `GoalXZ` [8] |
+| descend | `dig down to y {y_band}`; y_band: 48, 16, 0, -16, -32, -54 | band below the agent; pickaxe held | staircase: per block, break ticks + 6 + one step | NO_PATH, DIG_FAILED, HAZARD, INTERRUPTED | own loop: `dig` + move [6] |
+| strip_mine | `strip mine {dir4} {strip_dist} blocks`, 2 high; dir4: `north`, `east`, `south`, `west`; strip_dist: 16, 32 | pickaxe held | per block, break ticks + 6, plus walking | DIG_FAILED, HAZARD, INV_FULL, INTERRUPTED | own loop: `dig` + move [6] |
+| mine | `mine {mine_count} {block}`; mine_count: 1, 2, 4, 8, 16 | class perceived now or in the notebook (6.3) | per block: T_goto + break ticks + 6 + RT + pickup | NO_TARGET, NO_PATH, DIG_FAILED, INV_FULL, INTERRUPTED | pathfinder + `dig`, with targets from shared perception, never `findBlocks` [6] |
+| craft | `craft {item_count} {item}`; item_count: 1, 2, 3, 4, 6, 8, 12, 16, 32, 64 | recipe satisfiable; 3×3 needs a table within 16 blocks | walk + per item: n_clicks·RT + 2 ticks [est]; a pickaxe is about 8–10 clicks | MISSING_INGREDIENT, NO_STATION, TIMEOUT | `recipesFor`, `craft`, which crafts one item per loop pass [6][75] |
+| smelt_start | `smelt {item_count} {item}` (fuel chosen automatically) | furnace within 16; input and fuel held | walk + about 6 clicks·RT [est]; the agent is then free | NO_STATION, MISSING_INGREDIENT, TIMEOUT | `openFurnace`, `putFuel`, `putInput` [6] |
+| collect | `collect from my furnace {furnace}`; furnace: 1–4, the agent's own furnaces in placement order | that furnace has output ready | walk + about 3 clicks·RT [est] | NO_TARGET, NO_PATH, TIMEOUT | `openFurnace`, `takeOutput` [6] |
+| place | `place {item} {pattern}`; pattern: `here`, `in front`, `under me` (pillar), `around me` (enclose), `for light` | enough items; target cells free | per block: RT + 2 ticks [est] | NO_TARGET, INTERRUPTED, TIMEOUT | `placeBlock` [6] |
+| attack | `attack the {ordinal} {entity}` · `attack {player}` | within 16 blocks | walk, then hit every T ticks until done | TARGET_LOST, DIED, INTERRUPTED | own loop on `attack` (mineflayer-pvp gets flagged as killaura [32]) |
+| flee | `flee from the {ordinal} {entity}` · `flee from {player}` | hostile or enemy within 16 | move 16–24 blocks away | STUCK | pathfinder, inverted goal [mem] |
+| eat | `eat {item}` | food held, hunger < 20 | 32 ticks + RT [mem] | INTERRUPTED | `consume` [6] |
+| equip | `hold {item}` · `hold {item} in off hand` · `wear {item}` (armor; the slot follows from the item) | item held | 1–2 RT | TIMEOUT | `equip` [6] |
+| sleep | `sleep` | bed within 16, bed window, no hostile within 8 blocks [mem] | until the night is skipped or the agent wakes | NO_STATION, INTERRUPTED | `sleep` [6] |
+| give | `give {item_count} {item} to {player}` | item held; player within 32 | walk to ≤3 blocks, toss (RT); pickup delay about 40 ticks [mem] | TARGET_LOST, NO_PATH | goto + `toss` [6] |
+| chat | `tell {addressee} {sentence}`; addressee: a player, `everyone` or `team`; sentences in section 9 | ≤1 message per 40 ticks | 1 tick + RT/2 | — | `chat` [6] |
+| wait | `wait {wait_seconds} seconds`; wait_seconds: 1, 5, 20 (20, 100, 400 ticks) | always | as chosen | INTERRUPTED | no-op |
+| store | `store {item_count} {item} in my chest {chest}`; chest: 1–8, the agent's own chests | `containers` on; item held; chest known (6.3) | walk + about 3 clicks·RT [est] | NO_TARGET, NO_PATH, INV_FULL (chest full), TIMEOUT | `openContainer`, `window.deposit` [6] |
+| take | `take {item_count} {item} from my chest {chest}` | `containers` on; the notebook says that chest holds the item | walk + about 3 clicks·RT [est] | NO_TARGET (item gone), NO_PATH, INV_FULL, TIMEOUT | `openContainer`, `window.withdraw` [6] |
+
+- **Entities by name and rank.** `{ordinal}` is `nearest`, `second`, `third`, … `sixteenth`: the rank by distance among visible entities with the same phrase. Entity phrases are entity-class phrases (`zombie`, `cave spider`, `cow`), or `dropped {item}` for an item on the ground. This replaces draft 0.3's entity pointer: the agent names a target the way a player would (`attack the second zombie.`).
+- **Counts mean "up to".** `craft 64 stick.` crafts as many as possible, up to 64; `give 8 bread to red 3.` gives at most what is held. A count is valid if at least one unit can be done. The count's mask then does not depend on the item chosen after it, and commands read the way people talk. The result reports what was actually done (the inventory change).
 
 `descend` and `strip_mine` exist because iron is mostly below the surface. Smelting is split in two so the agent is not blocked for 200 ticks per item (80 s for 8 ores); the furnace is a scheduled event that runs only while its chunk ticks.
 
 **Failure codes**, the same in the simulator and the bridge: `NO_TARGET, NO_PATH, PATH_TIMEOUT, STUCK, DIG_FAILED, MISSING_INGREDIENT, NO_STATION, INV_FULL, TARGET_LOST, HAZARD, INTERRUPTED, DIED, TIMEOUT`.
-- Every action has a deadline in ticks and in wall-clock time. The failure code appears in the next observation.
+- Every action has a deadline in ticks and in wall-clock time. The result, as words, appears in the next observation and in the logs.
 - Voyager teleports stuck bots with `/tp` [33]. Here a stuck bot gets `STUCK`, and the policy must recover.
+
+Each code maps one-to-one to **result words** from the shared vocabulary (contracts 4.3):
+
+| Code | Result words |
+|---|---|
+| `OK` | `done` |
+| `NO_TARGET` | `no target` |
+| `NO_PATH` | `no path` |
+| `PATH_TIMEOUT` | `path too slow` |
+| `STUCK` | `stuck` |
+| `DIG_FAILED` | `dig failed` |
+| `MISSING_INGREDIENT` | `missing ingredient` |
+| `NO_STATION` | `no {station} nearby`; station: `crafting table`, `furnace`, `bed` |
+| `INV_FULL` | `inventory full` |
+| `TARGET_LOST` | `target lost` |
+| `HAZARD` | `danger ahead` |
+| `INTERRUPTED` | `interrupted by {cause}`; cause: `damage`, `message`, or the phrase of the hostile that appeared (`interrupted by creeper`) |
+| `DIED` | `died` |
+| `TIMEOUT` | `too slow` |
 
 **Wrapper rules** (bridge side):
 - **Deadlines with cleanup.** On a deadline or a cancel, the wrapper calls `stopDigging`, stops pathfinder, and closes any window. Some Mineflayer calls can hang: for versions without transaction packets, such as 1.21.1, a window click waits for a slot update with no timeout [75].
 - **Digs are verified.** Mineflayer's `dig` waits `bot.digTime` (prismarine-block's formula), sends "finish", and then sets the block to air locally [74]. The promise can therefore resolve even if the server delays or refuses the break. After a dig, the wrapper re-reads the block after RT + 2 ticks, and returns `DIG_FAILED` if the block is still there.
 - **Targets come from shared perception**, never from `findBlocks`, which searches every loaded block and amounts to X-ray.
 
-**Action heads.** The action space is factorized into a verb head and argument heads, like the craft/place/equip enums of MineRL and MineDojo [37][38].
-- Invalid choices get a logit of −1e9. This keeps the policy gradient valid and scales far better than penalties [65].
-- Masks are stored with the rollout, so the PPO ratios use the same masks.
+**Writing a command.** Draft 0.3 factorized the action into a verb head and argument heads, like the craft/place/equip enums of MineRL and MineDojo [37][38]. Draft 0.4 has the policy write the command one word at a time (contracts 4.5; network in 6.4).
+- **Grammar mask.** At each step only words that continue some valid command are allowed. The mask comes from the grammar and the game state: after `mine 4`, only the phrases of blocks the agent knows remain. Invalid words get a logit of −1e9. This keeps the policy gradient valid and scales far better than penalties [65].
+- **Forced words.** When only one word can follow (`to` in `give 3 bread to`, the final `.`), it is fed in without a decision. It adds nothing to the log-probability or the entropy.
+- **Tied output scores.** A word's score is the decoder state's dot product with that word's embedding, the same embedding that reads the word in the observation [87]. What the network learns about `iron` from `raw iron` in its inventory carries over to writing `mine 4 iron ore.`
+- **Probability and entropy.** The log-probability of a command is the sum over its non-forced words, which gives the exact probability of the command. The entropy bonus is the sum of the per-step entropies along the sampled command. By the chain rule its expected value is the joint entropy of the whole command, so it is an unbiased estimate, and it needs only the steps actually taken; draft 0.3's exact formula, `H(verb) + Σ_v p(v)·H(args | v)`, needed every verb's argument heads at every step. Its gradient makes each step's choice less certain, but it does not pull the verb choice toward verbs with more argument choices (`chat`, `give`), as the gradient of the exact formula does. That removes draft 0.3's bias toward those verbs. A forced word adds no entropy.
+- **Masks are stored with the rollout**, so the PPO ratios use the same masks.
+
+**Precedent.** Agents for text adventure games act through generated English commands. LSTM-DQN scores an action word and an object word [81]; TDQN fills verb-object templates word by word [83]; KG-A2C generates template commands, with a knowledge graph restricting the objects [84]; DRRN scores whole command texts against the state text [82] (all [mem]).
+
+**Ablations** (RQ5), each on the single-agent exit test:
+- **Opaque ids:** each concept (block class, item class, entity, verb, number) gets its own id and embedding, and the output heads are untied, as in draft 0.3. Same masks, same information, no shared words.
+- **Phrase-level scoring:** each slot is one choice among whole phrases, scored against the phrase vectors (6.4), in the style of DRRN [82]. Fewer decoding steps, same words.
+
+**Commands are the interchange format.** Logs, replays, the bridge protocol (11.1), the human and the scripted helpers all use command text. One parser (`hivemind.lang`) turns text into the parsed form (verb plus slot values, contracts 4.4), and `parse(render(c)) == c` holds for every v1 command. The C++ core and the Node side execute the parsed form and never parse English themselves.
 
 ## 6. Observation and network v1
 
 ### 6.1 Perception
 
-Perception is defined once and runs in the C++ core. The bridge calls the same function on the blocks that Mineflayer holds.
+Perception is defined once and runs in the C++ core; the reference version is `hivemind/sim/ref/perception.py`. The bridge calls the same function on the blocks that Mineflayer holds.
 - **Exposed:** a block is exposed if at least one face touches air or a transparent block.
 - **Voxel window** (within 7 blocks): exposed cells show their class. Buried cells show a single `buried` class. This allows a little knowledge through walls at short range, the same on both sides.
-- **Resource memory** (within 24 blocks [est]): a block enters memory only when one of its exposed faces is in line of sight. Line of sight is a ray from the eyes that crosses only transparent cells. It is checked every 5 ticks on a fixed set of rays [est].
+- **Resource sightings** (within 24 blocks [est]): a block of a resource class enters memory only when one of its exposed faces is in line of sight. Line of sight is a ray from the eyes that crosses only transparent cells. It is checked every 5 ticks on a fixed set of rays [est]. Sightings are written into the notebook's places table (6.3), which replaces draft 0.3's separate resource memory.
 - **X-ray condition** (ablation only): memory is filled from every block within 24, which is what `findBlocks` does. Results are reported separately and never count toward the exit criteria.
 
 ### 6.2 Observation
 
-| Part | Shape | Encoding |
-|---|---|---|
-| Voxel window | 15 × 15 (x, z) × 7 (y −3..+3) | block class, embedded (`buried` for unexposed cells); light/15 |
-| Resource memory | 40 classes × 4 | known?, path distance/128, dy/64, count seen (perceived blocks only) |
-| Furnaces | 4 own furnaces × 3 | distance/64, input left, output ready |
-| Inventory | ~120 items | log(1+n)/log(65); held item; armor; durability |
-| Self | 10 | health, food, saturation, air, XP, y/320, sin/cos of time of day, rain, light |
-| Entities | 16 nearest within 32 blocks | type, offset/32, HP, held item, flags (teammate, enemy, hostile, passive, human), slot; padding mask |
-| Chat | last 8 messages | 4 slot tokens, speaker relation (self, team, enemy, human), addressed-to-me flag, age |
-| Last action | 4 | verb, argument, result code, elapsed ticks |
-| Lag | 1 | ping/500 ms (Mineflayer reports ping [6]) |
-| Identity | 1–2 | agent slot 0–19; team id only in the shared-network variant |
+Every symbolic field is given as words from the shared vocabulary (contracts section 4), plus numbers. A voxel is not class 37 but `deepslate iron ore`; an inventory stack is `raw iron` and a count; a nearby player is `blue 7`, `enemy`. The network reads every word through one embedding table (6.4).
+
+| Part | Shape | Words | Numbers |
+|---|---|---|---|
+| Voxel window | 15 × 15 (x, z) × 7 (y −3..+3) | block-class phrase (`stone`, `iron ore`; `buried` for unexposed cells) | light/15 |
+| Inventory | up to 41 tokens (36 main slots, 4 armor, off hand) | item phrase (`raw iron`, `iron pickaxe`) | log(1+n)/log(65), durability; held, armor and off-hand flags; padding mask |
+| Self | 10 | — | health, food, saturation, air, XP, y/320, sin/cos of time of day, rain, light |
+| Entities | 16 nearest within 32 blocks | entity phrase (`zombie`, `dropped raw iron`) or player name (`blue 7`); relation word (`teammate`, `enemy`, `human`, `hostile`, `passive`); held item phrase | offset/32, HP, rank among visible entities with the same phrase (the `{ordinal}` of section 5); padding mask |
+| Chat | last 8 messages | the sentence (`i need 3 iron ingot`); speaker's name and relation word | from-me and addressed-to-me flags, age |
+| Furnaces | 4 own furnaces | `my furnace 2`; input and output item phrases | distance/64, input left, output ready |
+| Notebook (6.3) | about 136 tokens | each entry's words (`iron ore`; `blue 7` `enemy`; `my chest 1` `iron ingot`; `blue 7 attacked me`) | offset, path distance/128, dy/64, counts, age |
+| Last command | 1 | the command (`mine 4 iron ore.`) and its result words (`interrupted by zombie`) | elapsed ticks |
+| Lag | 1 | — | ping/500 ms (Mineflayer reports ping [6]) |
+| Identity | 1 | own name (`red 7`): the number is the agent slot; the team word matters only in the shared-network variant | — |
 
 **Teammates' inventories are hidden**, as in the real game; otherwise asking would be pointless. Nearby players' held items and armor stay visible.
 
@@ -380,20 +456,69 @@ Precedents:
 - Craftax's symbolic observations are about 10× faster than pixels [40].
 - Neural MMO convolves a 15×15 tile crop and uses attention only for entities [54].
 
-### 6.3 Network (about 4–6M parameters)
+### 6.3 Memory: the notebook (added in draft 0.4)
+
+The owner asked how the agent will remember where things were, who is an enemy, and how much it put in a chest (section 1). The GRU alone cannot do it:
+- Weights do not change during play, so anything learned in an episode must live in the network's state.
+- A GRU is poor at exact recall over a 24,000-tick day. It can carry "a zombie is close" for a few decisions, not "my chest 2 held 11 iron ingots this morning".
+
+So each agent keeps an explicit **notebook**, written by code and read by the network (contracts 6.1). The GRU still carries short-term context. Learned external memories, which the network writes itself (MERLIN [91], Neural Map [92]), are a later option; the notebook is the simple baseline that can be inspected and tested.
+
+| Table | Capacity | Entry | Answers |
+|---|---|---|---|
+| Places | 48 | kind (`resource`, `station`, `danger`, `home`); phrase (`iron ore`, `my furnace 2`, `my chest 1`, `my bed`, `lava`); position; count seen; first and last seen tick. When full, the entry with the lowest score of resource tier, distance and age is dropped [est] | Where were things? |
+| Players | 40 | name (`blue 7`); relation from the visible team colour (`teammate`, `enemy`, `human`); last seen position and tick; last message words; counters: damage dealt to me, damage I dealt, kills each way, items given each way, items taken from my chests | Who is an enemy? |
+| Containers | 8 own + 8 seen | phrase (`my chest 1`); position; contents (item class → count) as of the last time the agent looked; tick of that look | How much is in a chest? |
+| Events | 16, ring buffer | an event sentence (`blue 7 attacked me`, `3 iron ingot missing from my chest 1`, `i found diamond ore`) and its tick | What happened? |
+
+Rules:
+- **Honest.** Written only from what the agent itself perceived (6.1), did, or was told in chat; never from hidden state. What it was told is stored as the speaker's words (last message), not as fact. Tests change hidden parts of the world and check that the notebook stays the same.
+- **Persistent.** Survives death and respawn within an episode (from M9, when respawn exists), and is cleared at episode reset. An agent that respawns still knows who killed it and where its chest is.
+- **Shared code.** The same `Notebook` (`hivemind/features/memory.py`) runs in the simulator and the bridge.
+- **Masks read the notebook, not the world.** `goto`, `mine`, `store` and `take` offer only targets the notebook holds (section 5).
+- **Read as tokens.** One token per place, player and event, and one per chest and item class it holds (at most 32 [est]): about 136 tokens. Each token is words plus numbers, read by cross-attention from the trunk (6.4), so many entries stay cheap.
+
+**Who is an enemy.** The relation word is the team colour, as a real player sees it on a name tag; it is not hidden information. But colour says only who is on which side. The behaviour counters (damage each way, kills, gifts, items taken from my chests) let the agent learn who is actually dangerous, and whether a particular enemy tends to leave it alone. Grudges and trust between individual agents are part of RQ2 (10.3).
+
+**How much is in a chest.** Contents are stored as last seen. The agent's own `store` and `take` update them exactly. If someone else takes items, the notebook does not know until the agent next opens the chest; then the count has dropped, and the event `3 iron ingot missing from my chest 1` is written. Theft is discoverable, not seen. The thief is named (`blue 7 took 3 iron ingot from my chest 1`) only when the agent saw it happen.
+
+### 6.4 Network (about 4–6M parameters)
 
 | Block | Design | Forward cost [est] |
 |---|---|---|
-| Voxels | 8-d class embedding plus light, y folded into 63 channels; Conv 3×3 → 64; Conv 3×3 stride 2 → 64; Linear 4096 → 256 | 16 + 5 + 2 MFLOP |
-| Entities and chat | 24 tokens (16 entities, 8 messages); 2-layer masked transformer, d = 128, 4 heads; mean- and max-pooled to 256. Entity tokens double as pointer targets | ~19 MFLOP (about 0.39 MFLOP per token per layer) |
-| Other inputs | MLP over inventory, self, memory, furnaces, last action, identity → 256 | <1 MFLOP |
-| Trunk | 768 → 512 → GRU 512, the GRU size of Craftax's PPO-RNN baseline [40] | ~4 MFLOP |
-| Heads | verb (17), then argument heads conditioned on the verb: item class (~160), entity pointer, count, pattern, direction, Y band, or the 4 chat slots in turn | <1 MFLOP |
-| **Total** | | **≈ 47 MFLOP** (≈ 66 with 48 tokens) |
+| Words | One word embedding table shared by every input and the output: about 600 words × 64 [est]. A phrase encoder turns a phrase into one vector: the mean of its word vectors plus its head word's vector (`ore` in `iron ore`), then a small MLP → 64. It runs once per batch over every phrase in the vocabulary, not once per observation | ~0 per decision |
+| Voxels | Class embedding = the class's phrase vector projected to 8-d; plus light, y folded into 63 channels; Conv 3×3 → 64; Conv 3×3 stride 2 → 64; Linear 4096 → 256 | 16 + 5 + 2 MFLOP |
+| Entities and chat | 24 tokens (16 entities, 8 messages), each its phrase and relation vectors plus numbers → 128; 2-layer masked transformer, d = 128, 4 heads; mean- and max-pooled to 256. Plus 8 LLM input-port tokens, masked out and skipped during RL (6.5) | ~19 MFLOP (about 0.39 MFLOP per token per layer) |
+| Inventory | up to 41 tokens: item phrase vector plus numbers → 128, shared across slots; mean- and max-pooled to 256 | ~1 MFLOP |
+| Notebook | about 136 tokens (6.3): words plus numbers → key and value (64 each); 4-head cross-attention with the GRU's previous state as the query → 256 | ~3 MFLOP |
+| Other inputs | MLP over self, furnaces, last command and result, lag, identity → 256 | <1 MFLOP |
+| Trunk | 1280 → 512 → GRU 512, the GRU size of Craftax's PPO-RNN baseline [40]; then two spare adapter layers, inert until an LLM is coupled (6.5) | ~4 MFLOP, adapters <1 |
+| Action decoder | GRU 256 [est] started from the trunk state with `<bos>`; input: the previous word's embedding; output scores tied to the word embeddings (section 5, "Writing a command") | ~6 MFLOP (about 0.6 per word, up to ~10 words) |
+| **Total** | | **≈ 56 MFLOP** (≈ 75 with 48 entity and chat tokens) |
 
-- **Log-probability:** summed over the heads used, which gives the exact joint probability.
-- **Entropy:** the exact joint entropy, `H(verb) + Σ_v p(v)·H(args | v)`. Summing entropies over the heads used would give chat (4 heads) and give (3) a larger bonus than wait. If computing every verb's argument heads proves too slow, fall back to dividing each head's entropy by the log of its number of valid options.
-- **Shared item embeddings** (D9): blocks, inventory slots, arguments and chat item tokens share one table. The chat token `iron_ingot` then starts with the same vector as the ingot in the inventory. Nonce words (9) get their own, initially uninformative, vectors.
+- **Log-probability and entropy:** summed over the non-forced words of the command (section 5).
+- **Shared word embeddings** (D9): every symbol (block, item and entity classes, players, verbs, numbers, results, chat) is made of words from one table. `iron` in the voxel phrase `iron ore`, in the inventory's `raw iron`, in the chat sentence `i need 3 iron ingot` and in the command `mine 4 iron ore.` is one vector. Agents in simulated 3D worlds that learned words from grounded experience generalized to new combinations of known words [85] [mem]; RQ5 tests whether the same happens here. Nonce words (9) get their own, initially uninformative, vectors.
+- **Sentences keep their order.** Chat, event and command sentences are encoded slot by slot: the template's words, then each slot's phrase vector in a fixed position. `blue 7 attacked me` and `i attacked blue 7` then differ.
+- **Ablation:** opaque per-concept ids with untied output heads, as in draft 0.3 (section 5).
+
+### 6.5 LLM ports (added in draft 0.4)
+
+The owner wants spare layers so an LLM can later learn to control Minecraft through the agent's network (section 1). The ports are reserved now, so that coupling later does not change the network's shape, and they do nothing until then.
+
+| Port | Design | During RL |
+|---|---|---|
+| Input port | 8 extra tokens (width 128) in the entity and chat transformer (6.4), for an LLM's hidden states after a learned projection | masked out and skipped |
+| Output port | the trunk state (512) and the action decoder's states, exposed for reading | read by nothing |
+| Spare layers | two residual bottleneck adapters (512 → 128 → 512) after the GRU, with zero-initialised output weights, so each is the identity until trained. This is the trick of adapters [88], LoRA [89] and ControlNet's zero convolutions [90] [mem] | frozen at zero (not in the optimizer) |
+| Vocabulary bridge | Our words are English, so their embeddings can be aligned with an LLM's token embeddings of the same words (a learned map fitted on the shared words) | unused |
+| Text route | Works today, with no surgery: an LLM can write commands (`mine 4 iron ore.`) that the parser checks, or chat with the agents like the owner (9) | off |
+
+**Surgery protocol** (optional milestone M11):
+1. Freeze the trained policy.
+2. Train the adapters and port projections, and LoRA on the LLM [89], on supervised pairs: the game state plus an instruction, and the command a good player would write (from logged owner sessions and scripted experts).
+3. Fine-tune with RL.
+
+**"No LLM in the loop" still holds** for every RL experiment (principle 3). The ports are masked and the adapters zero-initialised and frozen, so they change nothing. A test checks that the outputs are identical with and without them. Cost: about 0.3M parameters and under 1 MFLOP per decision.
 
 ## 7. Rewards and curriculum
 
@@ -478,31 +603,34 @@ A delayed MDP becomes Markov again if the state includes the actions sent since 
 
 ## 9. Chat and grounding
 
-**Vocabulary v1 (about 118 tokens).** A message has 4 slots (intent, item, count, addressee); `none` fills unused slots.
+**Vocabulary.** Chat uses the shared English vocabulary (contracts section 4), not draft 0.3's 118 slot tokens. A message is one of the sentence templates below (the 14 intents), sent with the command `tell {addressee} {sentence}.` The addressee is a player (`red 7`, `human`), `everyone` or `team`.
 
-| Slot | Tokens |
+| Intent | Sentence |
 |---|---|
-| intent (14) | need, have, give, come, follow, help, attack, flee, stop, wait, yes, no, thanks, where |
-| item (~68) | minecraft-data names (log, planks, stick, cobblestone, coal, raw_iron, iron_ingot, bread, ...) plus 8 nonce words `word_1`–`word_8` whose meaning is drawn per episode |
-| count (10) | 1, 2, 3, 4, 6, 8, 12, 16, 32, 64 |
-| addressee (~24) | agent 0–19, all, team, me, you |
+| need, have, give | `i need {count} {item}` · `i have {count} {item}` · `give me {count} {item}` |
+| where | `where is {item}` |
+| come, follow, help | `come here` · `follow me` · `help me` |
+| attack, flee, stop, wait | `attack` · `flee` · `stop` · `wait` |
+| yes, no, thanks | `yes` · `no` · `thanks` |
 
-- **Rendering:** a message is shown as text, e.g. `need 3 iron_ingot @all`.
+- **Slots:** `{item}` is any v1 item phrase (`iron ingot`, `raw iron`, `bread`) or a nonce word; `{count}` is 1, 2, 3, 4, 6, 8, 12, 16, 32 or 64. Example: `tell everyone i need 3 iron ingot.`
+- **Nonce words** are made-up, English-like words: `dax`, `wug`, `blicket`, `fep`, `toma`, `zib`, `kiki`, `bouba`, in the spirit of Berko's wug test [93] [mem]. They are allowed only in chat item slots, and their meaning is drawn per episode.
+- **Rendering:** in the game, a message is plain chat text with the addressee first (`everyone, i need 3 iron ingot.`), the same form the owner types (below). The exact format is fixed in M2.
 - **Limits:** at most 1 message per 40 ticks, each costing −0.001 [est]. This keeps agents below vanilla's spam kick [mem]; 26.2 made the threshold configurable [29].
 - **Interrupts:** only messages from teammates and the human interrupt an action (4.5).
-- **Structure:** with large vocabularies, emergent-language agents gave each object its own symbol, without structure [59]. The fixed template builds the structure in.
+- **Structure:** with large vocabularies, emergent-language agents gave each object its own symbol, without structure [59]. The fixed templates build the structure in, and their words are the same as in actions and observations.
 
 **How meaning is learned:**
 1. **Asking pays.** Inventories are hidden, and agents get different starting kits and areas. **Giving pays** through the team share τ > 0 (section 10) and through the receiver's own crafts (section 7).
-2. **Scripted helpers** use the human meaning. On `need X n` they come and give X if they have it, and they say `have X` truthfully. They start as 30–50% of teammates and anneal to about 10%, so a learner gets help only by using the human meaning.
-3. **Shared item embeddings** (section 6). An ablation with separate, random chat embeddings tests the owner's idea of teaching meaning through chat alone.
+2. **Scripted helpers** use the human meaning. On `i need {n} {x}` they come and give x if they have it, and they say `i have {n} {x}` truthfully. They start as 30–50% of teammates and anneal to about 10%, so a learner gets help only by using the human meaning.
+3. **Shared word embeddings** (6.4). An ablation with separate, random chat embeddings tests the owner's idea of teaching meaning through chat alone.
 4. **Auxiliary losses (weight about 0.1):**
    - a speaker loss toward what a scripted speaker would say;
    - a listener head predicting the speaker's need or have;
    - positive-signalling and positive-listening losses [64].
 5. **Supervised first, then self-play**, with the supervised loss kept in the mix. Lowe et al. found this order works best [63]. Lewis et al. used a frozen human-like partner and 1 supervised update per 4 RL updates [58]. Lazaridou et al. also grounded emergent symbols in natural language [60].
-6. **Nonce-word episodes: the owner's "teach it by chatting".** Weights do not change during play, so a word learned mid-game must live in the GRU's memory. In 20% of episodes [est], each `word_k` stands for an item drawn for that episode, and helpers use it consistently (`have word_3`, then hand over bread). The agent must learn the word from its partner. Score: request success with nonce words, by how often the word was shown before.
-7. **No-imitation arm.** No speaker loss and no supervised pretraining; helpers still answer `need X`. A random `need X` comes up about once in 14 × 60 = 840 chat actions [est], so this arm tests whether asking is discovered rather than imitated. It answers RQ3's "do they learn to ask?"; the main arm shows how well taught asking works.
+6. **Nonce-word episodes: the owner's "teach it by chatting".** Weights do not change during play, so a word learned mid-game must live in the GRU's state or in the notebook (the speaker's last message and the `gave me` event, 6.3). In 20% of episodes [est], each nonce word stands for an item drawn for that episode, and helpers use it consistently (`i have 3 dax`, then hand over bread). The agent must learn the word from its partner. Learning a new name for an object within an episode is the "fast mapping" studied in grounded agents by Hill et al. [86] [mem]. Score: request success with nonce words, by how often the word was shown before.
+7. **No-imitation arm.** No speaker loss and no supervised pretraining; helpers still answer `i need {n} {x}`. Under a uniform word-by-word policy, a given `i need … x` comes up about once in 13 × 2 × 60 ≈ 1,500 chat actions [est] (`i` is one of 13 first words, `need` one of 2 after it, and x one of about 60 items), so this arm tests whether asking is discovered rather than imitated. It answers RQ3's "do they learn to ask?"; the main arm shows how well taught asking works.
 
 **Precedent.** Craftax-Coop added REQUEST_RESOURCE and GIVE actions to Craftax. Trading appeared most under MAPPO, less under IPPO, and not at all under PQN [44].
 
@@ -512,19 +640,21 @@ A delayed MDP becomes Markov again if the state includes the actions sent since 
 - Evaluation uses partners the agents never trained with [56].
 
 **A human in the chat:**
-- A tokenizer lowercases text, maps item names and synonyms to tokens, maps "me"/"I" to the speaker and numbers to the nearest bin, and drops unknown words.
-- The human appears as an entity with relation "human". Logged human chats become supervised data.
+- The human tokenizer (contracts 4.4) lowercases text, turns plurals into the singular (`ingots` → `ingot`), number words into digits (`three` → `3`) and synonyms into vocabulary words (`pick` → `pickaxe`, `workbench` → `crafting table`). It maps "me"/"I" to the speaker and counts to the nearest bin, and drops filler words. Unknown words become `<unk>`.
+- The human appears as the player `human`, with relation word `human`. Logged human chats become supervised data.
+- **Commands from the owner.** The owner can type the same commands the agent uses, addressed to an agent: `red 0, mine 4 iron ore`. Helpers obey them. Learners see them as words in the chat field; nothing rewards obeying them in v1, which leaves room for a later instruction-following arm.
 - **What to expect:** the agent learns what to *do* with a message (come, give, look for X). It does not understand language.
-- The owner teaches meanings by being a consistent helper: say `have 3 bread`, then hand over bread. Nonce words let the owner name things the agent has never heard of.
+- The owner teaches meanings by being a consistent helper: say `i have 3 bread`, then hand over bread. Nonce words let the owner name things the agent has never heard of.
 
 | Metric | Definition |
 |---|---|
-| Ask rate | `need X` sent when X is missing for a reachable craft |
-| Request success and latency | X received within 600 ticks; median delay |
+| Ask rate | `i need … x` sent when x is missing for a reachable craft |
+| Request success and latency | x received within 600 ticks; median delay |
 | Causal influence | change in listener actions and team return when messages are replaced by a null message [62] |
-| Truthfulness | `have X` sent while actually holding X |
+| Truthfulness | `i have … x` sent while actually holding x |
 | Helper agreement | learner messages a scripted speaker would also send |
-| Nonce-word success | request success with `word_k`, by number of prior exposures in the episode |
+| Nonce-word success | request success with nonce words, by number of prior exposures in the episode |
+| Held-out combinations | correct responses to requests and owner commands whose pairing of words never occurred in training, against chance (RQ5) |
 | Human success | the owner's requests answered correctly, out of 20 per session |
 
 Messages can be informative yet ignored [62], so causal influence, not message count, is the main metric.
@@ -536,7 +666,7 @@ Messages can be informative yet ignored [62], so causal influence, not message c
 This is a separate experiment from the grounded chat above. The grounded chat is for talking with humans. This arm asks whether agents invent a language of their own, and what they use it for.
 
 **The free channel.**
-- K abstract symbols with no meaning given: 32 symbols [est], messages of 1–3 symbols, rendered as `#07 #19` in logs.
+- K abstract symbols with no meaning given: 32 symbols [est], messages of 1–3 symbols, rendered as `#07 #19` in logs. The symbols are abstract on purpose: they are not words of the shared English vocabulary (6.4), so any meaning they get comes from use alone.
 - No helpers, no speaker loss and no supervised data on this channel. Meaning can only come from what works.
 - Variants: team-only channel (main) and global channel (the other team can listen in). Both channels can coexist (grounded + free) or the free channel can run alone.
 - Same rate limit and small cost as chat (one message per 40 ticks, −0.001).
@@ -592,7 +722,9 @@ Expect the first languages to be small and practical: a few symbols for "danger"
   - death drops the inventory, and the agent respawns at base after a delay;
   - cross-team damage on, friendly fire off (a scoreboard team option [mem]);
   - global chat, with team-only as a variant;
-  - the night-skip gamerule set explicitly. At the default of 100%, one awake enemy blocks the skip [73], and the simulator models the same rule.
+  - the night-skip gamerule set explicitly. At the default of 100%, one awake enemy blocks the skip [73], and the simulator models the same rule;
+  - containers on (feature flag `containers`, D21): agents place chests and use `store` and `take` on their own chests, up to 8 each (section 5).
+- **Containers and theft.** Vanilla chests have no owner, so any player can open any chest [mem]. Theft is therefore possible. The notebook keeps each chest's contents as last seen, so the victim finds out the next time it opens the chest (6.3), and learns the thief's name only if it saw the theft. In the v1 grammar an agent can take only from its own chests, so the first thieves are scripted raiders and the owner. Letting learners take from other chests needs one more template (`take {item_count} {item} from the {ordinal} chest`), made only of words already in the vocabulary; it is decided at M9 (D21).
 
 ### 10.2 Scarcity and controls
 
@@ -616,6 +748,8 @@ Knobs: ore density ×{0.25, 0.5, 1, 2}, area per agent (about 60² or 120² bloc
 | Avoidance | contact time vs a random-placement baseline at the same density and area | ratio |
 | Gifts | `give` calls and items moved, within and across teams | per agent-hour |
 | Scavenging | other team's dropped items picked up, including death drops | per agent-hour |
+| Storage | items stored and taken back; share of a team's items held in chests; chests per agent | per agent-hour; share |
+| Theft | items taken from other players' chests, within and across teams; ticks until the victim notices (6.3); the victim's attacks on a known thief compared with its attacks on other enemies | per agent-hour; ticks; ratio |
 | Territory | chunks holding a team's placed blocks; overlap between teams | share |
 | Inequality | Gini of inventory value (crafting depth), within and across teams | 0–1 |
 | Specialization | entropy of each agent's verb distribution; mutual information between slot and verb | bits |
@@ -646,10 +780,10 @@ Chat is off in the core plan. It belongs to M8, and enters the team stage only a
 
 | Phase | Cells | Seeds | Per run | Runs | Machine time [est] |
 |---|---|---|---|---|---|
-| Pilot and convergence check | scarcity {0.25, 2} × τ {0, 1} | 2 | 1.5B, with checkpoints at 0.5B and 1.0B | 8 | ~6 days |
-| Main grid | scarcity {0.25, 0.5, 1, 2} × τ {0, 1} | 8 | 0.5B | 64 | ~16 days |
-| Controls | {PvP off, keepInventory} × scarcity {0.25, 2}, τ = 0 | 8 | 0.5B | 32 | ~8 days |
-| Variants | τ = 0.5; shared network; team size 5 and 20; area; chat global vs team | 4, at scarcity 0.25 and 2 | 0.5B | ~48 | ~12 days |
+| Pilot and convergence check | scarcity {0.25, 2} × τ {0, 1} | 2 | 1.5B, with checkpoints at 0.5B and 1.0B | 8 | ~7 days |
+| Main grid | scarcity {0.25, 0.5, 1, 2} × τ {0, 1} | 8 | 0.5B | 64 | ~19 days |
+| Controls | {PvP off, keepInventory} × scarcity {0.25, 2}, τ = 0 | 8 | 0.5B | 32 | ~9 days |
+| Variants | τ = 0.5; shared network; team size 5 and 20; area; chat global vs team | 4, at scarcity 0.25 and 2 | 0.5B | ~48 | ~14 days |
 
 **Statistics:**
 - With 8 seeds, t(0.975, 7) = 2.36, so a 95% interval is ±0.83 SD of the seed spread. With 3 seeds it would be ±2.5 SD (t = 4.30).
@@ -662,7 +796,7 @@ Chat is off in the core plan. It belongs to M8, and enters the team stage only a
 
 ```
 Python conductor (asyncio) ── TCP, u32 length + msgpack ── Node hosts ×10 (4 bots each: wrappers, lag shim, telemetry)
-   │ same featurizer, perception and masks as the simulator
+   │ same featurizer, perception, notebook, language and masks as the simulator
    └─ RCON :25575 (/tick, setup, resets, /tick query) ── Fabric 1.21.1 servers (Lithium + Carpet + harness mod)
 ```
 
@@ -686,10 +820,10 @@ Python conductor (asyncio) ── TCP, u32 length + msgpack ── Node hosts ×
   - at most 4–5 bots per Node process, so A* cannot starve physics;
   - no path beyond loaded chunks [8].
 - **Messages:**
-  - The conductor sends `act{agent, req, action, params, deadline_ticks, deadline_ms}` or `cancel`.
-  - Node replies `result{agent, req, code, tick0, tick1, wall_ms, n_roundtrips, inv_delta, raw_state}`.
-  - Node pushes `event{chat|hurt|death|kick|correction}`.
-  - Python builds features from the raw state with the simulator's featurizer and perception.
+  - The conductor sends `act{agent, req, command: "mine 4 iron ore.", parsed: {verb, args}, deadline_ticks, deadline_ms}` or `cancel`. The command text is for logs; Node runs the parsed form and never parses English itself, so both sides share one parser (contracts section 7).
+  - Node replies `result{agent, req, code, result: "no path", tick0, tick1, wall_ms, n_roundtrips, inv_delta, raw_state}`, with the result words of section 5. After `store` or `take`, the raw state includes the chest's contents.
+  - Node pushes `event{chat|hurt|death|kick|correction}`. Chat from people arrives as text, and the conductor reads it with the human tokenizer (9).
+  - Python builds features from the raw state with the simulator's featurizer, perception and notebook.
 - **Timing:** each agent is its own semi-MDP. Agents that become ready within 5–10 ms of each other are batched, as in WAI's async actor.
 - **Wrappers:** deadlines with cleanup, verified digs and perception-based targets (section 5).
 
@@ -742,7 +876,7 @@ Every statistic (spawns, ore exposure, furnace timing, despawns) is measured und
 
 Telemetry is compressed JSONL per bot per session:
 - `session.json`: versions, jar hash, seed, lag profile, shim seed.
-- Per action: parameters, start snapshot (voxels, inventory, entities, health, food), result, `tick0`/`tick1`, wall ms, round trips, path length, replans, search ms, items gained, damage, corrections and ping.
+- Per action: the command (text and parsed form), start snapshot (voxels, inventory, entities, health, food), result (code and words), `tick0`/`tick1`, wall ms, round trips, path length, replans, search ms, items gained, damage, corrections and ping.
 - Every 5 ticks: position, velocity, health, food, held item.
 - Every 10 s: server MSPT and Node event-loop delay.
 - The harness log of server-side break ticks.
@@ -788,19 +922,20 @@ Effort is in focused weeks at about WAI's pace [est].
 
 | # | Milestone | Exit criteria | Effort |
 |---|---|---|---|
-| M0 | Pin version, build rules, freeze server config | Rules JSON built (loot from the generator only); cross-check and break-time checks pass; block class table; `server.properties` and gamerules frozen | 1–2 wk |
-| M1 | Reference simulator | 4.3 formulas unit-tested; 17 verbs; perception; chunk ticking; furnace events; text and top-down viewer | 4–6 wk |
+| M0 | Pin version, build rules, freeze server config | Rules JSON built from the pinned sources (loot from the generator only); cross-check and break-time checks pass; block, item and entity class tables with phrases, homogeneity checks pass (4.4); vocabulary built (`data/vocab-1.21.1.json`); `server.properties` and gamerules frozen | 2–3 wk |
+| M1 | Reference simulator | 4.3 formulas unit-tested; 19 verbs as English commands (`store` and `take` behind the `containers` flag); grammar round-trip tests pass (`parse(render(c)) == c` for every v1 command); notebook with honesty tests (6.3); perception; chunk ticking; furnace events; text and top-down viewer | 5–7 wk |
 | M2 | Minimal bridge, rule check, duration and lag fits | Harness mod; server-logged digs within ±1 tick; recipes 100%; goto, mine and craft durations fitted (log-RMSE ≤ 0.2); wrapper durations and failures measured under profiles A–C | 2–3 wk |
 | M3 | Worlds | 50 seeds imported (Y ≤ 191 areas); per-Y ore and exposure histograms; spawn rates in walled areas under the frozen config; density knob; pool | 2–3 wk |
 | M4 | Fast core | ≥30k decisions/s on 24 threads; differential test clean over 1M actions; exact replays | 6–10 wk |
-| M5 | Single-agent PPO | Held-out, no X-ray: iron pickaxe ≥80%, first night ≥80%; Crafter score; learner throughput measured | 3–6 wk |
+| M5 | Single-agent PPO | Held-out, no X-ray: iron pickaxe ≥80%, first night ≥80%; Crafter score; learner throughput measured; word model vs opaque-id ablation reported (RQ5); LLM-port identity test passes (6.5) | 4–7 wk |
 | M6 | Lag randomization, using the M2 fits | ≤10% score drop in profile C | 1–2 wk |
 | M7 | Full bridge, calibration, evaluation orchestration | 11.4 thresholds pass in profiles A–C; areas, resets and instances automated; 40-bot ramp test (MSPT p95 < 40 ms, Node loop delay p99 < 20 ms) | 6–10 wk |
-| M8 | Chat with helpers | Request success ≥70%; causal influence with a 95% interval excluding 0; drift stable; nonce words learned within episodes; owner ≥15 of 20; no-imitation arm reported | 3–5 wk |
-| M9 | Small teams (2v2 → 5v5) | Independent populations train stably; metrics, cross-play and a first payoff matrix produced | 4–6 wk |
+| M8 | Chat with helpers | Request success ≥70%; causal influence with a 95% interval excluding 0; drift stable; nonce words learned within episodes; held-out word combinations above chance; owner ≥15 of 20; no-imitation arm reported | 3–5 wk |
+| M9 | Small teams (2v2 → 5v5) | Independent populations train stably; containers on (`store`, `take`, chest memory); metrics, including storage and theft, cross-play and a first payoff matrix produced | 4–7 wk |
 | M10 | Two teams of 10–20 | Pilot, main grid and controls done with ≥8 seeds; payoff analysis per scarcity level; real-game spot checks | 4–8 wk |
+| M11 | LLM coupling (optional; needs only M5) | An LLM drives a frozen agent through the ports or the text route (6.5) and completes a fixed set of tasks (for example "get 3 iron ingots", "make a bed") at a pass rate set before the run [est] | 4–8 wk [est] |
 
-Total: about 36–61 focused weeks [est]. M0–M5 (about 18–30 weeks) clear the owner's "first big hurdle", and are worth doing even if the team stage never happens.
+Total: about 39–65 focused weeks [est] for M0–M10, plus 4–8 for the optional M11. M0–M5 (about 21–33 weeks) clear the owner's "first big hurdle", and are worth doing even if the team stage never happens.
 
 ## 13. Hardware and compute budget
 
@@ -818,9 +953,9 @@ MineLand measured 6.3 GB for 64 agents and 9.0 GB for 128, without vision [34].
 
 **Learner cost [est].**
 - One decision costs one forward pass to act, plus, in each of E PPO epochs, a forward and a backward pass (about 3 forward-equivalents).
-- With the network in 6.3 (≈47 MFLOP) and E = 4, that is 13 × 47 ≈ 0.6 GFLOP per decision.
-- The 3090's dense FP32/TF32 peak is about 35.6 TFLOPS [mem]. Small-batch RL with a GRU sustains perhaps a quarter of that.
-- Result: **about 10–15k decisions/s per 3090**. At MAPPO's 10 epochs [67] it would be about 5–7k.
+- With the network in 6.4 (≈56 MFLOP) and E = 4, that is 13 × 56 ≈ 0.73 GFLOP per decision.
+- The 3090's dense FP32/TF32 peak is about 35.6 TFLOPS [mem]. Small-batch RL with a GRU sustains perhaps a sixth to a quarter of that (about 6–9 TFLOPS). The word-by-word decoder adds up to ~10 short sequential steps per decision, which may lower this further [est].
+- Result: **about 8–12k decisions/s per 3090** [est] (draft 0.3: 10–15k at ≈47 MFLOP). At MAPPO's 10 epochs [67], 31 forward-equivalents, it would be about 3.5–5k.
 - The learner sets the rate. Acting is 1/13 of the work, so the actor shares its run's GPU, as in WAI. M5 measures the real number.
 
 **Using two GPUs:**
@@ -834,14 +969,14 @@ Never put two runs on one GPU; WAI saw illegal-memory-access crashes. If WAI is 
 
 | Run | Agent-decisions | Throughput [est] | Wall time [est] |
 |---|---|---|---|
-| Single agent, wood → stone pickaxe | 1–10M | ~12k/s on one GPU | minutes |
-| Single agent, iron pickaxe and the night (M5) | 50–300M | ~12k/s | 1–7 h |
-| Single agent, diamond and armor | 0.3–1B | ~12k/s | 7–23 h |
-| Team grid run, 10v10, two populations | 0.5B | ~24k/s on both GPUs | ~6 h |
-| Pilot and convergence run | 1.5B | ~24k/s | ~17 h |
-| Showcase, 20v20 | 3B | ~24k/s | ~1.5 days |
+| Single agent, wood → stone pickaxe | 1–10M | ~10k/s on one GPU | minutes |
+| Single agent, iron pickaxe and the night (M5) | 50–300M | ~10k/s | 1.5–8 h |
+| Single agent, diamond and armor | 0.3–1B | ~10k/s | 8–28 h |
+| Team grid run, 10v10, two populations | 0.5B | ~20k/s on both GPUs | ~7 h |
+| Pilot and convergence run | 1.5B | ~20k/s | ~21 h |
+| Showcase, 20v20 | 3B | ~20k/s | ~1.7 days |
 
-The team-stage plan in 10.5 then needs about **6 weeks of machine time** [est]: 6 + 16 + 8 + 12 days. If the pilot shows that 0.5B is not enough, the grid shrinks in cells, not seeds.
+The team-stage plan in 10.5 then needs about **7 weeks of machine time** [est]: 7 + 19 + 9 + 14 days. If the pilot shows that 0.5B is not enough, the grid shrinks in cells, not seeds.
 
 For comparison:
 - PPO on Craftax-Classic ran 1B steps in under an hour on one GPU, reaching about 90% of the optimal reward [40].
@@ -877,6 +1012,10 @@ For comparison:
 | Results are artifacts of the reward design | Own-production unlocks; PvP-off and keepInventory controls; payoff analysis; metrics fixed before the grid runs; every cell reported |
 | Cooperation is a convention between copies of one network | Independent populations as the main setting; cross-play matrix |
 | Chat unused, drifting, or only imitated | Helpers, auxiliary losses, causal-influence and drift checks; the no-imitation arm |
+| Word-by-word commands learn slower than flat action heads | Ablations against opaque ids with untied heads and against phrase-level scoring (section 5); if words lose, keep the English text as the interchange format and use the faster decoder |
+| The notebook leaks hidden information | Honesty rule (6.3): written only from perception, own actions and chat; tests that change hidden world state and check that the notebook does not change; masks read the notebook, not the world |
+| LLM ports change behaviour before any LLM is coupled | Port tokens masked; adapters zero-initialised and frozen; an identity test (outputs equal with and without the ports) |
+| Class merging hides real-game rules (a bed needs three wool of one colour) | Homogeneity checks in the class build; every approximation listed (4.4); each checked in the real game in M7 |
 | Scope: this is several projects | Each milestone stands alone; stopping after M5 or M8 still gives results |
 | Version churn | Rules regenerate by script; gamerule names keyed to the version; recalibrate on version bumps |
 
@@ -892,7 +1031,7 @@ For comparison:
 | D6 | Chat scope | Global; team-only as a variant |
 | D7 | Team reward mix | τ ∈ {0, 1} in the grid, 0.5 as a variant |
 | D8 | Helpers in final experiments | Training only; report final results without them |
-| D9 | Chat shares item embeddings | Yes, plus a separate-embedding ablation; nonce words have their own |
+| D9 | All symbols share word embeddings (blocks, items, entities, players, verbs, numbers, results, chat) | Yes, with output scores tied to the same embeddings; ablations with opaque per-concept ids and with separate chat embeddings; nonce words have their own |
 | D10 | Linux training box | Not needed for v1 |
 | D11 | Human sessions | The owner plays a helper; sessions logged |
 | D12 | Team networks | Two independent populations; a shared network as a variant |
@@ -901,8 +1040,13 @@ For comparison:
 | D15 | Perception | Exposed face in line of sight within 24 blocks; X-ray only as an ablation |
 | D16 | Evaluation | Profiles A–C; 250 episodes per profile for full checks |
 | D17 | Emergent language (9.1) | Run it as its own arm next to the grounded chat; team-only channel first, global as a variant |
+| D18 | Natural language everywhere (owner request) | Yes: every action is an English command, written word by word under a grammar mask with tied word embeddings; every observed symbol is named in the same words (5, 6.2) |
+| D19 | Explicit memory (owner request) | Yes: an honest, code-written notebook of places, players, chests and events, read by cross-attention (6.3); learned memories later |
+| D20 | LLM ports (owner request) | Reserve inert ports now (masked tokens, zero-initialised frozen adapters); couple an LLM in the optional M11 (6.5) |
+| D21 | Containers | `store` and `take` and their words in the vocabulary now; enabled at the team stage (M9). Whether learners may take from other players' chests is decided at M9 (10.1) |
 
 **Open questions:**
+- Will sharing words give transfer? Does learning `iron ore` help with `deepslate iron ore` and `raw iron`, or does the network treat each phrase as an opaque symbol anyway (RQ5)?
 - Will agents build shelters without a shelter reward?
 - What will they fight over? Ores are finite; trees and animals regrow; death drops make killing pay in materials, though not in unlocks.
 - Can teams trade with only `give` and chat, or is a trade verb needed?
@@ -937,7 +1081,14 @@ For comparison:
 - **τ:** the share of reward pooled across a team.
 - **Crafter score:** the geometric mean of achievement success rates.
 - **Perception, X-ray:** what an agent may know about blocks; X-ray means seeing blocks with no exposed face in view.
-- **Nonce word:** a chat token whose meaning is drawn fresh each episode.
+- **Concept, class:** a set of vanilla blocks, items or entities that behave the same in v1 and share one phrase (all eight log types are the class `log`).
+- **Phrase:** the English words that name a concept or a player (`deepslate iron ore`, `my furnace 2`, `blue 7`).
+- **Grammar mask:** the set of words allowed next while a command is written, given the grammar and the game state.
+- **Tied embeddings:** one set of word vectors used both to read words in the input and to score words in the output.
+- **Notebook:** an agent's explicit memory of places, players, chests and events, written by code from what the agent perceived, did or was told.
+- **LLM port:** an inert input or output slot in the network, reserved for coupling an LLM later.
+- **Adapter:** a small bottleneck layer added to a network, with zero-initialised output weights so it starts as the identity.
+- **Nonce word:** a made-up, English-like chat word (`dax`, `wug`) whose meaning is drawn fresh each episode.
 - **Drift:** learned messages losing their human meaning. **Causal influence:** how much a message changes the listener's behavior.
 - **Equivalence test:** a pass only if the confidence interval of a difference lies inside a margin. **TV distance:** half the sum of absolute differences between two distributions. **KS D:** the largest gap between two cumulative distributions.
 - **Simulation distance:** the square of chunks around a player in which entities are ticked [72].
@@ -950,7 +1101,7 @@ For comparison:
 
 1. PrismarineJS minecraft-data — https://github.com/PrismarineJS/minecraft-data
 2. minecraft-data `dataPaths.json` (checked 2026-10-13) — https://github.com/PrismarineJS/minecraft-data/blob/master/data/dataPaths.json
-3. misode/mcmeta (branches `1.21.1-data`, `26.1-data`) — https://github.com/misode/mcmeta
+3. misode/mcmeta (branches `1.21.1-data`, `1.21.1-summary`, `26.1-data`; the pinned commits are in `data/sources.json`) — https://github.com/misode/mcmeta
 4. Running the data generator — https://minecraft.wiki/w/Tutorials/Running_the_data_generator
 5. Mineflayer README and history — https://github.com/PrismarineJS/mineflayer
 6. Mineflayer API — https://raw.githubusercontent.com/PrismarineJS/mineflayer/master/docs/api.md
@@ -1046,3 +1197,19 @@ For comparison:
 78. Jaques et al. (2019), "Social influence as intrinsic motivation for multi-agent deep reinforcement learning", ICML — https://arxiv.org/abs/1810.08647 [mem]
 79. Foerster et al. (2016), "Learning to communicate with deep multi-agent reinforcement learning", NeurIPS — https://arxiv.org/abs/1605.06676 [mem]
 80. Mordatch & Abbeel (2018), "Emergence of grounded compositional language in multi-agent populations", AAAI — https://arxiv.org/abs/1703.04908 [mem]
+
+**Added in draft 0.4** (from memory, not checked yet [mem]; arXiv is not reachable from the build machine)
+
+81. Narasimhan, Kulkarni & Barzilay (2015), "Language understanding for text-based games using deep reinforcement learning", EMNLP — LSTM-DQN — https://arxiv.org/abs/1506.08941 [mem]
+82. He et al. (2016), "Deep reinforcement learning with a natural language action space", ACL — DRRN — https://arxiv.org/abs/1511.04636 [mem]
+83. Hausknecht, Ammanabrolu, Côté & Yuan (2020), "Interactive fiction games: a colossal adventure", AAAI — Jericho, TDQN — https://arxiv.org/abs/1909.05398 [mem]
+84. Ammanabrolu & Hausknecht (2020), "Graph constrained reinforcement learning for natural language action spaces", ICLR — KG-A2C — https://arxiv.org/abs/2001.08837 [mem]
+85. Hermann et al. (2017), "Grounded language learning in a simulated 3D world" — https://arxiv.org/abs/1706.06551 [mem]
+86. Hill et al. (2021), "Grounded language learning fast and slow", ICLR — https://arxiv.org/abs/2009.01719 [mem] (arXiv id matches the citation in the `deepmind/dm_fast_mapping` README)
+87. Press & Wolf (2017), "Using the output embedding to improve language models", EACL — tied embeddings — https://arxiv.org/abs/1608.05859 [mem]
+88. Houlsby et al. (2019), "Parameter-efficient transfer learning for NLP", ICML — adapters — https://arxiv.org/abs/1902.00751 [mem]
+89. Hu et al. (2021), "LoRA: low-rank adaptation of large language models" (ICLR 2022) — https://arxiv.org/abs/2106.09685 [mem]
+90. Zhang, Rao & Agrawala (2023), "Adding conditional control to text-to-image diffusion models", ICCV — ControlNet, zero convolutions — https://arxiv.org/abs/2302.05543 [mem]
+91. Wayne et al. (2018), "Unsupervised predictive memory in a goal-directed agent" — MERLIN — https://arxiv.org/abs/1803.10760 [mem]
+92. Parisotto & Salakhutdinov (2018), "Neural Map: structured memory for deep reinforcement learning", ICLR — https://arxiv.org/abs/1702.08360 [mem]
+93. Berko (1958), "The child's learning of English morphology", Word 14 — the wug test [mem]
