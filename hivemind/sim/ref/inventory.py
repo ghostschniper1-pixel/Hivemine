@@ -22,15 +22,27 @@ Public methods take an item class as its name (``"iron_ingot"``) or its id.
 the first slot that already holds the same item with room left, searched in the order selected
 hotbar slot, off hand, then slots 0-35; failing that, into the first empty slot of 0-35 (hotbar
 first). An empty off hand or armor slot is never filled by picking up. Damageable items never
-merge (in v1 they all have stack size 1). ``add`` returns what did not fit.
+merge (in v1 they all have stack size 1). ``add`` returns what did not fit. ``add`` makes new
+items (crafting, smelting, loot: tools at full durability); ``add_stack`` moves an existing
+stack (a pickup, a gift, a chest) and keeps its durability, so moving a tool never repairs it.
 
 **Removing** and finding a stack for an action (``remove``, ``wear``, ``hold_offhand``) search the
 main inventory in Mineflayer's order, slots 9-35 and then the hotbar 0-8: the order of
 ``Window.findInventoryItem``, which the bridge's crafting, tossing and equipping use [mem]. Items
 in the off hand and in armor slots are not taken by ``remove`` unless asked (``offhand=True``),
 because Mineflayer's window counts and searches skip them too [mem]; ``count`` includes the off
-hand, ``count_main`` does not. Counts per class are exact; which slot an item ends up in after a
-craft can differ from the real game (Mineflayer puts leftovers into the first empty slot).
+hand, ``count_main`` does not. ``remove`` returns the stacks it took (with their durability), for
+actions that pass items on (``give``, ``store``).
+
+**Known approximation: stacks hold item classes.** A slot holds one item class, so members of a
+class stack together here: 20 oak logs and 20 birch logs fill one slot here and two in the game,
+where only identical items stack (``ItemStack.isSameItemSameComponents`` [mem]). This affects the
+classes that merge several vanilla items (``log``, ``planks``, ``sapling``, ``wool``, the non-v1
+``other_item_*`` classes, ...): the number of slots used, ``free_capacity``, and when the inventory
+becomes full (``INV_FULL``) can differ from the real game, never the count held per class. The
+simulator does not know which member it holds (voxels and drops are class-level, contracts 3), so
+this cannot be made exact here; it is a sim-to-real check for M7. Which slot an item ends up in
+after a craft can also differ (Mineflayer puts leftovers into the first empty slot).
 
 **Durability** [mem]: an item breaks when its damage reaches ``max_damage`` (``ItemStack.
 hurtAndBreak``: damage >= max), i.e. when the remaining durability here reaches 0, so a wooden
@@ -57,6 +69,7 @@ from hivemind.sim.ref import mechanics
 
 if TYPE_CHECKING:
     from hivemind.rules.classes import Concepts, ItemClass
+    from hivemind.sim.ref.world import World
 
 ItemRef = str | int  # an item class by name or id
 
@@ -90,6 +103,23 @@ class InventoryState:
 
     slots: tuple[Stack | None, ...]
     selected: int
+
+
+NO_DURABILITY = -1  # the durability field of a stack that has none (as in ``Inventory.to_array``)
+
+
+def add_durability_fields(world: World) -> None:
+    """Give the world's item tables a durability next to each stack, so a tool keeps its wear
+    when it is dropped, picked up or stored (world.py lets the owner of a kind add fields).
+
+    ``world.items.durability[i]`` for a dropped item and ``world.chests.slot_durability[i, k]`` for
+    chest slot k, both ``NO_DURABILITY`` (-1) when the stack has none. Does nothing for a field
+    that already exists.
+    """
+    if "durability" not in world.items.fields:
+        world.items.add_field("durability", np.int16, (), NO_DURABILITY)
+    if "slot_durability" not in world.chests.fields:
+        world.chests.add_field("slot_durability", np.int16, world.chests.slots.shape[1:2], NO_DURABILITY)
 
 
 def item_id(concepts: Concepts, item: ItemRef) -> int:
@@ -146,10 +176,10 @@ class Inventory:
     def to_array(self) -> np.ndarray:
         """int32 array (41, 3): item id, count, durability (-1 if none); empty slots are (0, 0, -1)."""
         out = np.zeros((N_SLOTS, 3), np.int32)
-        out[:, 2] = -1
+        out[:, 2] = NO_DURABILITY
         for i, s in enumerate(self.slots):
             if s is not None:
-                out[i] = (s.item, s.count, -1 if s.durability is None else s.durability)
+                out[i] = (s.item, s.count, NO_DURABILITY if s.durability is None else s.durability)
         return out
 
     def stacks(self) -> Iterator[tuple[int, Stack]]:
@@ -205,9 +235,10 @@ class Inventory:
     # -- adding and removing ------------------------------------------------------------
 
     def add(self, item: ItemRef, n: int = 1, durability: int | None = None) -> int:
-        """Add ``n`` items in the game's order (module docstring); returns how many did not fit.
+        """Add ``n`` new items in the game's order (module docstring); returns how many did not fit.
 
-        Damageable items get ``durability`` (default: full, the class's ``max_damage``).
+        Damageable items get ``durability`` (default: full, the class's ``max_damage``). To move
+        an existing stack, use ``add_stack``, which never fills in a durability.
         """
         iid = item_id(self.concepts, item)
         if iid == 0:
@@ -222,6 +253,18 @@ class Inventory:
                 raise ValueError(f"durability {durability} outside 1..{cls.max_damage} for {cls.name}")
         elif durability is not None:
             raise ValueError(f"{cls.name} has no durability")
+        return self._put(iid, n, size, durability)
+
+    def add_stack(self, stack: Stack) -> int:
+        """Add an existing stack (picked up, given, taken from a chest) keeping its durability;
+        returns how many did not fit. A damageable class must carry its durability (ValueError if
+        it is None), so a moved tool is never repaired to full."""
+        cls = self.concepts.item_class(item_id(self.concepts, stack.item))
+        if cls.max_damage is not None and stack.durability is None:
+            raise ValueError(f"a moved {cls.name} stack must carry its durability")
+        return self.add(cls.id, stack.count, stack.durability)
+
+    def _put(self, iid: int, n: int, size: int, durability: int | None) -> int:
         left = n
         while left > 0:
             i = self._slot_with_room(iid, size, durability)
@@ -252,14 +295,17 @@ class Inventory:
                 return i
         return None
 
-    def remove(self, item: ItemRef, n: int = 1, *, offhand: bool = False) -> None:
+    def remove(self, item: ItemRef, n: int = 1, *, offhand: bool = False) -> list[Stack]:
         """Remove ``n`` items from the main slots in Mineflayer's search order (then the off hand if
-        ``offhand``). Raises ValueError, changing nothing, if fewer are held."""
+        ``offhand``); returns the parts taken, one ``Stack`` per slot touched, with their
+        durability (``add_stack`` puts them elsewhere). Raises ValueError, changing nothing, if
+        fewer are held."""
         iid = item_id(self.concepts, item)
         have = self.count(iid) if offhand else self.count_main(iid)
         if n < 0 or n > have:
             raise ValueError(f"cannot remove {n} {self.concepts.item_class(iid).name}: {have} held")
         left = n
+        taken: list[Stack] = []
         for i in (*FIND_ORDER, OFFHAND) if offhand else FIND_ORDER:
             if left == 0:
                 break
@@ -268,7 +314,9 @@ class Inventory:
                 continue
             take = min(left, s.count)
             self.slots[i] = None if take == s.count else Stack(iid, s.count - take, s.durability)
+            taken.append(Stack(iid, take, s.durability))
             left -= take
+        return taken
 
     def take_slot(self, index: int) -> Stack | None:
         """Empty one slot and return what it held."""

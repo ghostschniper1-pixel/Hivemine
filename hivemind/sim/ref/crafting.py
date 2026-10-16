@@ -30,9 +30,10 @@ times as possible such that the items made do not exceed ``up_to_items``, but at
 ``n = max(1, min(max_crafts, up_to_items // count))``. ``craft 6 stick.`` makes 4 sticks (one craft;
 two would make 8), ``craft 1 planks.`` makes 4 planks. Failure codes (DESIGN.md 5):
 ``MISSING_INGREDIENT`` when no recipe can be crafted once, ``NO_STATION`` when only recipes that
-need a crafting table could be and none is near, ``INV_FULL`` when not even one result fits (the
-contract lists INV_FULL for a full inventory in general). A craft whose result would not fit stops
-the command there.
+need a crafting table could be and none is near. A craft whose result would not fit stops the
+command there with ``INV_FULL`` (container ``inventory``), whether or not earlier crafts were made
+(``n_crafts`` says how many): a full inventory ends an action with INV_FULL (DESIGN.md 4.5,
+contracts 4.3), so the result words are ``inventory full``, not ``done``.
 
 **Choices** [design], deterministic:
 - Recipe: among the recipes for the item that can be crafted at least once at this station,
@@ -64,14 +65,27 @@ jumps over stretches where nothing but the counters change, with the same result
 
 **Fuel choice for smelt_start** [design], deterministic. Candidates are the fuel classes held in
 the main slots that can go into the fuel slot (it must be empty or hold the same class) and that,
-with the heat already in the furnace (burn time left plus fuel in the slot), smelt at least one
-more item. The input class itself counts, minus the items being smelted (logs can fuel log ->
-charcoal). Candidates are ranked in tiers: plain fuel first, then fuels that are stations the agent
-needs (``PRESERVED_FUELS``: crafting table, chest), then damageable items (wooden tools, bow): a
-higher tier is used only when no lower tier has a candidate. Within a tier the fuel that smelts the
-most of the requested items wins, then the least wasted burn time, then the fewest fuel items,
-then the lower class id. No fuel is added when the furnace already has heat for every item. The
-number of items put in is then what that fuel covers ("up to" semantics), so no input waits for fuel.
+with the heat already in the furnace, smelt at least one more item. The input class itself
+counts, minus the items being smelted (logs can fuel log -> charcoal). Candidates are ranked in
+tiers: plain fuel first, then fuels that are stations the agent needs (``PRESERVED_FUELS``:
+crafting table, chest), then damageable items (wooden tools, bow): a higher tier is used only
+when no lower tier has a candidate. Within a tier the fuel that smelts the most of the requested
+items wins, then the least wasted burn time, then the fewest fuel items, then the lower class id.
+No fuel is added when the furnace already has heat for every item. The number of items put in is
+then what that fuel covers ("up to" semantics), so no input waits for fuel.
+
+**Heat already in the furnace**, counted exactly as ``Furnace.step`` uses it: a lit furnace with
+burn time B left cooks B - 1 more ticks (the counter drops before the furnace cooks; when it
+reaches 0 the next fuel item lights and cooks in that same tick), and each fuel item in the slot
+cooks its fuel ticks. The items already inside need their cook time minus the progress made.
+
+**Output slot.** The items put in are capped so that, with the items already inside, every result
+fits the output slot as it is now; then no item waits for a collect and no burning fuel goes to
+waste. When the output slot holds another item, or is full, nothing cooks and no fuel lights until
+it is taken (``collect``): the burn time left and the cook progress are then not counted (they may
+be gone by then), only the fuel in the slot, and the cap is a whole output stack. So every
+``smelt_start`` that returns OK smelts all its items, given only that the agent collects the
+output when it blocks the furnace (tested by running plans to completion).
 """
 
 from __future__ import annotations
@@ -171,6 +185,7 @@ class CraftResult:
     n_items: int = 0
     consumed: Mapping[int, int] = field(default_factory=dict)
     clicks: int = 0
+    container: str | None = None  # with INV_FULL: what is full (``inventory``), for the result words
 
     @property
     def n_ingredients(self) -> int:
@@ -195,7 +210,8 @@ class SmeltPlan:
 
 @dataclass(frozen=True)
 class FurnaceResult:
-    """What ``smelt_start`` or ``collect`` did."""
+    """What ``smelt_start`` or ``collect`` did. With ``INV_FULL``, ``container`` says what is full:
+    ``inventory`` (collect) or ``furnace`` (smelt_start), the ``{container}`` of the result words."""
 
     code: str
     item: int = 0
@@ -203,6 +219,7 @@ class FurnaceResult:
     fuel: int = 0
     fuel_units: int = 0
     clicks: int = 0
+    container: str | None = None
 
 
 class RecipeBook:
@@ -367,6 +384,7 @@ class RecipeBook:
         target = max(1, min(self.max_crafts(inv, rec), up_to_items // rec.count))
         consumed: dict[int, int] = {}
         crafts = clicks = 0
+        full = False
         for _ in range(target):
             cells = self._fill(inv, rec)
             before = inv.snapshot()
@@ -377,15 +395,16 @@ class RecipeBook:
                 inv.remove(c, n)
             if inv.add(rec.result, rec.count) > 0:  # the result does not fit: stop here
                 inv.restore(before)
+                full = True
                 break
             for c, n in used.items():
                 consumed[c] = consumed.get(c, 0) + n
             pickups = 1 + sum(1 for a, b in pairwise(cells) if a != b)
             clicks += len(cells) + pickups + CLICKS_AFTER_GRID
             crafts += 1
-        if crafts == 0:
-            return CraftResult(INV_FULL, iid, rec)
-        return CraftResult(OK, iid, rec, crafts, crafts * rec.count, dict(sorted(consumed.items())), clicks)
+        code, container = (INV_FULL, "inventory") if full else (OK, None)
+        return CraftResult(code, iid, rec, crafts, crafts * rec.count, dict(sorted(consumed.items())), clicks,
+                           container)
 
     # -- smelting -------------------------------------------------------------------------
 
@@ -394,21 +413,41 @@ class RecipeBook:
             return 2
         return 1 if fuel in self._preserved else 0
 
+    def _output_room(self, f: Furnace, rec: SmeltRecipe) -> int:
+        """How many more cooks of this recipe the output slot takes now (``canBurn``'s room test)."""
+        size = int(self.concepts.item_class(rec.result).stack_size)
+        if f.output_count == 0:
+            return size // rec.count
+        if f.output != rec.result:
+            return 0
+        return (size - f.output_count) // rec.count
+
     def plan_smelt(self, inv: Inventory, item: ItemRef, up_to: int, furnace: Furnace | None = None) -> SmeltPlan:
         """How many items ``smelt_start`` would put in and which fuel it would add (module docstring)."""
         iid = self._id(item)
         f = furnace if furnace is not None else Furnace(book=self)
         rec = self._smelt.get(iid)
-        if rec is None or up_to < 1 or f.input not in (0, iid):
+        if rec is None or up_to < 1 or (f.input_count > 0 and f.input != iid):
             return SmeltPlan(iid, 0)
-        inside = f.input_count if f.input == iid else 0
+        inside = f.input_count
+        cook = rec.cook_ticks
+        slot_heat = f.fuel_count * self.fuel_ticks(f.fuel)
+        room = self._output_room(f, rec)
+        if room == 0:
+            # Output blocked: nothing cooks and no fuel lights until it is taken. By then the burn
+            # time left and the cook progress may be gone, so only the fuel in the slot counts.
+            heat, backlog = slot_heat, inside * cook
+            room = int(self.concepts.item_class(rec.result).stack_size) // rec.count  # once taken
+        else:
+            # A lit furnace with burn time B left cooks B - 1 more ticks: step() lowers the counter
+            # before it cooks, and at 0 the next fuel item lights (and cooks) in the same tick.
+            heat = max(f.burn_left - 1, 0) + slot_heat
+            backlog = inside * cook - (f.cook_ticks if inside else 0)  # heat the items inside still need
         held = inv.count_main(iid)
-        n_max = min(up_to, held, self.concepts.item_class(iid).stack_size - inside)
+        # room - inside: every item put in has room in the output slot, so none waits for a collect
+        n_max = min(up_to, held, int(self.concepts.item_class(iid).stack_size) - inside, room - inside)
         if n_max <= 0:
             return SmeltPlan(iid, 0)
-        cook = rec.cook_ticks
-        heat = f.burn_left + f.fuel_count * self.fuel_ticks(f.fuel)
-        backlog = inside * cook - f.cook_ticks  # heat the items already inside still need
 
         def covered(extra_heat: int) -> int:
             """Items of the n_max that ``heat + extra_heat`` smelts."""
@@ -421,14 +460,14 @@ class RecipeBook:
         fuels = [f.fuel] if f.fuel else sorted(inv.counts())
         for fuel in fuels:
             ticks = self.fuel_ticks(fuel)
-            room = self.concepts.item_class(fuel).stack_size - (f.fuel_count if f.fuel == fuel else 0)
-            if ticks <= 0 or room <= 0 or inv.count_main(fuel) == 0:
+            slot_room = self.concepts.item_class(fuel).stack_size - (f.fuel_count if f.fuel == fuel else 0)
+            if ticks <= 0 or slot_room <= 0 or inv.count_main(fuel) == 0:
                 continue
             best: SmeltPlan | None = None
             for n in range(n_max, base, -1):  # the most items this fuel can cover
                 need = backlog + n * cook - heat
                 units = -(-need // ticks)
-                if units <= room and units + (n if fuel == iid else 0) <= inv.count_main(fuel):
+                if units <= slot_room and units + (n if fuel == iid else 0) <= inv.count_main(fuel):
                     best = SmeltPlan(iid, n, fuel, units, units * ticks - need)
                     break
             if best is not None:
@@ -439,7 +478,8 @@ class RecipeBook:
         return min((o for o in options if o[0][0] == tier), key=lambda o: o[0])[1]
 
     def smeltable(self, inv: Inventory, furnace: Furnace | None = None) -> dict[int, int]:
-        """{input class id: items smelt_start could smelt now} for held inputs with enough fuel."""
+        """{input class id: items smelt_start could smelt now} for held inputs with enough fuel
+        and room in this furnace: the smelt_start mask (``smelt_start`` returns OK exactly for these)."""
         out = {}
         for iid in inv.counts():
             if iid in self._smelt and inv.count_main(iid) > 0:
@@ -451,15 +491,21 @@ class RecipeBook:
     def smelt_start(self, inv: Inventory, furnace: Furnace, item: ItemRef, up_to: int) -> FurnaceResult:
         """Put up to ``up_to`` items and the chosen fuel into the furnace (``smelt {n} {item}.``).
 
-        ``MISSING_INGREDIENT`` when nothing can be smelted (no input, no recipe or no fuel).
-        ValueError when the furnace's input slot holds another class: a caller (mask) error.
+        The mask is ``smeltable(inv, furnace)``: it allows the item exactly when this returns OK.
+        Otherwise: ``MISSING_INGREDIENT`` when the agent lacks what it needs (the item, a recipe
+        for it, or fuel for one item); ``INV_FULL`` with container ``furnace`` when the agent has
+        it but the furnace's slots block it (the input slot holds another item or is full, the
+        fuel slot holds a fuel the agent cannot add to, or the output slot is too full for the
+        items inside). With that mask these failures happen only when the furnace changes during
+        the walk to it (another player's doing). ValueError for a count below 1.
         """
         iid = self._id(item)
-        if furnace.input not in (0, iid):
-            raise ValueError(f"the furnace already smelts {self.concepts.item_class(furnace.input).name}")
+        if up_to < 1:
+            raise ValueError(f"item count must be at least 1, got {up_to}")
         plan = self.plan_smelt(inv, iid, up_to, furnace)
         if plan.n_items == 0:
-            return FurnaceResult(MISSING_INGREDIENT, iid)
+            code = self._smelt_failure(inv, furnace, iid)
+            return FurnaceResult(code, iid, container="furnace" if code == INV_FULL else None)
         inv.remove(iid, plan.n_items)
         furnace.put_input(iid, plan.n_items)
         clicks = CLICKS_PER_FURNACE_STACK
@@ -469,25 +515,49 @@ class RecipeBook:
             clicks += CLICKS_PER_FURNACE_STACK
         return FurnaceResult(OK, iid, plan.n_items, plan.fuel, plan.fuel_units, clicks)
 
+    def _smelt_failure(self, inv: Inventory, furnace: Furnace, iid: int) -> str:
+        """Why ``plan_smelt`` finds nothing to smelt: ``INV_FULL`` (the furnace's slots block it)
+        or ``MISSING_INGREDIENT`` (the agent lacks the item, a recipe or the fuel)."""
+        if iid not in self._smelt or inv.count_main(iid) == 0:
+            return MISSING_INGREDIENT
+        if furnace.input_count > 0 and (furnace.input != iid
+                                        or furnace.input_count >= self.concepts.item_class(iid).stack_size):
+            return INV_FULL
+        held = inv.count_main(iid)
+        for clear_output, clear_fuel in ((True, False), (False, True), (True, True)):
+            probe = furnace.copy()
+            if clear_output:
+                probe.take_output()
+            if clear_fuel:
+                probe.take_fuel()
+            if self.plan_smelt(inv, iid, held, probe).n_items > 0:
+                return INV_FULL  # an emptier output or fuel slot would have let it smelt
+        return MISSING_INGREDIENT
+
     def collect(self, inv: Inventory, furnace: Furnace) -> FurnaceResult:
         """Take the output (as much as fits), and an empty bucket left in the fuel slot [design].
 
-        ``NO_TARGET`` when there is no output; ``INV_FULL`` when none of it fits.
+        ``NO_TARGET`` when there is no output. ``INV_FULL`` (container ``inventory``) when the
+        inventory fills before everything is taken, with ``n_items`` the number taken (0 if none
+        fit); a full inventory ends an action with INV_FULL (DESIGN.md 4.5).
         """
         if furnace.output_count == 0:
             return FurnaceResult(NO_TARGET)
         item, n = furnace.output, furnace.output_count
         left = inv.add(item, n)
-        if left == n:
-            return FurnaceResult(INV_FULL, item)
         furnace.output_count = left
         if left == 0:
             furnace.output = 0
-        clicks = CLICKS_PER_FURNACE_STACK
-        remainder = furnace.fuel and furnace.fuel_count and self.fuel_ticks(furnace.fuel) == 0  # a bucket
-        if remainder and inv.add(furnace.fuel, furnace.fuel_count) == 0:
-            furnace.fuel, furnace.fuel_count = 0, 0
-            clicks += CLICKS_PER_FURNACE_STACK
+        clicks = CLICKS_PER_FURNACE_STACK if left < n else 0
+        bucket_stays = False
+        if furnace.fuel_count and self.fuel_ticks(furnace.fuel) == 0:  # a bucket left by lava
+            if inv.free_capacity(furnace.fuel) >= furnace.fuel_count:
+                inv.add(*furnace.take_fuel())
+                clicks += CLICKS_PER_FURNACE_STACK
+            else:
+                bucket_stays = True
+        if left > 0 or bucket_stays:
+            return FurnaceResult(INV_FULL, item, n - left, clicks=clicks, container="inventory")
         return FurnaceResult(OK, item, n - left, clicks=clicks)
 
 

@@ -202,9 +202,41 @@ def test_full_inventory_stops_the_craft():
     inv.slots[MAIN_SIZE - 1] = Stack(iid("planks"), 64)
     before = inv.snapshot()
     r = craft(inv, "stick", 4)
-    assert r.code == INV_FULL and inv.snapshot() == before
+    assert (r.code, r.container, r.n_crafts) == (INV_FULL, "inventory", 0) and inv.snapshot() == before
     inv.slots[MAIN_SIZE - 1] = Stack(iid("planks"), 4)
     assert craft(inv, "crafting_table", 1).code == OK  # the planks' slot frees up
+
+
+def test_a_craft_stopped_by_a_full_inventory_reports_it():
+    # The reviewer's case: room for one craft of sticks only. The result is "inventory full", with
+    # the one craft that was made, not "done".
+    inv = Inventory()
+    for i in range(MAIN_SIZE - 2):
+        inv.slots[i] = Stack(iid("wooden_sword"), 1, 59)
+    inv.slots[MAIN_SIZE - 2] = Stack(iid("planks"), 8)
+    inv.slots[MAIN_SIZE - 1] = Stack(iid("stick"), 60)
+    r = craft(inv, "stick", 64)
+    assert (r.code, r.container, r.n_crafts, r.n_items) == (INV_FULL, "inventory", 1, 4)
+    assert inv.count("stick") == 64 and inv.count("planks") == 6 and names(r.consumed) == {"planks": 2}
+    assert craft(inv_with(planks=8), "stick", 64).container is None  # OK carries no container
+
+
+def test_collect_reports_a_full_inventory():
+    inv = Inventory()
+    for i in range(MAIN_SIZE - 1):
+        inv.slots[i] = Stack(iid("wooden_sword"), 1, 59)
+    inv.slots[MAIN_SIZE - 1] = Stack(iid("iron_ingot"), 61)
+    f = Furnace(output=iid("iron_ingot"), output_count=8)
+    r = BOOK.collect(inv, f)
+    assert (r.code, r.container, r.n_items, r.clicks) == (INV_FULL, "inventory", 3, 3)
+    assert f.output_count == 5 and inv.count("iron_ingot") == 64
+    r = BOOK.collect(inv, f)
+    assert (r.code, r.n_items, r.clicks) == (INV_FULL, 0, 0) and f.output_count == 5
+    # all the output fits but the bucket left by lava does not: the inventory is full
+    inv.slots[MAIN_SIZE - 1] = None
+    f = Furnace(output=iid("iron_ingot"), output_count=5, fuel=iid("bucket"), fuel_count=1)
+    r = BOOK.collect(inv, f)
+    assert (r.code, r.n_items, f.output_count, f.fuel) == (INV_FULL, 5, 0, iid("bucket"))
 
 
 def test_recipe_choice_prefers_the_item_held_most():
@@ -405,10 +437,18 @@ def test_smelt_up_to_what_the_fuel_covers():
 
 
 def test_existing_heat_is_used_first():
-    f = Furnace(burn_left=1000)
+    # A lit furnace with burn time B left cooks B - 1 more ticks (step() lowers it before cooking):
+    # 1001 ticks smelt 5 items, 1000 only 4, so a fifth item needs fuel.
+    f = Furnace(burn_left=1001)
     inv = inv_with(raw_iron=5, coal=1)
     r = BOOK.smelt_start(inv, f, "raw_iron", 5)
     assert (r.n_items, r.fuel_units, r.clicks) == (5, 0, 3) and inv.count("coal") == 1
+    assert f.finish_ticks() == 1000
+    f = Furnace(burn_left=1000)
+    assert plan(inv_with(raw_iron=5), "raw_iron", 5, f) == ("", 0, 4)
+    inv = inv_with(raw_iron=5, coal=1)
+    assert BOOK.smelt_start(inv, f, "raw_iron", 5).fuel_units == 1
+    assert f.finish_ticks() == 1000  # 999 ticks of the old fire, then the coal lights and cooks
     f2 = Furnace()
     f2.put_input("raw_iron", 2)
     f2.put_fuel("planks", 1)
@@ -416,20 +456,216 @@ def test_existing_heat_is_used_first():
     assert plan(inv, "raw_iron", 4, f2) == ("planks", 3, 4)  # same fuel class as the slot holds
 
 
+def test_burn_time_left_is_counted_exactly():
+    # Every burn time left, with an empty furnace: the plan's items are exactly what the fire smelts.
+    for burn_left in range(0, 1300):
+        f = Furnace(burn_left=burn_left)
+        inv = inv_with(raw_iron=64)
+        r = BOOK.smelt_start(inv, f, "raw_iron", 64)
+        expected = max(burn_left - 1, 0) // 200
+        assert r.n_items == expected and r.fuel_units == 0, burn_left
+        if expected:
+            assert r.code == OK and f.finish_ticks() == expected * 200, burn_left
+
+
+def test_lit_furnace_after_a_collect_does_not_strand_an_item():
+    # The reviewer's sequence: 1 raw iron with 1 coal, collect at tick 201 (1400 ticks of fire left),
+    # then 7 more: the fire covers only 6, so one coal is added and all 7 smelt.
+    inv = inv_with(raw_iron=8, coal=2)
+    f = Furnace()
+    BOOK.smelt_start(inv, f, "raw_iron", 1)
+    f.tick(201)
+    assert BOOK.collect(inv, f).n_items == 1 and f.burn_left == 1400
+    r = BOOK.smelt_start(inv, f, "raw_iron", 7)
+    assert (r.code, r.n_items, r.fuel_units) == (OK, 7, 1)
+    f.tick(20000)
+    assert (f.output_count, f.input_count) == (7, 0)
+
+
+def test_blocked_output_slot_waits_for_a_collect():
+    # Iron ingots sit in the output; sand cannot cook until they are taken, and the fire left
+    # burns out meanwhile, so the plan does not count it.
+    inv = inv_with(raw_iron=1, coal=2, sand=7)
+    f = Furnace()
+    BOOK.smelt_start(inv, f, "raw_iron", 1)
+    f.tick(200)
+    assert (f.output, f.output_count, f.burn_left) == (iid("iron_ingot"), 1, 1401)
+    r = BOOK.smelt_start(inv, f, "sand", 7)
+    assert (r.code, r.n_items, r.fuel, r.fuel_units) == (OK, 7, iid("coal"), 1)
+    f.tick(1500)
+    assert (f.output, f.input_count, f.fuel_count, f.lit) == (iid("iron_ingot"), 7, 1, False)
+    assert f.finish_ticks() is None
+    assert BOOK.collect(inv, f).code == OK
+    assert f.finish_ticks() == 1400
+    f.tick(1400)
+    assert (f.output, f.output_count, f.input_count) == (iid("glass"), 7, 0)
+    # without fuel held, the output slot is what blocks: the furnace is full, nothing is missing
+    g = Furnace(output=iid("iron_ingot"), output_count=1, burn_left=1401)
+    r = BOOK.smelt_start(inv_with(sand=7), g, "sand", 7)
+    assert (r.code, r.container) == (INV_FULL, "furnace")
+
+
+def test_items_are_capped_by_the_room_in_the_output_slot():
+    f = Furnace(output=iid("iron_ingot"), output_count=60)
+    inv = inv_with(raw_iron=8, coal=1)
+    r = BOOK.smelt_start(inv, f, "raw_iron", 8)
+    assert (r.code, r.n_items) == (OK, 4) and inv.count("raw_iron") == 4
+    f.tick(800)
+    assert (f.output_count, f.input_count) == (64, 0)
+    g = Furnace(output=iid("iron_ingot"), output_count=62)
+    g.put_input("raw_iron", 2)  # the output fills exactly with the two inside
+    r = BOOK.smelt_start(inv_with(raw_iron=1, coal=1), g, "raw_iron", 1)
+    assert (r.code, r.container) == (INV_FULL, "furnace")
+
+
 def test_smelt_failures():
     inv = inv_with(raw_iron=3)
     before = inv.snapshot()
-    assert BOOK.smelt_start(inv, Furnace(), "raw_iron", 3).code == MISSING_INGREDIENT
-    assert BOOK.smelt_start(inv_with(coal=1), Furnace(), "raw_iron", 3).code == MISSING_INGREDIENT
-    assert BOOK.smelt_start(inv_with(stick=3, coal=1), Furnace(), "stick", 3).code == MISSING_INGREDIENT
+    assert BOOK.smelt_start(inv, Furnace(), "raw_iron", 3).code == MISSING_INGREDIENT  # no fuel
+    assert BOOK.smelt_start(inv_with(coal=1), Furnace(), "raw_iron", 3).code == MISSING_INGREDIENT  # no input
+    assert BOOK.smelt_start(inv_with(stick=3, coal=1), Furnace(), "stick", 3).code == MISSING_INGREDIENT  # no recipe
     assert inv.snapshot() == before
-    busy = Furnace()
-    busy.put_input("sand", 4)
     with pytest.raises(ValueError):
-        BOOK.smelt_start(inv_with(raw_iron=1, coal=1), busy, "raw_iron", 1)
+        BOOK.smelt_start(inv_with(raw_iron=1, coal=1), Furnace(), "raw_iron", 0)
+    # The agent holds input and fuel, but the furnace's slots block it: "furnace full", not
+    # "missing ingredient".
+    held = inv_with(raw_iron=8, coal=4)
+    busy = Furnace()
+    busy.put_input("sand", 4)  # another item in the input slot
+    full = Furnace()
+    full.put_input("raw_iron", 64)  # a full input slot
+    stick = Furnace()
+    stick.put_fuel("stick", 1)  # another fuel in the fuel slot, worth half an item
+    for f in (busy, full, stick):
+        before = (held.snapshot(), f.copy())
+        r = BOOK.smelt_start(held, f, "raw_iron", 8)
+        assert (r.code, r.container, r.n_items) == (INV_FULL, "furnace", 0)
+        assert (held.snapshot(), f) == before
 
 
 def test_smeltable():
     assert names(smeltable(inv_with(raw_iron=10, coal=1))) == {"raw_iron": 8}
     assert smeltable(inv_with(raw_iron=10)) == {}
     assert names(smeltable(inv_with(sand=3, raw_iron=2, coal=1))) == {"raw_iron": 2, "sand": 3}
+
+
+SMELT_INPUTS = ("raw_iron", "sand", "log", "beef", "cobblestone", "raw_gold")
+SMELT_FUELS = ("coal", "charcoal", "planks", "stick", "log", "lava_bucket", "wooden_pickaxe", "crafting_table",
+               "bucket")
+OUTPUTS = ("iron_ingot", "glass", "charcoal", "cooked_beef", "stone")
+
+
+def random_furnace(s) -> Furnace:
+    """A furnace in a state reached by play: some loads, some ticks, some collects, sometimes an
+    output of another item."""
+    start = s.below(3)
+    if start == 0:
+        f = Furnace(output=iid(OUTPUTS[s.below(len(OUTPUTS))]), output_count=s.randint(1, 64))
+    elif start == 1:  # a small batch just finished: often still lit, with its output waiting
+        f = Furnace()
+        k = s.randint(1, 6)
+        f.put_input(SMELT_INPUTS[s.below(len(SMELT_INPUTS))], k)
+        f.put_fuel(("coal", "planks", "lava_bucket")[s.below(3)], 2)
+        f.tick(200 * k + s.randint(0, 400))
+        return f
+    else:
+        f = Furnace()
+    for _ in range(s.randint(0, 3)):
+        op = s.below(5)
+        if op == 0:  # mostly small loads, so many finish and leave a lit furnace with an output
+            f.put_input(SMELT_INPUTS[s.below(len(SMELT_INPUTS))], s.randint(1, 64 if s.below(4) == 0 else 6))
+        elif op == 1:
+            f.put_fuel(SMELT_FUELS[s.below(len(SMELT_FUELS))], s.randint(1, 4))
+        elif op == 2 and s.below(2):
+            f.take_output()
+        elif op == 3:
+            f.take_input()
+        f.tick(s.randint(0, 2000))
+    return f
+
+
+def random_held(s) -> Inventory:
+    inv = Inventory()
+    for _ in range(s.randint(1, 5)):
+        name = (*SMELT_INPUTS, *SMELT_FUELS)[s.below(len(SMELT_INPUTS) + len(SMELT_FUELS))]
+        inv.add(name, s.randint(1, 20) if C.item_class(name).stack_size > 1 else 1)
+    return inv
+
+
+def run_until_empty(f: Furnace, s, early_collects: bool) -> bool:
+    """Tick the furnace, taking the output only when it blocks the furnace and only after the fire
+    left has burned out (the worst case), or also at random moments; True if the input slot
+    empties without adding anything."""
+    for _ in range(5000):  # random partial ticks take about log2(200) steps per item
+        if f.input_count == 0:
+            return True
+        k = f.next_output_ticks()
+        if k is None:
+            if f.output_count == 0:
+                return False  # stuck with input left and nothing to collect
+            f.tick(f.burn_left + 1)  # nothing changes but the fire burning out
+            f.take_output()
+            continue
+        f.tick(s.randint(1, k) if early_collects else k)
+        if early_collects and s.below(3) == 0:
+            f.take_output()
+    return False
+
+
+def test_every_smelt_start_that_returns_ok_smelts_all_its_items():
+    """Property (review finding): no plan strands an item. Covers lit and cold furnaces, cook
+    progress, fuel in the slot, items inside, and output slots that are partly full or hold
+    another item; the agent collects only when the output blocks the furnace."""
+    rng = CounterRNG(21)
+    n_ok = n_full = 0
+    for trial in range(1500):
+        s = rng.stream(0, trial, Purpose.GENERIC)
+        f, inv = random_furnace(s), random_held(s)
+        item = SMELT_INPUTS[s.below(len(SMELT_INPUTS))]
+        if s.below(4):
+            inv.add(item, s.randint(1, 64))
+        if s.below(2):
+            inv.add(SMELT_FUELS[s.below(3)], s.randint(1, 3))  # coal, charcoal or planks
+        able = BOOK.smeltable(inv, f)
+        n = (1, 3, 8, 64)[s.below(4)]
+        before = (f.copy(), inv.snapshot())
+        r = BOOK.smelt_start(inv, f, item, n)
+        assert (r.code == OK) == (iid(item) in able), (trial, r, before)  # the mask is smeltable()
+        if r.code != OK:
+            assert r.code in (MISSING_INGREDIENT, INV_FULL) and (f, inv.snapshot()) == before
+            assert (r.container == "furnace") == (r.code == INV_FULL)
+            n_full += r.code == INV_FULL
+            continue
+        n_ok += 1
+        assert 1 <= r.n_items <= min(n, able[iid(item)])
+        assert run_until_empty(f.copy(), s, early_collects=False), (trial, r, before)
+        assert run_until_empty(f.copy(), s, early_collects=True), (trial, r, before)
+    assert n_ok > 500 and n_full > 20
+
+
+def test_plans_at_the_edges_of_the_burn_time_smelt_all_their_items():
+    """The burn times where a one-tick error strands an item: burn time left minus the heat the
+    items inside still need, at and next to multiples of 200, lit or not, with cook progress, and
+    with progress left over after the input was taken out."""
+    rng = CounterRNG(22)
+    n_ok = 0
+    for burn_left in sorted({max(0, 200 * k + d) for k in range(9) for d in (-1, 0, 1, 2)}):
+        for inside, progress in ((0, 0), (1, 0), (1, 57), (3, 199), (2, 1)):
+            for taken_out in (False, True):
+                f = Furnace(burn_left=burn_left, burn_total=1600)
+                if inside:
+                    f.put_input("raw_iron", inside)
+                    f.cook_ticks = progress
+                if taken_out:
+                    f.take_input()  # progress stays until the next tick
+                inv = inv_with(raw_iron=64, planks=64)
+                r = BOOK.smelt_start(inv, f, "raw_iron", 64)
+                assert r.code == OK
+                n_ok += 1
+                s = rng.stream(0, burn_left, Purpose.GENERIC)
+                assert run_until_empty(f.copy(), s, early_collects=False), (burn_left, inside, progress, r)
+                no_fuel = Furnace(burn_left=burn_left, burn_total=1600)
+                r = BOOK.smelt_start(inv_with(raw_iron=64), no_fuel, "raw_iron", 64)
+                if r.code == OK:
+                    assert r.fuel_units == 0 and no_fuel.finish_ticks() is not None, (burn_left, r)
+    assert n_ok == 35 * 5 * 2

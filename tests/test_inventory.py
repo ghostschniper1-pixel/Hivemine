@@ -90,6 +90,50 @@ def test_free_capacity_matches_add():
             assert probe.add(item, cap + 3) == 3
 
 
+def test_class_members_share_a_stack_known_approximation():
+    # Documented approximation (module docstring): a slot holds an item class, so 20 oak and 20
+    # birch logs share one slot here (two in the game). The count per class is exact.
+    assert len(C.item_class("log").members) > 1
+    inv = Inventory()
+    inv.add("log", 20)
+    inv.add("log", 20)
+    assert inv.slots[0] == Stack(iid("log"), 40) and inv.slots[1] is None
+    assert inv.count("log") == 40
+
+
+def test_moved_stacks_keep_their_durability():
+    inv = Inventory()
+    inv.add("iron_pickaxe", durability=3)
+    inv.add("torch", 10)
+    (taken,) = inv.remove("iron_pickaxe")
+    assert taken == Stack(iid("iron_pickaxe"), 1, 3) and inv.count("iron_pickaxe") == 0
+    other = Inventory()
+    assert other.add_stack(taken) == 0
+    assert other.slots[0] == Stack(iid("iron_pickaxe"), 1, 3)  # not repaired to 250
+    assert other.add_stack(Stack(iid("torch"), 70)) == 0 and other.count("torch") == 70
+    with pytest.raises(ValueError):
+        other.add_stack(Stack(iid("iron_pickaxe"), 1))  # a moved tool must carry its durability
+    # remove returns one part per slot touched, in Mineflayer's order
+    inv.slots[20] = Stack(iid("torch"), 3)
+    assert inv.remove("torch", 5) == [Stack(iid("torch"), 3), Stack(iid("torch"), 2)]
+
+
+def test_world_tables_get_durability_fields():
+    from hivemind.sim.ref.inventory import NO_DURABILITY, add_durability_fields
+    from hivemind.sim.ref.world import CHEST_SLOTS, World
+
+    w = World(16, 16)
+    add_durability_fields(w)
+    add_durability_fields(w)  # a second call changes nothing
+    assert "durability" in w.items.fields and "slot_durability" in w.chests.fields
+    i = w.items.alloc(item=iid("iron_pickaxe"), count=1, durability=3)
+    assert w.items.durability[i] == 3
+    j = w.items.alloc(item=iid("torch"), count=4)
+    assert w.items.durability[j] == NO_DURABILITY
+    assert w.chests.slot_durability.shape == (w.chests.capacity, CHEST_SLOTS)
+    assert (w.chests.slot_durability == NO_DURABILITY).all()
+
+
 def test_add_validates_arguments():
     inv = Inventory()
     with pytest.raises(ValueError):
