@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Raw upstream data, fetched by `python -m hivemind.rules.fetch_sources` (pinned in data/sources.json)
+data/sources/
+
+# Training and evaluation outputs
+runs/
+worlds/
+node_modules/
