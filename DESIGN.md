@@ -17,7 +17,7 @@ The owner's design ideas:
 - Use the owner's own high-level actions (craft pickaxe, mine block, chat).
 - No LLM.
 - Teach item meanings by chatting, and see whether the agent learns to ask for items.
-- Write every action as an English command (`mine 4 iron ore.`), in the same words that name what the agent sees, so it can learn what the words mean (added 2026-10-16).
+- Write every action as an English command (`mine 4 iron ore.`), in the same words that name what the agent sees, so it can learn what the words mean.
 - Keep a couple of spare layers so an LLM can be hooked up later ("neural surgery"). Until then, no LLM is in the loop (6.5).
 - Give each agent an explicit memory: where things were, who is an enemy, how much is in a chest (6.3).
 
@@ -51,7 +51,7 @@ RQ2 has no yes/no answer. The expected result is a map of which settings lead to
 | One agent, simulator | On 1,000 held-out seeds, with honest perception (6.1): iron pickaxe in ≥80% of episodes; first night survived in ≥80% |
 | One agent, real game | Real/sim success ratio ≥0.8 per milestone in each of three evaluation profiles, at the fixed sample size in 11.5 |
 | Language | The word model matches or beats the opaque-id ablation on the single-agent exit test. Held-out word combinations (requests or commands whose pairing of words never occurred in training) are answered correctly above chance |
-| Chat | With scripted helpers, ≥70% of `need X` requests succeed. Nulling the messages lowers team return. Agents use a nonce word correctly within an episode. The owner gets ≥15 of 20 requests answered |
+| Chat | With scripted helpers, ≥70% of `i need … x` requests succeed. Nulling the messages lowers team return. Agents use a nonce word correctly within an episode. The owner gets ≥15 of 20 requests answered |
 | Teams | Two independently trained populations of 10–20 agents train stably. Metrics have 95% intervals over ≥8 seeds and differ from scripted baselines. There is a payoff matrix per scarcity level |
 
 The thresholds are proposals [est], so that each stage has a finish line.
@@ -99,15 +99,15 @@ flowchart LR
     LAG["Lag model"]
     OBS["Perception + observation builder<br/>shared code"]
     LANG["Language<br/>vocabulary, grammar, parser<br/>shared code"]
-    NOTE["Notebook memory<br/>places, players, chests, events<br/>shared code"]
+    MEM["Notebook memory<br/>places, players, chests, events<br/>shared code"]
     REW["Rewards and curriculum"]
     REF -. differential tests .- CORE
     LAG --> EXEC
     EXEC --> CORE
     CORE --> OBS
-    CORE -- perceived, done, told --> NOTE
-    NOTE --> OBS
-    NOTE -- masks --> EXEC
+    CORE -- perceived, done, told --> MEM
+    MEM --> OBS
+    MEM -- masks --> EXEC
     LANG --> OBS
     LANG -- parsed command --> EXEC
     CORE --> REW
@@ -142,7 +142,7 @@ flowchart LR
   ACT -- command --> COND
   OBS -. same code .- COND
   LANG -. same code .- COND
-  NOTE -. same code .- COND
+  MEM -. same code .- COND
   NODE --> CAL
   MC --> CAL
   CORE --> CAL
@@ -184,7 +184,7 @@ The `hivemind/`, `data/` and `bridge/` directories exist in the repository; `sim
 | minecraft.wiki [13–22][72][73] | Formulas, fuel values, mob stats, gamerules | Written by players; must be verified |
 | Real game, via the bridge and the harness mod | Final authority | Slow |
 
-The build script (`hivemind/rules/`) takes loot, recipes, tags and worldgen from mcmeta `1.21.1-data`, item properties from the item components and minecraft-data, and everything else from minecraft-data. Where sources overlap it cross-checks them and fails on any disagreement: recipes in both; stack sizes, durability and food; harvest tools against tool rules plus the `needs_*_tool` tags; tool speeds. Known differences in representation are listed in the build script, each with a reason. The exact upstream commits are pinned in `data/sources.json` (contracts section 1). The built `data/rules-1.21.1.json` is committed, so the project builds offline.
+The build script (`hivemind/rules/`) takes loot, recipes, tags and worldgen from the generator's output (mcmeta `1.21.1-data`), item properties from the item components and minecraft-data, and everything else from minecraft-data. Where sources overlap it cross-checks them and fails on any disagreement: recipes in both; stack sizes, durability and food; harvest tools against tool rules plus the `needs_*_tool` tags; tool speeds. Known differences in representation are listed in the build script, each with a reason. The exact upstream commits are pinned in `data/sources.json` (contracts section 1). The built `data/rules-1.21.1.json` is committed, so the project builds offline.
 
 ### 4.2 Exact, approximate, skipped
 
@@ -261,7 +261,7 @@ Check values: stone with a wooden pickaxe 23 ticks; stone by hand 150 (no drop);
   - hazard: lava, fire, magma, cactus, cobweb, powder snow, sweet berry bush.
 - **Y cap:** the world pool accepts only start areas whose terrain stays at or below Y 191. The real-game evaluation uses the same areas, so nothing is cut off on either side.
 - **Side arrays:** block light (4 bits), a heightmap for sky light, and a nav grid that is updated when blocks change.
-- **Entities:** fixed slots with in-use flags: agents ≤40, mobs ≤32, dropped items ≤64, furnaces ≤16. Craftax caps entity counts and masks unused slots in the same way [40].
+- **Entities:** fixed slots with in-use flags: agents ≤40, mobs ≤32, dropped items ≤64, furnaces ≤16, and from M9 chests ≤8 per agent (each with its contents). Craftax caps entity counts and masks unused slots in the same way [40].
 - **World sources:**
   - (a) Real chunks. Pregenerate seeds on a Fabric 1.21.1 server under the frozen config, using Chunky [mem]. Read the `r.x.z.mca` region files [21][22] (a palette plus packed longs per 16³ section) with a NumPy reader. Cross-check the reader against anvil-parser2 [11] or prismarine-provider-anvil 2.13.0 [10]. cubiomes [12] gives biomes, not blocks.
   - (b) A statistical generator that re-places ores and trees from measured per-Y histograms, so density can be scaled.
@@ -335,7 +335,7 @@ A **counter-based RNG** (Philox or SplitMix style) is keyed by seed, episode, ti
 6. **Speed bounds:** a lower time bound per milestone, computed from break and craft times. Any faster episode exposes a bug. Hide-and-seek agents exploited physics errors [57], and these agents will too.
 
 **Run tracking:**
-- Every run writes `run.json` with the git hash, rules hash, world-pool hash, config and seeds.
+- Every run writes `run.json` with the git hash, rules hash, concepts and vocabulary hashes, world-pool hash, config and seeds.
 - Unit and differential tests run on every commit.
 - A nightly Mineflayer smoke suite runs each verb against a local server.
 - Node dependencies are pinned in `package-lock.json`, Python dependencies in a lock file.
@@ -415,7 +415,7 @@ Each code maps one-to-one to **result words** from the shared vocabulary (contra
 - **Probability and entropy.** The log-probability of a command is the sum over its non-forced words, which gives the exact probability of the command. The entropy bonus is the sum of the per-step entropies along the sampled command. By the chain rule its expected value is the joint entropy of the whole command, so it is an unbiased estimate, and it needs only the steps actually taken; draft 0.3's exact formula, `H(verb) + Σ_v p(v)·H(args | v)`, needed every verb's argument heads at every step. Its gradient makes each step's choice less certain, but it does not pull the verb choice toward verbs with more argument choices (`chat`, `give`), as the gradient of the exact formula does. That removes draft 0.3's bias toward those verbs. A forced word adds no entropy.
 - **Masks are stored with the rollout**, so the PPO ratios use the same masks.
 
-**Precedent.** Agents for text adventure games act through generated English commands. LSTM-DQN scores an action word and an object word [81]; TDQN fills verb-object templates word by word [83]; KG-A2C generates template commands, with a knowledge graph restricting the objects [84]; DRRN scores whole command texts against the state text [82] (all [mem]).
+**Precedent.** Agents for text adventure games act through generated English commands. LSTM-DQN scores an action word and an object word [81]; TDQN chooses a command template and then the objects that fill it [83]; KG-A2C decodes a template and its objects in turn, with a knowledge graph restricting the objects [84]; DRRN scores whole command texts against the state text [82] (all [mem]).
 
 **Ablations** (RQ5), each on the single-agent exit test:
 - **Opaque ids:** each concept (block class, item class, entity, verb, number) gets its own id and embedding, and the output heads are untied, as in draft 0.3. Same masks, same information, no shared words.
@@ -474,7 +474,7 @@ So each agent keeps an explicit **notebook**, written by code and read by the ne
 Rules:
 - **Honest.** Written only from what the agent itself perceived (6.1), did, or was told in chat; never from hidden state. What it was told is stored as the speaker's words (last message), not as fact. Tests change hidden parts of the world and check that the notebook stays the same.
 - **Persistent.** Survives death and respawn within an episode (from M9, when respawn exists), and is cleared at episode reset. An agent that respawns still knows who killed it and where its chest is.
-- **Shared code.** The same `Notebook` (`hivemind/features/memory.py`) runs in the simulator and the bridge.
+- **Shared code.** The same `Notebook` (`hivemind/features/memory.py`) runs in the reference simulator and the bridge. The fast core (M4) runs a C++ port, checked against it by the differential tests (4.7), so no Python runs per world.
 - **Masks read the notebook, not the world.** `goto`, `mine`, `store` and `take` offer only targets the notebook holds (section 5).
 - **Read as tokens.** One token per place, player and event, and one per chest and item class it holds (at most 32 [est]): about 136 tokens. Each token is words plus numbers, read by cross-attention from the trunk (6.4), so many entries stay cheap.
 
@@ -516,9 +516,9 @@ The owner wants spare layers so an LLM can later learn to control Minecraft thro
 **Surgery protocol** (optional milestone M11):
 1. Freeze the trained policy.
 2. Train the adapters and port projections, and LoRA on the LLM [89], on supervised pairs: the game state plus an instruction, and the command a good player would write (from logged owner sessions and scripted experts).
-3. Fine-tune with RL.
+3. Fine-tune the coupled system, with RL on the game's rewards.
 
-**"No LLM in the loop" still holds** for every RL experiment (principle 3). The ports are masked and the adapters zero-initialised and frozen, so they change nothing. A test checks that the outputs are identical with and without them. Cost: about 0.3M parameters and under 1 MFLOP per decision.
+**"No LLM in the loop" still holds** for every experiment of M1–M10 (principle 3). The ports are masked and the adapters zero-initialised and frozen, so they change nothing. A test checks that the outputs are identical with and without them. Cost: about 0.3M parameters and under 1 MFLOP per decision.
 
 ## 7. Rewards and curriculum
 
@@ -595,7 +595,7 @@ Mineflayer's physics runs on a fixed 50 ms wall-clock timer with at most 4 catch
 
 Training still randomizes over the full ranges above.
 
-A delayed MDP becomes Markov again if the state includes the actions sent since the last observation (Katsikopoulos and Engelbrecht 2003, summarized in [66]). The last-action field and the GRU cover this, and DCAC trained well under random delays [66].
+A delayed MDP becomes Markov again if the state includes the actions sent since the last observation (Katsikopoulos and Engelbrecht 2003, summarized in [66]). The last-command field and the GRU cover this, and DCAC trained well under random delays [66].
 
 - **Schedule:** no lag until the single-agent exit test passes. Then ramp it in over about 20% of training, and report scores per profile.
 - **Scope:** macros hide most lag. It matters for combat, fleeing, crafting at high ping, and races to resources.
@@ -607,13 +607,13 @@ A delayed MDP becomes Markov again if the state includes the actions sent since 
 
 | Intent | Sentence |
 |---|---|
-| need, have, give | `i need {count} {item}` · `i have {count} {item}` · `give me {count} {item}` |
+| need, have, give | `i need {item_count} {item}` · `i have {item_count} {item}` · `give me {item_count} {item}` |
 | where | `where is {item}` |
 | come, follow, help | `come here` · `follow me` · `help me` |
 | attack, flee, stop, wait | `attack` · `flee` · `stop` · `wait` |
 | yes, no, thanks | `yes` · `no` · `thanks` |
 
-- **Slots:** `{item}` is any v1 item phrase (`iron ingot`, `raw iron`, `bread`) or a nonce word; `{count}` is 1, 2, 3, 4, 6, 8, 12, 16, 32 or 64. Example: `tell everyone i need 3 iron ingot.`
+- **Slots:** `{item}` is any v1 item phrase (`iron ingot`, `raw iron`, `bread`) or a nonce word; `{item_count}` is 1, 2, 3, 4, 6, 8, 12, 16, 32 or 64. Example: `tell everyone i need 3 iron ingot.`
 - **Nonce words** are made-up, English-like words: `dax`, `wug`, `blicket`, `fep`, `toma`, `zib`, `kiki`, `bouba`, in the spirit of Berko's wug test [93] [mem]. They are allowed only in chat item slots, and their meaning is drawn per episode.
 - **Rendering:** in the game, a message is plain chat text with the addressee first (`everyone, i need 3 iron ingot.`), the same form the owner types (below). The exact format is fixed in M2.
 - **Limits:** at most 1 message per 40 ticks, each costing −0.001 [est]. This keeps agents below vanilla's spam kick [mem]; 26.2 made the threshold configurable [29].
@@ -707,7 +707,7 @@ Expect the first languages to be small and practical: a few symbols for "danger"
 
 ### 10.1 Training setup
 
-- **Two independent populations (main setting).** Each team has its own network, learner and league. Neural MMO's niches formed between separately trained populations [53]. Within a team, agents share parameters and get an agent-slot input.
+- **Two independent populations (main setting).** Each team has its own network, learner and league. Neural MMO's niches formed between separately trained populations [53]. Within a team, agents share parameters and get an agent-slot input (the number in the agent's name, 6.2).
 - **Shared-network variant.** One network for both teams, with a team-id input (plain self-play). Cooperation between copies of one policy can be a convention between twins, so this variant is reported separately. A **cross-play matrix** (every trained population, shared ones included, against every other) shows whether behavior holds against strangers.
 - **Critic:** MAPPO's centralized critic. In the MAPPO study, the agent-specific (AS) and feature-pruned (FP) global-state inputs both did well; FP was used in most results and beat AS on several maps [67]. Start with FP. Hide-and-seek found an omniscient critic critical [57]. IPPO is the baseline; in Craftax-Coop all three algorithms reached comparable final returns, with MAPPO lowest [44].
 - **Batch:** at least 32k agent-decisions per update. Hide-and-seek used 64k; 32k cost little, and 8k and 16k never converged [57].
@@ -718,7 +718,7 @@ Expect the first languages to be small and practical: a few symbols for "danger"
   - opponents are 80% the other population's current policy and 20% its past snapshots, chosen by prioritized fictitious self-play [69];
   - exploiters reset above a 70% win rate [mem], where a win means a higher per-capita return.
 - **Team sizes** vary (5, 10, 20) in training, because unseen agent counts do not generalize [49].
-- **World rules** (D4–D6, D14):
+- **World rules** (D4–D6, D14, D21):
   - death drops the inventory, and the agent respawns at base after a delay;
   - cross-team damage on, friendly fire off (a scoreboard team option [mem]);
   - global chat, with team-only as a variant;
@@ -751,7 +751,7 @@ Knobs: ore density ×{0.25, 0.5, 1, 2}, area per agent (about 60² or 120² bloc
 | Storage | items stored and taken back; share of a team's items held in chests; chests per agent | per agent-hour; share |
 | Theft | items taken from other players' chests, within and across teams; ticks until the victim notices (6.3); the victim's attacks on a known thief compared with its attacks on other enemies | per agent-hour; ticks; ratio |
 | Territory | chunks holding a team's placed blocks; overlap between teams | share |
-| Inequality | Gini of inventory value (crafting depth), within and across teams | 0–1 |
+| Inequality | Gini of inventory value (crafting depth), counting each agent's own chests, within and across teams | 0–1 |
 | Specialization | entropy of each agent's verb distribution; mutual information between slot and verb | bits |
 | Communication | section 9 metrics, within team and across teams | |
 | Outcome | per-capita return, deaths, time to milestones | |
@@ -820,7 +820,7 @@ Python conductor (asyncio) ── TCP, u32 length + msgpack ── Node hosts ×
   - at most 4–5 bots per Node process, so A* cannot starve physics;
   - no path beyond loaded chunks [8].
 - **Messages:**
-  - The conductor sends `act{agent, req, command: "mine 4 iron ore.", parsed: {verb, args}, deadline_ticks, deadline_ms}` or `cancel`. The command text is for logs; Node runs the parsed form and never parses English itself, so both sides share one parser (contracts section 7).
+  - The conductor sends `act{agent, req, command: "mine 4 iron ore.", parsed: {verb, args}, deadline_ticks, deadline_ms}` or `cancel`. The command text is for logs; Node runs the parsed form and never parses English itself, so there is only one parser, on the Python side (contracts section 7).
   - Node replies `result{agent, req, code, result: "no path", tick0, tick1, wall_ms, n_roundtrips, inv_delta, raw_state}`, with the result words of section 5. After `store` or `take`, the raw state includes the chest's contents.
   - Node pushes `event{chat|hurt|death|kick|correction}`. Chat from people arrives as text, and the conductor reads it with the human tokenizer (9).
   - Python builds features from the raw state with the simulator's featurizer, perception and notebook.
@@ -926,7 +926,7 @@ Effort is in focused weeks at about WAI's pace [est].
 | M1 | Reference simulator | 4.3 formulas unit-tested; 19 verbs as English commands (`store` and `take` behind the `containers` flag); grammar round-trip tests pass (`parse(render(c)) == c` for every v1 command); notebook with honesty tests (6.3); perception; chunk ticking; furnace events; text and top-down viewer | 5–7 wk |
 | M2 | Minimal bridge, rule check, duration and lag fits | Harness mod; server-logged digs within ±1 tick; recipes 100%; goto, mine and craft durations fitted (log-RMSE ≤ 0.2); wrapper durations and failures measured under profiles A–C | 2–3 wk |
 | M3 | Worlds | 50 seeds imported (Y ≤ 191 areas); per-Y ore and exposure histograms; spawn rates in walled areas under the frozen config; density knob; pool | 2–3 wk |
-| M4 | Fast core | ≥30k decisions/s on 24 threads; differential test clean over 1M actions; exact replays | 6–10 wk |
+| M4 | Fast core | ≥30k decisions/s on 24 threads; differential test clean over 1M actions, including the notebook and the slot options behind the grammar masks; exact replays | 6–10 wk |
 | M5 | Single-agent PPO | Held-out, no X-ray: iron pickaxe ≥80%, first night ≥80%; Crafter score; learner throughput measured; word model vs opaque-id ablation reported (RQ5); LLM-port identity test passes (6.5) | 4–7 wk |
 | M6 | Lag randomization, using the M2 fits | ≤10% score drop in profile C | 1–2 wk |
 | M7 | Full bridge, calibration, evaluation orchestration | 11.4 thresholds pass in profiles A–C; areas, resets and instances automated; 40-bot ramp test (MSPT p95 < 40 ms, Node loop delay p99 < 20 ms) | 6–10 wk |
@@ -1060,7 +1060,7 @@ For comparison:
 3. **The CPU barrier** (28 Python workers waiting on the slowest) → one process steps all worlds and batches ready agents.
 4. **Held-out maps** → held-out seeds.
 5. **Stuck-spot practice and heat maps** → curriculum start states and seed replay.
-6. **Action masks** (parachute only when allowed) → a rule-based mask per verb.
+6. **Action masks** (parachute only when allowed) → a rule-based mask per verb, applied word by word as a grammar mask (5).
 7. **Real-game timing surprises** (WA's turn clock) → measure Mineflayer's wall-clock physics, round trips and `/tick` before modelling, and measure on the server, not the client.
 8. **Typed ctypes signatures** on every native call. **One run per GPU.** **Keep every checkpoint's weights** (the league needs them).
 9. **Don't penalize harmless habits**, only what costs results.
