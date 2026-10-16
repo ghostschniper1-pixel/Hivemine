@@ -7,7 +7,11 @@
     rules.tag("block", "mineable/pickaxe")        # ('acacia_button', ...) also "#minecraft:..."
     rules.recipes_for("stick")                    # recipes whose result is stick
     rules.loot_table("blocks/gravel")             # vanilla loot table JSON
+    rules.loot_table("gameplay/fishing/fish")     # tables that other tables reference are included
+    rules.tag("entity_type", "skeletons")         # tag kinds: block, item, entity_type, enchantment,
+    rules.tag("enchantment", "smelts_loot")       #   worldgen/biome (rules.tag_kinds)
     rules.entity("zombie").max_health             # 20.0
+    rules.biome("birch_forest")                   # Biome(id=4, display_name='Birch Forest', dimension='overworld')
     rules.constant("smelt_ticks")                 # 200 (rules.constant_entry(...) has the source)
     rules.mining_speed("wooden_pickaxe", "stone") # 2.0; tool None = bare hand
     rules.can_harvest("wooden_pickaxe", "iron_ore")  # False
@@ -184,6 +188,14 @@ class Entity:
 
 
 @dataclass(frozen=True)
+class Biome:
+    name: str
+    id: int  # index in the 1.21.1 worldgen/biome registry (cross-checked with minecraft-data's ids)
+    display_name: str  # English name from language.json ("Birch Forest")
+    dimension: str | None  # "overworld" | "nether" | "end" from the is_* biome tags; None for the_void
+
+
+@dataclass(frozen=True)
 class Constant:
     value: Any
     source: str  # "[n]" | "[mem]" | "[est]"
@@ -247,6 +259,8 @@ class Rules:
         self.blocks: dict[str, Block] = {n: _block(n, d) for n, d in raw["blocks"].items()}
         self.items: dict[str, Item] = {n: _item(n, d) for n, d in raw["items"].items()}
         self.entities: dict[str, Entity] = {n: _entity(n, d) for n, d in raw["entities"].items()}
+        self.biomes: dict[str, Biome] = {n: Biome(n, d["id"], d["display_name"], d["dimension"])
+                                         for n, d in sorted(raw["biomes"].items(), key=lambda kv: kv[1]["id"])}
         self.recipes: tuple[Recipe, ...] = tuple(_recipe(d) for d in raw["recipes"])
         self.constants: dict[str, Constant] = {n: Constant(d["value"], d["source"])
                                                for n, d in raw["constants"].items()}
@@ -283,8 +297,19 @@ class Rules:
         except KeyError:
             raise KeyError(f"unknown entity {name!r}") from None
 
+    def biome(self, name: str) -> Biome:
+        try:
+            return self.biomes[_name(name)]
+        except KeyError:
+            raise KeyError(f"unknown biome {name!r}") from None
+
+    @property
+    def tag_kinds(self) -> tuple[str, ...]:
+        """The tag kinds in the file: "block", "item", "entity_type", "enchantment", "worldgen/biome"."""
+        return tuple(self._tags)
+
     def tag(self, kind: str, name: str) -> tuple[str, ...]:
-        """Members of a block or item tag, fully resolved, sorted."""
+        """Members of a tag of one kind (``tag_kinds``), fully resolved, sorted."""
         try:
             return self._tags[kind][_name(name)]
         except KeyError:

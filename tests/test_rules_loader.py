@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from hivemind.rules import Block, Item, Rules, load_rules
+from hivemind.rules import Biome, Block, Item, Rules, load_rules
 from hivemind.rules.loader import DEFAULT_RULES_PATH
 
 
@@ -78,6 +78,22 @@ def test_tags(rules: Rules) -> None:
     assert rules.tag("block", "needs_diamond_tool") == tuple(sorted(rules.tag("block", "needs_diamond_tool")))
     with pytest.raises(KeyError):
         rules.tag("block", "no_such_tag")
+    assert set(rules.tag_kinds) == {"block", "item", "entity_type", "enchantment", "worldgen/biome"}
+    assert rules.in_tag("entity_type", "stray", "#minecraft:skeletons")
+    assert not rules.in_tag("entity_type", "zombie", "skeletons")
+    assert rules.tag("enchantment", "smelts_loot") == ("fire_aspect",)
+    assert rules.in_tag("worldgen/biome", "plains", "is_overworld")
+    with pytest.raises(KeyError):
+        rules.tag("enchantments", "smelts_loot")  # unknown kind
+
+
+def test_biomes(rules: Rules) -> None:
+    b = rules.biome("minecraft:birch_forest")
+    assert isinstance(b, Biome) and b == Biome("birch_forest", 4, "Birch Forest", "overworld")
+    assert [x.id for x in rules.biomes.values()] == list(range(64))  # iteration in id order
+    assert rules.biome("the_void").dimension is None and rules.biome("warped_forest").dimension == "nether"
+    with pytest.raises(KeyError, match="pale_garden"):
+        rules.biome("pale_garden")  # added in 1.21.4, not in 1.21.1
 
 
 def test_recipes_for(rules: Rules) -> None:
@@ -98,6 +114,7 @@ def test_loot_tables(rules: Rules) -> None:
     assert "minecraft:flint" in json.dumps(gravel)
     assert "minecraft:coal" in json.dumps(rules.loot_table("blocks/coal_ore"))
     assert rules.loot_table("minecraft:entities/zombie")["type"] == "minecraft:entity"
+    assert rules.loot_table("gameplay/fishing/fish")["type"] == "minecraft:fishing"  # the guardians' fish
     with pytest.raises(KeyError):
         rules.loot_table("blocks/nothing")
 

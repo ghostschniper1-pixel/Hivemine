@@ -52,10 +52,10 @@ def rules(raw_bytes: bytes) -> dict:
 
 def test_top_level_layout(rules: dict) -> None:
     assert set(rules) == {"version", "build", "blocks", "items", "tags", "recipes", "loot_tables", "entities",
-                          "constants"}
+                          "biomes", "constants"}
     assert rules["version"] == "1.21.1"
     assert set(rules["build"]) == {"sources", "hash"}
-    assert set(rules["tags"]) == {"block", "item"}
+    assert set(rules["tags"]) == set(B.TAG_KINDS) == {"block", "item", "entity_type", "enchantment", "worldgen/biome"}
 
 
 def test_file_is_canonical_and_hash_matches(rules: dict, raw_bytes: bytes) -> None:
@@ -134,14 +134,22 @@ def test_items_schema(rules: dict) -> None:
 
 
 def test_tags_are_fully_resolved(rules: dict) -> None:
-    for kind, universe in (("block", rules["blocks"]), ("item", rules["items"])):
+    for kind, universe, n_min in (("block", rules["blocks"], 100), ("item", rules["items"], 100),
+                                  ("entity_type", rules["entities"], 30), ("worldgen/biome", rules["biomes"], 50)):
         tags = rules["tags"][kind]
-        assert len(tags) > 100
+        assert len(tags) > n_min, kind
         for tag, members in tags.items():
             assert members == sorted(set(members)), tag
             assert all(m in universe for m in members), tag  # no '#refs' and no unknown names
+    for tag, members in rules["tags"]["enchantment"].items():  # no enchantment table: names only
+        assert members == sorted(set(members)) and all(re.fullmatch(r"[a-z_]+", m) for m in members), tag
     assert "oak_log" in rules["tags"]["block"]["logs"]  # logs -> #oak_logs -> oak_log (nested)
     assert len(rules["tags"]["item"]["planks"]) == 11
+    # the tags that loot conditions use (entities/wither_skeleton, every meat drop)
+    assert rules["tags"]["entity_type"]["skeletons"] == ["bogged", "skeleton", "skeleton_horse", "stray",
+                                                         "wither_skeleton"]
+    assert rules["tags"]["enchantment"]["smelts_loot"] == ["fire_aspect"]
+    assert "exclusive_set/armor" in rules["tags"]["enchantment"]  # subdirectories keep their path
 
 
 def test_recipes(rules: dict) -> None:
@@ -166,10 +174,40 @@ def test_recipes(rules: dict) -> None:
 
 def test_loot_tables_are_verbatim_vanilla(rules: dict) -> None:
     loot = rules["loot_tables"]
-    assert all(k.startswith(("blocks/", "entities/")) for k in loot)
+    assert all(k.startswith(B.LOOT_TABLE_PREFIXES) or k in B.LOOT_TABLE_FILES for k in loot)
     assert loot["blocks/stone"]["type"] == "minecraft:block"
     assert loot["entities/zombie"]["type"] == "minecraft:entity"
     assert "entities/sheep/white" in loot
+    fishing = sorted(k for k in loot if k.startswith("gameplay/"))
+    assert fishing == ["gameplay/fishing", "gameplay/fishing/fish", "gameplay/fishing/junk", "gameplay/fishing/treasure"]
+    assert loot["gameplay/fishing/fish"]["type"] == "minecraft:fishing"
+
+
+def test_loot_table_references_resolve_inside_the_file(rules: dict) -> None:
+    loot = rules["loot_tables"]
+    refs = {(path, ref) for path, table in loot.items() for ref in B.loot_references(table)}
+    assert all(ref in loot for _, ref in refs), sorted(r for r in refs if r[1] not in loot)
+    assert ("entities/guardian", "gameplay/fishing/fish") in refs
+    assert ("entities/elder_guardian", "gameplay/fishing/fish") in refs
+    assert ("gameplay/fishing", "gameplay/fishing/junk") in refs
+
+
+def test_biomes(rules: dict) -> None:
+    biomes = rules["biomes"]
+    assert len(biomes) == 64
+    assert sorted(b["id"] for b in biomes.values()) == list(range(64))
+    assert [n for n, _ in sorted(biomes.items(), key=lambda kv: kv[1]["id"])] == sorted(biomes)  # registry order
+    for name, b in biomes.items():
+        assert set(b) == {"id", "display_name", "dimension"}, name
+        assert b["dimension"] in ("overworld", "nether", "end", None), name
+        assert (b["dimension"] == "overworld") == (name in rules["tags"]["worldgen/biome"]["is_overworld"]), name
+    assert biomes["birch_forest"] == {"id": 4, "display_name": "Birch Forest", "dimension": "overworld"}
+    assert biomes["plains"]["display_name"] == "Plains"
+    assert biomes["nether_wastes"]["dimension"] == "nether" and biomes["the_end"]["dimension"] == "end"
+    assert biomes["the_void"]["dimension"] is None  # in no dimension tag (B.TOLERATED_BIOME_DIMENSION)
+    dims = [b["dimension"] for b in biomes.values()]
+    assert (dims.count("overworld"), dims.count("nether"), dims.count("end")) == (53, 5, 5)
+    assert {"deep_dark", "lush_caves", "dripstone_caves"} <= set(rules["tags"]["worldgen/biome"]["is_overworld"])
 
 
 def test_entities(rules: dict) -> None:
@@ -412,11 +450,13 @@ def test_hash_ignores_build_field() -> None:
 
 def _src(md: dict | None = None, **parts) -> B.Sources:
     base = {"items": [], "foods": [], "blocks": [], "materials": {}, "recipes": {}, "entities": [], "language": {},
-            "block_loot": [], "entity_loot": []}
-    return B.Sources(pins={}, md={**base, **(md or {})}, tags=parts.get("tags", {"block": {}, "item": {}}),
+            "biomes": [], "block_loot": [], "entity_loot": []}
+    return B.Sources(pins={}, md={**base, **(md or {})}, tags=parts.get("tags", {k: {} for k in B.TAG_KINDS}),
                      recipes=parts.get("recipes", {}), loot=parts.get("loot", {}),
                      components=parts.get("components", {}), summary_blocks=parts.get("summary_blocks", {}),
-                     entity_registry=parts.get("entity_registry", []))
+                     entity_registry=parts.get("entity_registry", []),
+                     enchantment_registry=parts.get("enchantment_registry", []),
+                     biome_registry=parts.get("biome_registry", []))
 
 
 def test_check_items_detects_planted_mismatches() -> None:
@@ -502,6 +542,56 @@ def test_check_entities_detects_a_planted_name() -> None:
         assert (not B.check_entities(src).mismatches) is ok
 
 
+def test_build_biomes_ids_names_and_dimensions() -> None:
+    lang = {"biome.minecraft.beach": "Beach", "biome.minecraft.the_void": "The Void"}
+    src = _src({"language": lang}, biome_registry=["beach", "the_void"])
+    tags = {"is_overworld": ["beach"], "is_nether": [], "is_end": []}
+    notes: list[str] = []
+    assert B.build_biomes(src, tags, notes) == {"beach": {"id": 0, "display_name": "Beach", "dimension": "overworld"},
+                                                "the_void": {"id": 1, "display_name": "The Void", "dimension": None}}
+    with pytest.raises(B.BuildError, match="several dimension tags"):
+        B.build_biomes(src, {**tags, "is_end": ["beach"]}, notes)
+    with pytest.raises(B.BuildError, match="no English name"):
+        B.build_biomes(_src({"language": {}}, biome_registry=["beach"]), tags, notes)
+
+
+def test_check_biomes_detects_planted_mismatches() -> None:
+    biomes = {"beach": {"id": 0, "display_name": "Beach", "dimension": "overworld"},
+              "the_void": {"id": 1, "display_name": "The Void", "dimension": None}}
+    md = [{"id": 0, "name": "beach", "displayName": "Beach", "dimension": "overworld"},
+          {"id": 1, "name": "the_void", "displayName": "The Void", "dimension": "overworld"}]
+    chk = B.check_biomes(_src({"biomes": md}), biomes)
+    assert chk.compared == 2 and not chk.mismatches and len(chk.tolerated) == 1  # the_void's dimension
+    for i, field, value in ((0, "id", 5), (0, "displayName", "Shore"), (0, "dimension", "nether"), (1, "name", "x")):
+        bad = [dict(b) for b in md]
+        bad[i][field] = value
+        assert B.check_biomes(_src({"biomes": bad}), biomes).mismatches, (field, value)
+
+
+def test_select_loot_tables_follows_references() -> None:
+    item = {"type": "minecraft:item", "name": "minecraft:cod"}
+    loot = {"blocks/stone": {"pools": []},
+            "entities/guardian": {"pools": [{"entries": [{"type": "minecraft:loot_table",
+                                                          "value": "minecraft:gameplay/fishing/fish"}]}]},
+            "gameplay/fishing": {"pools": [{"entries": [{"type": "minecraft:loot_table",
+                                                         "value": "minecraft:gameplay/other"}]}]},
+            "gameplay/fishing/fish": {"pools": [{"entries": [item]}]},
+            "gameplay/other": {"pools": [{"entries": [{"type": "minecraft:loot_table", "value": {"pools": []}}]}]},
+            "gameplay/unused": {"pools": []},
+            "chests/village": {"pools": []}}
+    notes: list[str] = []
+    kept = B.select_loot_tables(loot, notes)
+    assert list(kept) == ["blocks/stone", "entities/guardian", "gameplay/fishing", "gameplay/fishing/fish",
+                          "gameplay/other"]  # gameplay/other only because gameplay/fishing references it
+    assert "['gameplay/other']" in notes[-1]
+    broken = {**loot, "entities/guardian": {"pools": [{"entries": [{"type": "minecraft:loot_table",
+                                                                     "value": "minecraft:gameplay/missing"}]}]}}
+    with pytest.raises(B.BuildError, match="missing table gameplay/missing"):
+        B.select_loot_tables(broken, notes)
+    with pytest.raises(B.BuildError, match="missing loot table gameplay/fishing"):
+        B.select_loot_tables({"blocks/stone": {"pools": []}}, notes)
+
+
 def test_check_display_names_detects_a_planted_name() -> None:
     for name, ok in (("Stone", True), ("Rock", False)):
         src = _src({"blocks": [{"name": "stone", "displayName": name}], "language": {"block.minecraft.stone": "Stone"}})
@@ -559,7 +649,8 @@ def test_rebuild_from_cache_reproduces_committed_file(raw_bytes: bytes) -> None:
             assert chk.mismatches == [], chk.line()
     names = {c.name for c in checks}
     for expected in ("stack sizes", "durability", "food values", "harvest tools vs tool rules + tags",
-                     "tool speeds: materials.json vs tool rules", "recipes: minecraft-data vs mcmeta (crafting)"):
+                     "tool speeds: materials.json vs tool rules", "recipes: minecraft-data vs mcmeta (crafting)",
+                     "biomes: 1.21.1 registry and tags vs minecraft-data 1.20.5"):
         assert expected in names
     assert rules["build"]["hash"] == json.loads(raw_bytes)["build"]["hash"]
     assert B.render(rules) == raw_bytes

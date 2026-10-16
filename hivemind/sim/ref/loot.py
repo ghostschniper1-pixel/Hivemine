@@ -16,9 +16,11 @@ Fortune, no Silk Touch, no explosion, block-state conditions resolved) with item
 item-class names. Mobs use the vanilla tables of the rules file (``entities/<name>``), evaluated
 with vanilla item names (so ``furnace_smelt`` uses the vanilla smelting recipes exactly) and mapped
 to item classes at the end. An unsheared sheep uses ``entities/sheep/<colour>`` (one wool plus the
-plain sheep table), as the game does [mem]; all colours give the class ``wool``. Tables referenced
-from other tables but missing from the rules file are in ``EXTRA_LOOT_TABLES`` (from the pinned
-mcmeta ``1.21.1-data`` [3]).
+plain sheep table), as the game does [mem]; all colours give the class ``wool``. Tables that other
+tables reference (the guardians' ``gameplay/fishing/fish``) and the entity-type and enchantment
+tags that conditions test (``#skeletons``, ``#smelts_loot``) are read from the rules file too
+(``rules.loot_table``, ``rules.tag("entity_type" | "enchantment", ...)``), which carries them
+verbatim from the pinned mcmeta ``1.21.1-data`` [3].
 
 **Harvesting.** A block gives drops only when broken with a tool that can harvest it
 (``concepts.can_harvest``; the server checks ``hasCorrectToolForDrops`` before rolling the table
@@ -89,26 +91,6 @@ Drops = dict[int, int]  # item-class id -> count
 
 MAX_NESTING = 8  # nested loot_table entries deeper than this raise (the game stops recursion too [mem])
 
-# Tables that rules-file tables reference but the rules file does not carry; verbatim from the
-# pinned mcmeta 1.21.1-data, data/minecraft/loot_table/gameplay/fishing/fish.json [3].
-EXTRA_LOOT_TABLES: dict[str, dict] = {
-    "gameplay/fishing/fish": {
-        "type": "minecraft:fishing",
-        "pools": [{"bonus_rolls": 0.0, "rolls": 1.0, "entries": [
-            {"type": "minecraft:item", "name": "minecraft:cod", "weight": 60},
-            {"type": "minecraft:item", "name": "minecraft:salmon", "weight": 25},
-            {"type": "minecraft:item", "name": "minecraft:tropical_fish", "weight": 2},
-            {"type": "minecraft:item", "name": "minecraft:pufferfish", "weight": 13},
-        ]}],
-        "random_sequence": "minecraft:gameplay/fishing/fish",
-    },
-}
-# Non-item tags the tables use, from the pinned mcmeta 1.21.1-data [3]:
-# tags/entity_type/skeletons.json and tags/enchantment/smelts_loot.json.
-ENTITY_TYPE_TAGS: dict[str, tuple[str, ...]] = {
-    "skeletons": ("skeleton", "stray", "wither_skeleton", "skeleton_horse", "bogged"),
-}
-ENCHANTMENT_TAGS: dict[str, tuple[str, ...]] = {"smelts_loot": ("fire_aspect",)}
 # Functions that only set item components (no change of item or count): identities at class level.
 COMPONENT_ONLY_FUNCTIONS = frozenset({
     "set_potion",  # tipped arrows of strays and bogged
@@ -479,12 +461,17 @@ class LootSampler:
 
     def _table(self, path: str) -> dict:
         path = _ns(path)
-        if path in EXTRA_LOOT_TABLES:
-            return EXTRA_LOOT_TABLES[path]
         try:
             return self.rules.loot_table(path)
         except KeyError:
             raise UnsupportedLoot(f"loot table {path!r} is not in the rules file") from None
+
+    def _tag(self, kind: str, name: str) -> tuple[str, ...]:
+        """Members of an entity_type or enchantment tag from the rules file."""
+        try:
+            return self.rules.tag(kind, _ns(name))
+        except KeyError:
+            raise UnsupportedLoot(f"{kind} tag {name!r} is not in the rules file") from None
 
     def _validate(self, table: Mapping[str, Any], key: str | None) -> None:
         """``validate_table``, once per persistent table (``key``: a table path or block class)."""
@@ -703,7 +690,7 @@ class LootSampler:
             if item is None or _ns(item) not in allowed:
                 return False
         for e in pred.get("predicates", {}).get("minecraft:enchantments", ()):
-            if not _enchantment_matches(e, enchants):
+            if not self._enchantment_matches(e, enchants):
                 return False
         return True
 
@@ -735,7 +722,7 @@ class LootSampler:
 
     def _entity_type_matches(self, pred: Mapping[str, Any], etype: str, target: str, ctx: _Ctx) -> bool:
         kill = ctx.kill
-        if "type" in pred and not _type_matches(pred["type"], etype):
+        if "type" in pred and not self._type_matches(pred["type"], etype):
             return False
         if "flags" in pred:
             for flag, want in pred["flags"].items():
@@ -770,9 +757,41 @@ class LootSampler:
             if "items" in hand:
                 raise UnsupportedLoot("the attacker's weapon item is not part of KillContext")
             for e in hand.get("predicates", {}).get("minecraft:enchantments", ()):
-                if not _enchantment_matches(e, kill.weapon_enchantments):
+                if not self._enchantment_matches(e, kill.weapon_enchantments):
                     return False
         return True
+
+    def _type_matches(self, want: Any, etype: str) -> bool:
+        """``EntityTypePredicate``: an id, an ``#tag`` (entity_type tags of the rules file) or a list of ids."""
+        names = [want] if isinstance(want, str) else list(want)
+        for n in names:
+            if n.startswith("#"):
+                if etype in self._tag("entity_type", n):
+                    return True
+            elif _ns(n) == etype:
+                return True
+        return False
+
+    def _enchantment_matches(self, e: Mapping[str, Any], enchants: Mapping[str, int]) -> bool:
+        """One ``minecraft:enchantments`` sub-predicate: some listed enchantment (ids, or ``#tags``
+        of the rules file) present at a level in range."""
+        names = e.get("enchantments")
+        if names is None:
+            candidates = list(enchants)
+        else:
+            listed = [names] if isinstance(names, str) else list(names)
+            candidates = []
+            for n in listed:
+                if n.startswith("#"):
+                    candidates += self._tag("enchantment", n)
+                else:
+                    candidates.append(_ns(n))
+        levels = e.get("levels")
+        for c in candidates:
+            lvl = int(enchants.get(c, 0))
+            if lvl > 0 and _int_range(levels, lvl):
+                return True
+        return False
 
     def _damage_matches(self, pred: Mapping[str, Any], ctx: _Ctx) -> bool:
         kill = ctx.kill
@@ -869,21 +888,6 @@ def _loot_stream(stream: DrawStream) -> DrawStream:
     return stream
 
 
-def _type_matches(want: Any, etype: str) -> bool:
-    """``EntityTypePredicate``: an id, an ``#tag`` or a list of ids."""
-    names = [want] if isinstance(want, str) else list(want)
-    for n in names:
-        if n.startswith("#"):
-            tag = _ns(n)
-            if tag not in ENTITY_TYPE_TAGS:
-                raise UnsupportedLoot(f"entity type tag {n!r}")
-            if etype in ENTITY_TYPE_TAGS[tag]:
-                return True
-        elif _ns(n) == etype:
-            return True
-    return False
-
-
 def _int_range(want: Any, value: int) -> bool:
     """``MinMaxBounds.Ints``: an exact number or {min, max}."""
     if want is None:
@@ -892,30 +896,6 @@ def _int_range(want: Any, value: int) -> bool:
         return value == int(want)
     lo, hi = want.get("min"), want.get("max")
     return (lo is None or value >= lo) and (hi is None or value <= hi)
-
-
-def _enchantment_matches(e: Mapping[str, Any], enchants: Mapping[str, int]) -> bool:
-    """One ``minecraft:enchantments`` sub-predicate: some listed enchantment present at a level in range."""
-    names = e.get("enchantments")
-    if names is None:
-        candidates = list(enchants)
-    else:
-        listed = [names] if isinstance(names, str) else list(names)
-        candidates = []
-        for n in listed:
-            if n.startswith("#"):
-                tag = _ns(n)
-                if tag not in ENCHANTMENT_TAGS:
-                    raise UnsupportedLoot(f"enchantment tag {n!r}")
-                candidates += ENCHANTMENT_TAGS[tag]
-            else:
-                candidates.append(_ns(n))
-    levels = e.get("levels")
-    for c in candidates:
-        lvl = int(enchants.get(c, 0))
-        if lvl > 0 and _int_range(levels, lvl):
-            return True
-    return False
 
 
 def _state_matches(props: Mapping[str, Any], state: Mapping[str, str]) -> bool:

@@ -8,7 +8,7 @@
       "method": "raw",
       "url": "https://raw.githubusercontent.com/PrismarineJS/minecraft-data/{commit}/{path}",
       "dir": "minecraft-data",
-      "used_for": "hardness, harvest tools, block states, display names, collision shapes (1.20.5), entity sizes (1.20.5), tool speeds; recipes, items, foods and 1.20 loot for cross-checks",
+      "used_for": "hardness, harvest tools, block states, display names, collision shapes (1.20.5), entity sizes (1.20.5), tool speeds; recipes, items, foods, biome ids (1.20.5) and 1.20 loot for cross-checks",
       "files": {
         "data/pc/1.21.1/version.json": "da9541e79f0a996c5a041003d41f194056bd363bb216b75b978e87a6d994873d",
         "data/pc/1.21.1/blocks.json": "7d1d95c4e0255f9f269293e8077c7923c9ec0ff902a9a475ed131da8b26bc654",
@@ -19,6 +19,7 @@
         "data/pc/1.21.1/language.json": "5f7b6bf85a5cfb12d547f093fe216060fcfde827b5c65dd1320be68d23c0c007",
         "data/pc/1.20.5/entities.json": "abc419e378564603f249cfeb1d5ee7cd2a0ec3bf7c7fb1ba7d704bb0e7454038",
         "data/pc/1.20.5/blockCollisionShapes.json": "fac384f740f14ab24b7c422a30a5fbb742e715433a07cae726ef8f9bfbde8036",
+        "data/pc/1.20.5/biomes.json": "ff5c83d782c6fa8398c597ea685218304f9c138f1758f31fe30cd666ddc29b5c",
         "data/pc/1.20/blockLoot.json": "db0ae7e8997a3daf9f909afca0f3ae9560dec79222eefc562e08960fc7532a41",
         "data/pc/1.20/entityLoot.json": "d97e64a4a5f51ddfd9d91d3be3d44a321515dd9ca25858cbf2265be0e980704f"
       }
@@ -29,7 +30,7 @@
       "commit": "aacd2a457333b258d044a642f38270c8cddbc628",
       "method": "git-sparse",
       "dir": "mcmeta-1.21.1-data",
-      "used_for": "recipes, loot tables, block and item tags, worldgen placed and configured features",
+      "used_for": "recipes, loot tables, block, item, entity type, enchantment and biome tags, worldgen placed and configured features",
       "paths": [
         "data/minecraft/loot_table",
         "data/minecraft/recipe",
@@ -44,7 +45,7 @@
       "method": "raw",
       "url": "https://raw.githubusercontent.com/misode/mcmeta/{commit}/{path}",
       "dir": "mcmeta-1.21.1-summary",
-      "used_for": "item components (stack size, durability, food, tool rules and speeds, attack modifiers), block states, the entity_type registry",
+      "used_for": "item components (stack size, durability, food, tool rules and speeds, attack modifiers), block states, the entity_type, enchantment and worldgen/biome registries",
       "files": {
         "version.json": "dc02e5b2ccde59013371dc06e4294985d27ce3c936ee2b89b7d954cd5ec4dc4e",
         "item_components/data.json": "14efff2c0f4fcb5d9e3c73d2b9a3d78434f82f0e4ab626438985611c081744c7",

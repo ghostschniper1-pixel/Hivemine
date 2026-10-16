@@ -5,15 +5,12 @@ from __future__ import annotations
 import json
 import math
 from collections import Counter
-from pathlib import Path
 
 import pytest
 
 from hivemind.rules import load_concepts, load_rules
+from hivemind.sim.ref import loot as loot_module
 from hivemind.sim.ref.loot import (
-    ENCHANTMENT_TAGS,
-    ENTITY_TYPE_TAGS,
-    EXTRA_LOOT_TABLES,
     KillContext,
     LootSampler,
     UnsupportedLoot,
@@ -27,7 +24,6 @@ C = load_concepts()
 R = load_rules()
 SAMPLER = LootSampler()
 RNG = CounterRNG(20261016)
-MCMETA = Path(__file__).resolve().parents[1] / "data" / "sources" / "mcmeta-1.21.1-data" / "data" / "minecraft"
 
 
 def iid(name: str) -> int:
@@ -376,16 +372,24 @@ def test_location_and_state_conditions_need_their_context():
     assert SAMPLER.sample_table(STATE_TABLE, stream(0), level="class", block_state={"age": "2"}) == {}
 
 
-def test_embedded_tables_match_the_pinned_sources():
-    files = {
-        "gameplay/fishing/fish": MCMETA / "loot_table" / "gameplay" / "fishing" / "fish.json",
-        "skeletons": MCMETA / "tags" / "entity_type" / "skeletons.json",
-        "smelts_loot": MCMETA / "tags" / "enchantment" / "smelts_loot.json",
-    }
-    if not all(p.exists() for p in files.values()):
-        pytest.skip("source cache not present (python -m hivemind.rules.fetch_sources)")
-    assert EXTRA_LOOT_TABLES["gameplay/fishing/fish"] == json.loads(files["gameplay/fishing/fish"].read_text())
-    tag = [v.removeprefix("minecraft:") for v in json.loads(files["skeletons"].read_text())["values"]]
-    assert ENTITY_TYPE_TAGS["skeletons"] == tuple(tag)
-    ench = [v.removeprefix("minecraft:") for v in json.loads(files["smelts_loot"].read_text())["values"]]
-    assert ENCHANTMENT_TAGS["smelts_loot"] == tuple(ench)
+def test_nested_tables_and_tags_come_from_the_rules_file():
+    """No embedded copies: the guardians' fishing table and the entity-type and enchantment tags
+    are the rules file's (built verbatim from the pinned mcmeta 1.21.1-data)."""
+    for old in ("EXTRA_LOOT_TABLES", "ENTITY_TYPE_TAGS", "ENCHANTMENT_TAGS"):
+        assert not hasattr(loot_module, old), old
+    assert SAMPLER._table("minecraft:gameplay/fishing/fish") is R.loot_table("gameplay/fishing/fish")
+    assert "#minecraft:skeletons" in json.dumps(R.loot_table("entities/creeper"))
+    assert "#minecraft:smelts_loot" in json.dumps(R.loot_table("entities/cow"))
+    disc = iid("other_item_1")
+    for attacker, gets_disc in (("stray", True), ("bogged", True), ("zombie", False)):  # #skeletons
+        kill = KillContext(attacker=attacker, direct_attacker="arrow")
+        assert (SAMPLER.entity_drops("creeper", stream(0), kill).get(disc) == 1) is gets_disc, attacker
+    fire_aspect = KillContext.by_player(weapon_enchantments={"fire_aspect": 1})  # #smelts_loot
+    for i in range(20):
+        d = names(SAMPLER.entity_drops("cow", stream(i), fire_aspect))
+        assert d.get("cooked_beef", 0) >= 1 and "beef" not in d
+    unknown_tag = {"pools": [{"rolls": 1.0, "entries": [{"type": "minecraft:item", "name": "minecraft:bone",
+        "conditions": [{"condition": "minecraft:entity_properties", "entity": "attacker",
+                        "predicate": {"type": "#minecraft:no_such_tag"}}]}]}]}
+    with pytest.raises(UnsupportedLoot, match="no_such_tag"):
+        SAMPLER.sample_table(unknown_tag, stream(0), kill=KillContext(attacker="skeleton"))

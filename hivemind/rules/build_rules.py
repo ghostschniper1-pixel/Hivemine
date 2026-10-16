@@ -15,12 +15,25 @@ Where each part comes from:
 - items: mcmeta item components (stack size, durability, food, tool rules, attack
   modifiers), names and ids from minecraft-data; armor, fuel and equipment slots from
   ``constants.py`` (not in the data dumps).
-- tags: every mcmeta block and item tag, resolved recursively to sorted name lists.
+- tags: every mcmeta tag of the kinds in ``TAG_KINDS`` (block, item, entity_type,
+  enchantment, worldgen/biome), resolved recursively to sorted name lists. Loot conditions use
+  entity_type tags (``#skeletons``) and enchantment tags (``#smelts_loot``); the biome tags
+  give each biome its dimension.
 - recipes: every mcmeta recipe, tag ingredients resolved to name lists. Special recipes
   (``crafting_special_*``, decorated pot, smithing) are kept and flagged ``special``.
-- loot_tables: mcmeta ``loot_table/blocks/*`` and ``loot_table/entities/**`` verbatim.
+- loot_tables: mcmeta ``loot_table/blocks/*``, ``loot_table/entities/**`` and the fishing
+  tables (``gameplay/fishing`` and ``gameplay/fishing/*``; the guardians' drops roll
+  ``gameplay/fishing/fish``) verbatim, plus every table an included table references through a
+  ``minecraft:loot_table`` entry, transitively (``select_loot_tables``; a reference to a
+  missing table fails the build).
 - entities: the mcmeta ``entity_type`` registry; ids, sizes and categories from
   minecraft-data ``pc/1.20.5/entities.json``; stats from ``constants.py``.
+- biomes: the mcmeta ``worldgen/biome`` registry (64 biomes in 1.21.1); ``id`` is the index in
+  the registry (alphabetical, the order in which the game numbers a data-driven registry [mem]),
+  ``display_name`` from minecraft-data ``language.json`` (``biome.minecraft.<name>``),
+  ``dimension`` from the biome tags ``is_overworld``, ``is_nether`` and ``is_end`` (null when
+  the biome is in none of them: ``the_void``). Cross-checked against minecraft-data
+  ``pc/1.20.5/biomes.json`` (1.21 added no biome, so the 1.20.5 file still applies).
 - constants: ``constants.all_constants()`` as ``{"value", "source"}``.
 
 Representation choices not fixed by the contract:
@@ -38,6 +51,9 @@ Representation choices not fixed by the contract:
   is added (durability lost per block mined: 1, or 2 for swords, mace and trident).
 - ``food`` adds ``eat_seconds``, ``can_always_eat``, ``converts_to`` and ``effects``.
 - recipes add ``special`` (bool).
+- ``tags`` is keyed by tag kind (``TAG_KINDS``); tags in subdirectories keep their path
+  (``mineable/pickaxe``, ``exclusive_set/armor``, ``has_structure/village_plains``).
+- ``biomes``: ``{name: {id, display_name, dimension}}`` (additive; see above).
 
 The build cross-checks overlapping sources and fails on any disagreement that is not
 listed in a ``TOLERATED_*`` table below with its reason (``build`` raises
@@ -78,6 +94,13 @@ TIER_TAGS = {"wood": "incorrect_for_wooden_tool", "stone": "incorrect_for_stone_
 TOOL_SUFFIXES = ("pickaxe", "shovel", "axe", "hoe", "sword")
 SPECIAL_RECIPE_TYPES = ("crafting_decorated_pot", "smithing_transform", "smithing_trim")
 COOKING_TYPES = ("smelting", "blasting", "smoking", "campfire_cooking")
+# Tag kinds kept in the rules file: directory under data/minecraft/tags -> what the names are.
+TAG_KINDS = ("block", "item", "entity_type", "enchantment", "worldgen/biome")
+# Loot tables kept: path prefixes and single files (plus every table they reference).
+LOOT_TABLE_PREFIXES = ("blocks/", "entities/", "gameplay/fishing/")
+LOOT_TABLE_FILES = ("gameplay/fishing",)
+# Biome tags that name a biome's dimension (a biome is in at most one).
+BIOME_DIMENSION_TAGS = (("overworld", "is_overworld"), ("nether", "is_nether"), ("end", "is_end"))
 FOOD_DEFAULT_EAT_SECONDS = 1.6  # [mem] food component default; = constants eat_ticks 32 / 20
 TOOL_DEFAULT_DAMAGE_PER_BLOCK = 1  # [mem] tool component default
 FLOAT_TOLERANCE = 1e-5  # float32 vs decimal printing (e.g. 7.2000003 vs 7.2)
@@ -118,6 +141,12 @@ TOLERATED_WALL_DISPLAY_NAME = "minecraft-data uses the standing variant's (item'
 # Entity display names that differ between minecraft-data 1.20.5 and the 1.21.1 language
 # file (none for the pinned sources).
 TOLERATED_ENTITY_DISPLAY_NAMES: dict[str, str] = {}
+
+# Biomes whose minecraft-data dimension differs from the one the 1.21.1 biome tags give.
+TOLERATED_BIOME_DIMENSION = {
+    "the_void": "the superflat 'void' preset's biome is in none of the is_overworld, is_nether and is_end "
+                "tags (dimension null); minecraft-data files it under overworld",
+}
 
 # Recipes present in only one source. minecraft-data recipes are keyed by
 # (result, sorted ingredient names); mcmeta recipes by id.
@@ -221,12 +250,14 @@ class Sources:
 
     pins: dict
     md: dict[str, Any]  # minecraft-data files by short name, e.g. "blocks", "entities"
-    tags: dict[str, dict[str, Any]]  # "block" / "item" -> tag name -> raw tag JSON
+    tags: dict[str, dict[str, Any]]  # tag kind (TAG_KINDS) -> tag name -> raw tag JSON
     recipes: dict[str, Any]  # recipe id -> raw JSON
-    loot: dict[str, Any]  # "blocks/stone" -> raw JSON
+    loot: dict[str, Any]  # every mcmeta loot table: "blocks/stone" -> raw JSON (select_loot_tables picks)
     components: dict[str, Any]  # item name -> item components
     summary_blocks: dict[str, Any]  # block name -> [properties, default]
     entity_registry: list[str]
+    enchantment_registry: list[str]
+    biome_registry: list[str]  # in registry order
 
 
 MD_FILES = {
@@ -239,6 +270,7 @@ MD_FILES = {
     "language": "data/pc/1.21.1/language.json",
     "entities": "data/pc/1.20.5/entities.json",
     "shapes": "data/pc/1.20.5/blockCollisionShapes.json",
+    "biomes": "data/pc/1.20.5/biomes.json",
     "block_loot": "data/pc/1.20/blockLoot.json",
     "entity_loot": "data/pc/1.20/entityLoot.json",
 }
@@ -255,18 +287,20 @@ def load_sources(sources_dir: Path, pins: dict) -> Sources:
     if _read_json(data_root / "version.json")["id"] != GAME_VERSION:
         raise BuildError("mcmeta data checkout is not 1.21.1")
     mc = data_root / "data" / "minecraft"
-    tags = {"block": _read_tree(mc / "tags" / "block"), "item": _read_tree(mc / "tags" / "item")}
+    tags = {kind: _read_tree(mc / "tags" / kind) for kind in TAG_KINDS}
     recipes = _read_tree(mc / "recipe")
-    loot = {f"blocks/{k}": v for k, v in _read_tree(mc / "loot_table" / "blocks").items()}
-    loot.update({f"entities/{k}": v for k, v in _read_tree(mc / "loot_table" / "entities").items()})
+    loot = _read_tree(mc / "loot_table")
 
     summary_root = sources_dir / specs["mcmeta-summary"]["dir"]
     if _read_json(summary_root / "version.json")["id"] != GAME_VERSION:
         raise BuildError("mcmeta summary is not 1.21.1")
     components = {strip_ns(k): v for k, v in _read_json(summary_root / "item_components" / "data.json").items()}
     summary_blocks = {strip_ns(k): v for k, v in _read_json(summary_root / "blocks" / "data.json").items()}
-    registry = [strip_ns(x) for x in _read_json(summary_root / "registries" / "data.json")["entity_type"]]
-    return Sources(pins, md, tags, recipes, loot, components, summary_blocks, registry)
+    registries = _read_json(summary_root / "registries" / "data.json")
+    entity_registry, enchantment_registry, biome_registry = (
+        [strip_ns(x) for x in registries[key]] for key in ("entity_type", "enchantment", "worldgen/biome"))
+    return Sources(pins, md, tags, recipes, loot, components, summary_blocks, entity_registry,
+                   enchantment_registry, biome_registry)
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +730,62 @@ def build_entities(src: Sources) -> dict[str, dict]:
     return out
 
 
+def build_biomes(src: Sources, biome_tags: dict[str, list[str]], notes: list[str]) -> dict[str, dict]:
+    """The worldgen/biome registry: id (registry index), English name and dimension."""
+    lang = src.md["language"]
+    dim_sets = {dim: frozenset(biome_tags[tag]) for dim, tag in BIOME_DIMENSION_TAGS}
+    out: dict[str, dict] = {}
+    for i, name in enumerate(src.biome_registry):
+        dims = [dim for dim, members in dim_sets.items() if name in members]
+        if len(dims) > 1:
+            raise BuildError(f"biome {name} is in several dimension tags: {dims}")
+        key = f"biome.minecraft.{name}"
+        if key not in lang:
+            raise BuildError(f"biome {name} has no English name ({key}) in language.json")
+        out[name] = {"id": i, "display_name": lang[key], "dimension": dims[0] if dims else None}
+    by_dim = Counter(str(b["dimension"]) for b in out.values())
+    notes.append(f"biomes: {len(out)} ({dict(sorted(by_dim.items()))}); without a dimension tag: "
+                 f"{sorted(n for n, b in out.items() if b['dimension'] is None)}")
+    return out
+
+
+def loot_references(node: Any) -> set[str]:
+    """Paths of the tables that ``minecraft:loot_table`` entries reference by id (inline tables
+    are part of the node and need nothing)."""
+    out: set[str] = set()
+    if isinstance(node, dict):
+        ref = node.get("value") if node.get("type") == "minecraft:loot_table" else None
+        if isinstance(ref, str):
+            out.add(strip_ns(ref))
+        for v in node.values():
+            out |= loot_references(v)
+    elif isinstance(node, list):
+        for v in node:
+            out |= loot_references(v)
+    return out
+
+
+def select_loot_tables(all_loot: dict[str, Any], notes: list[str]) -> dict[str, Any]:
+    """The loot tables of the rules file: LOOT_TABLE_PREFIXES and LOOT_TABLE_FILES, plus every
+    table they reference, transitively. Fails on a reference to a table that does not exist."""
+    for path in LOOT_TABLE_FILES:
+        if path not in all_loot:
+            raise BuildError(f"missing loot table {path}")
+    roots = {k for k in all_loot if k.startswith(LOOT_TABLE_PREFIXES) or k in LOOT_TABLE_FILES}
+    keep, todo = set(roots), sorted(roots)
+    while todo:
+        path = todo.pop()
+        for ref in sorted(loot_references(all_loot[path])):
+            if ref not in all_loot:
+                raise BuildError(f"loot table {path} references the missing table {ref}")
+            if ref not in keep:
+                keep.add(ref)
+                todo.append(ref)
+    notes.append(f"loot tables: {len(keep)} of {len(all_loot)} kept; added only because another table "
+                 f"references them: {sorted(keep - roots)}")
+    return {k: all_loot[k] for k in sorted(keep)}
+
+
 def build_constants() -> dict[str, dict]:
     pattern = re.compile(C.SOURCE_LABELS_PATTERN)
     out = {}
@@ -951,6 +1041,28 @@ def check_entities(src: Sources) -> CrossCheck:
     return chk
 
 
+def check_biomes(src: Sources, biomes: dict[str, dict]) -> CrossCheck:
+    """The 1.21.1 biome registry, language names and dimension tags vs minecraft-data 1.20.5
+    biomes.json (names, ids, display names, dimension)."""
+    chk = CrossCheck("biomes: 1.21.1 registry and tags vs minecraft-data 1.20.5")
+    md = {b["name"]: b for b in src.md["biomes"]}
+    for name in sorted(set(biomes) ^ set(md)):
+        chk.mismatches.append(f"{name}: only in {'1.21.1 registry' if name in biomes else '1.20.5 data'}")
+    for name in sorted(set(biomes) & set(md)):
+        chk.compared += 1
+        ours, theirs = biomes[name], md[name]
+        if ours["id"] != theirs["id"]:
+            chk.mismatches.append(f"{name}: id {ours['id']} (registry order) vs minecraft-data {theirs['id']}")
+        if ours["display_name"] != theirs["displayName"]:
+            chk.mismatches.append(f"{name}: display name {ours['display_name']!r} vs {theirs['displayName']!r}")
+        if ours["dimension"] != theirs["dimension"]:
+            if name in TOLERATED_BIOME_DIMENSION:
+                chk.tolerated.append(f"{name}: {TOLERATED_BIOME_DIMENSION[name]}")
+            else:
+                chk.mismatches.append(f"{name}: dimension {ours['dimension']} (tags) vs {theirs['dimension']}")
+    return chk
+
+
 def check_display_names(src: Sources) -> CrossCheck:
     """minecraft-data display names vs the 1.21.1 language file (blocks and items)."""
     chk = CrossCheck("display names vs language.json")
@@ -1059,11 +1171,16 @@ def build(sources_dir: Path = DEFAULT_DEST, sources_json: Path = DEFAULT_SOURCES
 
     block_names = {b["name"] for b in src.md["blocks"]}
     item_names = {it["name"] for it in src.md["items"]}
-    block_tags = resolve_tags(src.tags["block"], block_names, "block")
-    item_tags = resolve_tags(src.tags["item"], item_names, "item")
+    known = {"block": block_names, "item": item_names, "entity_type": set(src.entity_registry),
+             "enchantment": set(src.enchantment_registry), "worldgen/biome": set(src.biome_registry)}
+    tags = {kind: resolve_tags(src.tags[kind], known[kind], kind) for kind in TAG_KINDS}
+    block_tags, item_tags = tags["block"], tags["item"]
     for tag in [f"mineable/{k}" for k in TOOL_KINDS] + [t for _, t in NEEDS_TIER_TAGS]:
         if tag not in block_tags:
             raise BuildError(f"missing block tag {tag}")
+    for _dim, tag in BIOME_DIMENSION_TAGS:
+        if tag not in tags["worldgen/biome"]:
+            raise BuildError(f"missing biome tag {tag}")
 
     blocks = build_blocks(src, block_tags, {it["id"]: it["name"] for it in src.md["items"]}, notes)
     items = build_items(src, item_tags, notes)
@@ -1071,8 +1188,9 @@ def build(sources_dir: Path = DEFAULT_DEST, sources_json: Path = DEFAULT_SOURCES
     for r in recipes:
         if r["result"] and r["result"]["item"] not in item_names:
             raise BuildError(f"recipe {r['id']} produces unknown item {r['result']['item']}")
-    loot_tables = dict(sorted(src.loot.items()))
+    loot_tables = select_loot_tables(src.loot, notes)
     entities = build_entities(src)
+    biomes = build_biomes(src, tags["worldgen/biome"], notes)
     constants = build_constants()
 
     checks = [
@@ -1082,6 +1200,7 @@ def build(sources_dir: Path = DEFAULT_DEST, sources_json: Path = DEFAULT_SOURCES
         check_tool_speeds(src, items, block_tags, blocks),
         check_recipes(src, recipes),
         check_entities(src),
+        check_biomes(src, biomes),
         check_display_names(src),
         check_derived_loot(src, blocks),
         check_stale_loot(src, blocks),
@@ -1092,7 +1211,9 @@ def build(sources_dir: Path = DEFAULT_DEST, sources_json: Path = DEFAULT_SOURCES
     notes.append(f"recipes: {len(recipes)} ({sum(r['special'] for r in recipes)} flagged special); "
                  f"types {dict(sorted(Counter(r['type'] for r in recipes).items()))}")
     notes.append(f"loot tables: {sum(k.startswith('blocks/') for k in loot_tables)} block, "
-                 f"{sum(k.startswith('entities/') for k in loot_tables)} entity")
+                 f"{sum(k.startswith('entities/') for k in loot_tables)} entity, "
+                 f"{sum(k.startswith('gameplay/') for k in loot_tables)} gameplay")
+    notes.append(f"tags: {', '.join(f'{len(tags[k])} {k}' for k in TAG_KINDS)}")
     notes.append(f"entities: {len(entities)} (registry 1.21.1; ids and sizes from minecraft-data 1.20.5); "
                  f"with hard-coded stats: {sorted(C.MOBS)}")
 
@@ -1100,10 +1221,11 @@ def build(sources_dir: Path = DEFAULT_DEST, sources_json: Path = DEFAULT_SOURCES
         "version": GAME_VERSION,
         "blocks": blocks,
         "items": items,
-        "tags": {"block": block_tags, "item": item_tags},
+        "tags": tags,
         "recipes": recipes,
         "loot_tables": loot_tables,
         "entities": entities,
+        "biomes": biomes,
         "constants": constants,
     }
     rules["build"] = {"sources": pins["sources"], "hash": rules_hash(rules)}

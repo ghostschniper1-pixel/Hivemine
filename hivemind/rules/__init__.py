@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from hivemind.rules.loader import (
     Armor,
+    Biome,
     Block,
     BlockState,
     Constant,
@@ -29,6 +30,7 @@ from hivemind.rules.loader import (
 
 __all__ = [
     "Armor",
+    "Biome",
     "Block",
     "BlockState",
     "Constant",
