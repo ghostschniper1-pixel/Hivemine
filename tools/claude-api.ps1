@@ -30,6 +30,11 @@
 .PARAMETER Test
     Check the saved key both ways against the model list (no tokens used), then exit.
 
+.PARAMETER Ping
+    Send one tiny message to the model directly through the API, outside Claude Code (a fraction of a
+    cent), and print the reply or the API's error, then exit. Use it to tell "the key or its credit
+    does not work at all" from "it works for the API but not for Claude Code".
+
 .PARAMETER Forget
     Delete the saved key and exit.
 
@@ -50,6 +55,7 @@ param(
     [switch]$Bearer,
     [switch]$ApiKey,
     [switch]$Test,
+    [switch]$Ping,
     [switch]$Forget,
     [string]$Model = 'claude-opus-5-5'
 )
@@ -106,6 +112,30 @@ if ($Test) {
         }
     }
     Write-Host "Saved mode: $mode."
+    return
+}
+
+if ($Ping) {
+    $headers = @{ 'anthropic-version' = '2023-06-01' }
+    if ($mode -eq 'bearer') {
+        $headers['Authorization'] = "Bearer $plain"
+        $headers['anthropic-beta'] = 'oauth-2025-04-20'
+    } else {
+        $headers['x-api-key'] = $plain
+    }
+    # Built by hand: Windows PowerShell's ConvertTo-Json can unwrap one-element arrays.
+    $body = '{"model":"' + $Model + '","max_tokens":64,"output_config":{"effort":"low"},' +
+            '"messages":[{"role":"user","content":"Reply with the single word: ok"}]}'
+    try {
+        $r = Invoke-RestMethod -Uri 'https://api.anthropic.com/v1/messages' -Method Post -Headers $headers `
+            -ContentType 'application/json' -Body $body
+        $text = ($r.content | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join ' '
+        Write-Host "WORKS through the API: $($r.model) answered '$text' (stop: $($r.stop_reason); tokens in/out: $($r.usage.input_tokens)/$($r.usage.output_tokens))."
+    } catch {
+        $err = if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { '(no response body)' }
+        Write-Host "Fails through the API: $($_.Exception.Message)"
+        Write-Host "    server says: $err"
+    }
     return
 }
 
