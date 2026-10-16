@@ -99,7 +99,10 @@ if ($Test) {
             $opus = if ($models -contains $Model) { "$Model is available" } else { "$Model is NOT in the list" }
             Write-Host "WORKS as $($t.Name): $($models.Count) models; $opus."
         } catch {
+            # The API explains the failure in the response body (error.type and error.message).
+            $body = if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { '(no response body)' }
             Write-Host "Fails as $($t.Name): $($_.Exception.Message)"
+            Write-Host "    server says: $body"
         }
     }
     Write-Host "Saved mode: $mode."
