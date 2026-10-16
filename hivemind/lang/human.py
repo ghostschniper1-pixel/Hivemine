@@ -34,9 +34,10 @@
    context-free and can differ from the parse: ``carrots`` is the carrot crop's phrase and stays
    ``carrots`` in ``i need 3 carrots``, which parses as the carrot item. Wherever a parse
    exists, show its words (``HumanMessage.content_words``), not the normalized ``words``.
-5. Names of class members, from the vanilla ids (``spruce log`` -> ``log``, ``white wool`` ->
-   ``wool``, the vocabulary's ``human_aliases``), become the class phrase when they contain a
-   word outside the vocabulary.
+5. Names of class members, from the vanilla ids (``stripped oak log`` -> ``log``, ``white
+   wool`` -> ``wool``, the vocabulary's ``human_aliases``), become the class phrase when they
+   contain a word outside the vocabulary. A member name made only of vocabulary words stays as
+   typed (``spruce log``: ``spruce`` is a biome word), and the parser still reads it as the class.
 6. Anything else is ``<unk>``.
 
 ``parse_human(text, speaker)`` reads the same tokens leniently and returns a ``Command``, a chat
@@ -65,8 +66,13 @@
   parse fail: an unknown word may change the meaning (``netherite pickaxe``).
 - Readings are scored (a skipped grammar word, a left-out optional word, a verb synonym, a
   default count each cost a little) and the cheapest wins; on a tie chat sentences come
-  before commands. ``where is the iron ore`` gives None: ``where is {item}`` takes items, and
-  ``iron ore`` is a block, not an item (mapping it to ``raw iron`` would be false).
+  before commands.
+- ``where is ...`` has two forms (draft 0.5): ``where is the iron ore`` is the block form
+  (``Sentence("where", block="iron_ore")``), ``where are the sticks`` the item form. A resource
+  block named like an item (``log``, ``stone``, ``sand``) is read as the block, the place to go,
+  because the item form does not offer those items (``where_item``); member names follow the
+  same rule (``where is the oak log`` is the block ``log``). A word that names no block or item
+  alone (``where is the iron``) still gives None, never a guess.
 """
 
 from __future__ import annotations
@@ -321,7 +327,9 @@ class HumanReader:
         return tuple(self.key(w) for w in words)
 
     def index(self, domain: str) -> dict[tuple[str, ...], list[tuple[Any, bool]]]:
-        """Number-insensitive phrase index of a domain: key tuple -> [(value, is_alias)]."""
+        """Number-insensitive phrase index of a domain: key tuple -> [(value, is_alias)]. Member
+        names index only classes of the domain (``where_item`` has no ``oak log``: the item
+        ``log`` is not in it, and the block form reads that name)."""
         idx = self._indexes.get(domain)
         if idx is None:
             idx = {}
@@ -335,14 +343,16 @@ class HumanReader:
                 alias_src = "entity_class"
             else:
                 pairs = [(v, self.lang.value_words(domain, v)) for v in values]
-                alias_src = {"block": "block", "item": "item", "chat_item": "item", "entity_class": "entity_class"}.get(domain)
+                alias_src = {"block": "block", "item": "item", "chat_item": "item", "where_item": "item",
+                             "entity_class": "entity_class"}.get(domain)
             for v, ph in pairs:
                 idx.setdefault(self.keys(ph), []).append((v, False))
             if alias_src:
                 canonical = set(idx)
+                in_domain = set(values) if values is not None else None
                 for a, name in self.lang.aliases.get(alias_src, {}).items():
                     k = self.keys(a.split())
-                    if k not in canonical:
+                    if k not in canonical and (in_domain is None or name in in_domain):
                         idx.setdefault(k, []).append((name, True))
             self._indexes[domain] = idx
         return idx
@@ -562,8 +572,9 @@ class HumanReader:
         """(base cost, kind, flat template) for every chat sentence and command (sentences first)."""
         if self._paths is None:
             paths: list[tuple[float, str, FlatTemplate]] = []
-            for intent, els in G.SENTENCE_ELEMENTS.items():
-                paths.append((0.0, "sentence", FlatTemplate(None, intent, tuple(els))))
+            for intent, forms in G.SENTENCE_ELEMENTS.items():
+                for els in forms:  # where is {item}, where is {block}
+                    paths.append((0.0, "sentence", FlatTemplate(None, intent, tuple(els))))
             for verb, templates in G.COMMAND_ELEMENTS.items():
                 for tid, els in templates.items():
                     head = (Mark("template", tid),) if G.multi_template(verb) else ()

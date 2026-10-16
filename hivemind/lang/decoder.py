@@ -15,9 +15,11 @@ word is allowed if at least one thread can take it and something can still follo
 
 When a thread reaches a slot it asks the provider ``options(verb, slot, chosen)``; when it
 reaches a choice (``template`` of a verb with several templates, ``intent`` of ``chat``,
-``goal`` of ``plan``) it asks for the allowed ids and splits into one thread per id; the next
-words decide which survive (``go to the nearest`` is both ``go to the nearest {block}`` and
-``go to the {ordinal} {entity}`` until the phrase shows which). A phrase that is a prefix of
+``goal`` of ``plan``) it asks for the allowed ids and splits into one thread per id, and per
+form of an intent with several (``where is {item}`` and ``where is {block}``); the next words
+decide which survive (``go to the nearest`` is both ``go to the nearest {block}`` and
+``go to the {ordinal} {entity}`` until the phrase shows which, and ``where is iron`` both
+``where is iron ingot`` and ``where is iron ore``). A phrase that is a prefix of
 another (``zombie`` / ``zombie villager``, ``stone`` / ``stone pickaxe``) does not end at its
 last word: the thread both stays in the trie and, tentatively, finishes the slot with that value
 and moves on, asking the provider for the next slot as if the value were chosen. Whichever word
@@ -30,7 +32,9 @@ value set (``Language.domains``; fallback classes never do, so offering one rais
 ``ValueError``), and must have at least one complete command after it ("no dead ends").
 Numbers may be NumPy integers (they become ints); a bool is never a value. The slot ``entity``
 takes ``EntityRef``s in commands but entity-class names inside ``plan to kill {mine_count}
-{entity}`` (a goal names a kind of mob, not one visible mob; ``slot_domain`` tells which). The
+{entity}`` (a goal names a kind of mob, not one visible mob), and chat's ``item`` takes
+``chat_item`` values except in ``where is {item}``, whose ``where_item`` leaves out the items
+named like a resource block; ``slot_domain(verb, slot, chosen)`` tells which. The
 decoder looks one word ahead, so a value whose next slot has no options is masked out, but a
 provider that offers a dead end deeper than that makes ``allowed()`` raise ``DeadEndError``.
 Verbs whose feature flag is off (``store``, ``take``: ``containers``; ``plan``: ``goals``) are
@@ -73,31 +77,68 @@ class TemplateChoice:
     verb: str
 
 
-def _verb_slot_domains() -> dict[str, dict[str, str]]:
-    out: dict[str, dict[str, str]] = {}
+def _slot_domain_table() -> dict[tuple[str, str | None, str], str]:
+    """(verb, nested head, slot) -> domain. The head is None for the verb's own slots and the
+    chosen intent or goal kind for the slots of a nested sentence or goal."""
+    out: dict[tuple[str, str | None, str], str] = {}
+
+    def put(key: tuple[str, str | None, str], dom: str) -> None:
+        if out.setdefault(key, dom) != dom:
+            raise ValueError(f"{key}: slot has two domains")
+
     for verb, templates in G.COMMAND_ELEMENTS.items():
-        doms: dict[str, str] = {}
-        stack: list[Element] = [e for els in templates.values() for e in els]
-        while stack:
-            e = stack.pop()
-            if isinstance(e, Slot):
-                if doms.setdefault(e.name, e.domain) != e.domain:
-                    raise ValueError(f"{verb}: slot {e.name!r} has two domains")
-            elif isinstance(e, Choice):
-                stack.extend(x for els in G.CHOICE_ELEMENTS[e.slot].values() for x in els)
-        out[verb] = doms
+        for els in templates.values():
+            for e in els:
+                if isinstance(e, Slot):
+                    put((verb, None, e.name), e.domain)
+                elif isinstance(e, Choice):
+                    for head, forms in G.CHOICE_FORMS[e.slot].items():
+                        for sub in forms:
+                            for x in sub:
+                                if isinstance(x, Slot):
+                                    put((verb, head, x.name), x.domain)
     return out
 
 
-VERB_SLOT_DOMAINS: dict[str, dict[str, str]] = _verb_slot_domains()
+SLOT_DOMAIN_TABLE: dict[tuple[str, str | None, str], str] = _slot_domain_table()
 
 
-def slot_domain(verb: str, slot: str) -> str:
-    """The value domain of a slot of a verb (``item`` of ``chat`` is ``chat_item``, ...)."""
-    try:
-        return VERB_SLOT_DOMAINS[verb][slot]
-    except KeyError:
-        raise KeyError(f"verb {verb!r} has no slot {slot!r}") from None
+def _verb_slot_domains() -> dict[str, dict[str, tuple[str, ...]]]:
+    out: dict[str, dict[str, tuple[str, ...]]] = {}
+    for (verb, _, slot), dom in SLOT_DOMAIN_TABLE.items():
+        doms = out.setdefault(verb, {}).get(slot, ())
+        out[verb][slot] = tuple(sorted({*doms, dom}))
+    return out
+
+
+# verb -> slot -> the domains the slot can have: several only for a nested slot whose domain
+# depends on the intent (chat's item is chat_item, or where_item in "where is {item}")
+VERB_SLOT_DOMAINS: dict[str, dict[str, tuple[str, ...]]] = _verb_slot_domains()
+
+
+def slot_domain(verb: str, slot: str, chosen: Mapping[str, Any] | None = None) -> str:
+    """The value domain of a slot of a verb (``item`` of ``give`` is ``item``, of ``chat`` is
+    ``chat_item``, ...). Inside a nested sentence or goal the domain can depend on which one was
+    chosen: ``item`` is ``where_item`` in ``where is {item}``. ``chosen`` (the slots chosen so
+    far, as ``SlotProvider.options`` gets them, so the intent or goal is in it) settles it;
+    without it, a slot whose domain depends on the intent raises KeyError."""
+    dom = SLOT_DOMAIN_TABLE.get((verb, None, slot))
+    if dom is not None:
+        return dom
+    nest = G.NESTED.get(verb)
+    head = chosen.get(nest.slot) if (nest is not None and chosen is not None) else None
+    if head is not None:
+        dom = SLOT_DOMAIN_TABLE.get((verb, head, slot))
+        if dom is None:
+            raise KeyError(f"{verb!r} {nest.slot} {head!r} has no slot {slot!r}")  # type: ignore[union-attr]
+        return dom
+    doms = VERB_SLOT_DOMAINS.get(verb, {}).get(slot)
+    if not doms:
+        raise KeyError(f"verb {verb!r} has no slot {slot!r}")
+    if len(doms) > 1:
+        raise KeyError(f"the domain of {verb!r} {slot!r} depends on the {nest.slot} "  # type: ignore[union-attr]
+                       f"({' or '.join(doms)}): pass the chosen slots")
+    return doms[0]
 
 
 def choice_ids(verb: str, slot: str) -> tuple[str, ...]:
@@ -132,7 +173,7 @@ class FullProvider:
     def options(self, verb: str, slot: str, chosen: Mapping[str, Any]) -> tuple:
         if slot in G.CHOICE_SLOTS:
             return choice_ids(verb, slot)
-        return self.lang.domains[slot_domain(verb, slot)]
+        return self.lang.domains[slot_domain(verb, slot, chosen)]
 
 
 @dataclass(frozen=True)
@@ -241,8 +282,8 @@ class Decoder:
                 yield from self._expand(_Thread(t.verb, (*t.chosen, ("template", tid)), (*els, *t.rest[1:])))
         elif isinstance(e, Choice):
             for cid in self._opts.choices(t.verb, e.slot, t.chosen):
-                els = G.CHOICE_ELEMENTS[e.slot][cid]
-                yield from self._expand(_Thread(t.verb, (*t.chosen, (e.slot, cid)), (*els, *t.rest[1:])))
+                for els in G.CHOICE_FORMS[e.slot][cid]:  # every form of the intent or goal
+                    yield from self._expand(_Thread(t.verb, (*t.chosen, (e.slot, cid)), (*els, *t.rest[1:])))
         else:  # pragma: no cover
             raise TypeError(e)
 
@@ -377,7 +418,8 @@ def enumerate_commands(lang: Language, provider: SlotProvider,
                 yield from rec(verb, (*G.COMMAND_ELEMENTS[verb][tid], *rest[1:]), (*chosen, ("template", tid)))
         else:
             for cid in opts.choices(verb, e.slot, chosen):
-                yield from rec(verb, (*G.CHOICE_ELEMENTS[e.slot][cid], *rest[1:]), (*chosen, (e.slot, cid)))
+                for els in G.CHOICE_FORMS[e.slot][cid]:  # forms have different slots: no repeats
+                    yield from rec(verb, (*els, *rest[1:]), (*chosen, (e.slot, cid)))
 
     for verb in G.VERBS:
         if verb in offered and flags.enabled(G.flag_of(verb)) and (wanted is None or verb in wanted):

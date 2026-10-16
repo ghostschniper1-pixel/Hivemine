@@ -11,11 +11,12 @@ Word order. Ids 0-3 are reserved (``<pad>``, ``<unk>``, ``<bos>``, ``.``). Then 
 anywhere, in order of first appearance over these sources, each in its own fixed order:
 
     block classes (curated, by id) · fallback block classes · item classes (by id) · fallback
-    item classes · entity classes (by id) · fallback entity classes · players (red, blue, 0-19,
-    human) · goal setters (me, llm) · addressees (everyone, team) · command templates · chat
-    sentences · goal templates · result words · interrupt causes · stations · containers ·
-    event sentences · relation words · place kinds · ordinals · directions · patterns ·
-    entity phrases (dropped) · equipment slots · number tokens · nonce words
+    item classes · entity classes (by id) · fallback entity classes · biomes (by registry id) ·
+    players (red, blue, 0-19, human) · goal setters (me, llm) · addressees (everyone, team) ·
+    command templates · chat sentences · goal templates · result words · interrupt causes ·
+    stations · containers · event sentences · relation words · place kinds · ordinals ·
+    directions · face words · time words · patterns · entity phrases (dropped) · equipment
+    slots · number tokens · nonce words
 
 so the order depends only on the class tables and the grammar text. Changing either changes the
 network's input and output layers, which is why the file carries the concepts hash and its own
@@ -23,10 +24,12 @@ sha256 (``hash``, over the canonical JSON without that field).
 
 The file also stores what the language layer needs without reading the class tables again:
 
-- ``concepts``: one row per named concept: ``kind`` (block, item, entity, player, setter,
-  addressee, nonce, number, ordinal, dir, pattern, station, container, cause, relation,
-  place_kind, equip_slot), ``name``, ``phrase`` and, for classes, ``id``, ``fallback`` and
-  ``resource`` (blocks), ``v1`` and ``equip_slot`` (items) or ``entity_kind`` (entities).
+- ``concepts``: one row per named concept: ``kind`` (block, item, entity, biome, player,
+  setter, addressee, nonce, number, ordinal, dir, face, time, pattern, station, container,
+  cause, relation, place_kind, equip_slot), ``name``, ``phrase`` and, for classes, ``id``,
+  ``fallback`` and ``resource`` (blocks), ``v1`` and ``equip_slot`` (items), ``entity_kind``
+  (entities) or ``overworld`` and ``dimension`` (biomes). Face and time rows are the words of
+  ``hivemind.lang.world_words`` (draft 0.5).
 - ``domains``: the full value list of every slot domain (see ``grammar.SLOT_DOMAINS``), in a
   fixed order. These are the "full v1 sets" the parser accepts and bitsets index.
 - ``templates``: the command templates by verb and template id, the chat sentences, goals,
@@ -54,6 +57,7 @@ from pathlib import Path
 from typing import Any
 
 from hivemind.lang import grammar as G
+from hivemind.lang import world_words as W
 from hivemind.lang.language import DEFAULT_VOCAB_PATH, vocab_hash, words_hash
 from hivemind.rules.classes import Concepts, canonical_json, load_concepts
 from hivemind.rules.loader import GAME_VERSION
@@ -81,6 +85,9 @@ def _rows(concepts: Concepts) -> list[dict]:
     for c in concepts.entity_classes:
         rows.append({"kind": "entity", "name": c.name, "id": c.id, "phrase": list(c.phrase), "fallback": c.fallback,
                      "entity_kind": c.kind})
+    for b in concepts.biomes:
+        rows.append({"kind": "biome", "name": b.name, "id": b.id, "phrase": list(b.phrase), "overworld": b.overworld,
+                     "dimension": b.dimension})
     for name, phrase in player_names():
         rows.append({"kind": "player", "name": name, "phrase": list(phrase)})
     for s in G.SETTERS:
@@ -95,6 +102,10 @@ def _rows(concepts: Concepts) -> list[dict]:
         rows.append({"kind": "ordinal", "name": i, "phrase": [w]})
     for d in G.DIR8:
         rows.append({"kind": "dir", "name": d, "phrase": [d]})
+    for f in W.FACE_WORDS:
+        rows.append({"kind": "face", "name": f, "phrase": [f]})
+    for t in W.TIME_WORDS:
+        rows.append({"kind": "time", "name": t, "phrase": [t]})
     for p, words in G.PATTERNS.items():
         rows.append({"kind": "pattern", "name": p, "phrase": list(words)})
     for s in G.STATIONS:
@@ -117,10 +128,14 @@ def _domains(concepts: Concepts) -> dict[str, Any]:
     items = [c.name for c in concepts.item_classes if c.v1 and not c.fallback and c.name != "none"]
     entities = [c.name for c in concepts.entity_classes if not c.fallback and c.name not in UNNAMEABLE_ENTITIES]
     players = [name for name, _ in player_names()]
+    # where is {item}: an item whose phrase is a resource block's (log, stone, sand, ...) is read
+    # as the block, the place to go (where is {block}), so the sentence has one reading (contracts 4.3)
+    block_phrases = {concepts.block_class(b).phrase for b in blocks}
     return {
         "block": blocks,
         "item": items,
         "chat_item": items + list(G.NONCE_WORDS),
+        "where_item": [i for i in items if concepts.item_class(i).phrase not in block_phrases] + list(G.NONCE_WORDS),
         "entity_class": entities,
         "entity_ref": {"ordinals": list(range(1, len(G.ORDINALS) + 1)), "entities": entities, "dropped": items},
         "player": players,
@@ -157,6 +172,7 @@ def _sources(concepts: Concepts) -> dict[str, list[str]]:
         "fallback item classes": words_of(c.phrase for c in concepts.item_classes if c.fallback),
         "entity classes": words_of(c.phrase for c in concepts.entity_classes if not c.fallback),
         "fallback entity classes": words_of(c.phrase for c in concepts.entity_classes if c.fallback),
+        "biomes": words_of(b.phrase for b in concepts.biomes),
         "players": words_of(p for _, p in player_names()),
         "goal setters": list(G.SETTERS),
         "addressees": list(G.ADDRESSEE_GROUPS),
@@ -172,6 +188,8 @@ def _sources(concepts: Concepts) -> dict[str, list[str]]:
         "place kinds": list(G.PLACE_KINDS),
         "ordinals": list(G.ORDINALS),
         "directions": list(G.DIR8),
+        "face words": list(W.FACE_WORDS),
+        "time words": list(W.TIME_WORDS),
         "patterns": words_of(G.PATTERNS.values()),
         "entity phrases": [G.DROPPED],
         "equipment slots": words_of(G.EQUIP_SLOTS.values()),
@@ -211,6 +229,7 @@ def build_vocab(concepts: Concepts | None = None) -> dict:
     """The vocabulary as a JSON-ready dict (with its hash)."""
     concepts = concepts or load_concepts()
     G.check_static_grammar()
+    W.check_tables()
     sources = _sources(concepts)
     words: list[str] = list(G.RESERVED)
     seen = set(words)
@@ -241,6 +260,10 @@ def build_vocab(concepts: Concepts | None = None) -> dict:
     missing = sorted({w for r in vocab["concepts"] for w in r["phrase"]} - seen)
     if missing:
         raise ValueError(f"phrase words missing from the vocabulary: {missing}")
+    for kind in ("biome", "face", "time", "container"):  # lang.concept(kind, words) must invert phrase
+        phrases = [tuple(r["phrase"]) for r in vocab["concepts"] if r["kind"] == kind]
+        if len(set(phrases)) != len(phrases):
+            raise ValueError(f"two {kind} concepts share a phrase")
     vocab["words_hash"] = words_hash(vocab)
     vocab["hash"] = vocab_hash(vocab)
     return vocab

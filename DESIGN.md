@@ -1020,7 +1020,7 @@ Simulator replays are cheap, so the simulator side of each comparison uses ≥10
 | World | per-Y ore and exposure histograms, sim generator vs real chunks | 50 seeds | TV distance, 95% upper bound ≤ 0.05 |
 | Episode | real/sim success ratio per milestone, per profile | 250 episodes | ≥ 0.8, 90% lower bound ≥ 0.7 |
 | Episode | return ratio | 250 episodes | ≥ 0.85 |
-| Episode | time to wood, stone pickaxe, iron, first dawn | 250 episodes | KS D, 95% upper bound ≤ 0.2 |
+| Episode | time to wood, stone pickaxe, iron, the first morning (tick 0 of day 1) | 250 episodes | KS D, 95% upper bound ≤ 0.2 |
 
 For scale: at a true rate of 0.8, n = 100 gives a 95% interval of ±7.8 points; n = 250 gives about ±5.
 

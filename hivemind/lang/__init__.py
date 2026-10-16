@@ -2,13 +2,17 @@
 
 One controlled English vocabulary serves actions, observations, chat and human input, so the
 embedding of ``iron`` is trained by ``mine 4 iron ore.``, by ``raw iron`` in the inventory and by
-``i need 3 iron ingot`` in chat. Words are always true of what they name: every block, item and
-entity is named by its class phrase from ``data/concepts-1.21.1.json``.
+``i need 3 iron ingot`` in chat. Words are always true of what they name: every block, item,
+entity and biome is named by its class phrase from ``data/concepts-1.21.1.json``.
 
 Modules:
 
-- ``grammar``: the fixed text: 20 verb ids and their templates, 14 chat sentences, 9 goals,
-  result words, event sentences, slot domains, number tokens.
+- ``grammar``: the fixed text: 20 verb ids and their templates, 15 chat sentences of 14
+  intents (``where`` has ``where is {item}`` and ``where is {block}``), 9 goals, result words,
+  event sentences, slot domains, number tokens.
+- ``world_words``: small typed tables of the words for where and when (directions with their
+  steps and yaws, block faces with their normals, times of day with their ticks) for the
+  observation builder's F3 group and panorama (DESIGN.md 6.1, 6.2).
 - ``vocab``: builds ``data/vocab-1.21.1.json`` (``python -m hivemind.lang.vocab [--check]``).
 - ``language``: ``Language`` (words, phrases, render, encode/decode, strict parse, results,
   events).

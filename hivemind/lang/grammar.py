@@ -12,10 +12,18 @@ word is literal. Two slot spellings are special:
   choices among the chat sentences and goals below, expanded inline: the decoder asks for the
   ``intent`` or ``goal`` slot and then for that sentence's or goal's own slots.
 
+An intent can have more than one sentence (its *forms*): the intent ``where`` is both
+``where is {item}`` and ``where is {block}`` (draft 0.5). The forms of one intent have different
+slot names, and the slot names tell them apart (``Sentence("where", block="iron_ore")``,
+``Sentence("where", item="iron_ingot")``); there is no extra choice slot, so after ``where is``
+the next words decide which form it is, as they decide between the templates of ``goto``.
+
 Which values fill a slot is the slot's *domain* (``SLOT_DOMAINS``). A slot name can mean
 different domains in different places: ``item`` is a v1 item class in commands and goals, but
-also a nonce word in chat sentences (``chat_item``); ``entity`` is an ``EntityRef`` in commands
-but an entity class in the goal ``kill {mine_count} {entity}`` and in event sentences.
+also a nonce word in chat sentences (``chat_item``), and in ``where is {item}`` it leaves out the
+items whose phrase is a resource block's (``where_item``: ``where is log`` is the block, the place
+to go, so the sentence reads one way only); ``entity`` is an ``EntityRef`` in commands but an
+entity class in the goal ``kill {mine_count} {entity}`` and in event sentences.
 """
 
 from __future__ import annotations
@@ -63,7 +71,8 @@ FURNACES = (1, 2, 3, 4)  # contracts 4.3: the agent's own furnaces in placement 
 CHESTS = (1, 2, 3, 4, 5, 6, 7, 8)  # contracts 4.3: the agent's own chests
 
 STATIONS = ("crafting_table", "furnace", "bed")  # contracts 4.3: block-class names, named by their phrases
-CONTAINERS = ("inventory", "chest")  # contracts 4.3: {container} full
+# contracts 4.3: {container} full. "furnace" (draft 0.5): the furnace's own slots block smelt_start.
+CONTAINERS = ("inventory", "chest", "furnace")
 CAUSE_WORDS = ("damage", "message")  # contracts 4.3: interrupted by {cause}; or a hostile's entity phrase
 RELATIONS = ("teammate", "enemy", "human", "hostile", "passive", "object")  # contracts 4.2, DESIGN.md 6.2
 PLACE_KINDS = ("resource", "station", "danger", "home")  # contracts 4.2, 6.1
@@ -115,21 +124,23 @@ VERBS: tuple[str, ...] = tuple(COMMANDS)
 VERB_ID: dict[str, int] = {v: i for i, v in enumerate(VERBS)}
 VERB_FLAG: dict[str, str] = {"store": "containers", "take": "containers", "plan": "goals"}  # contracts 4.3
 
-SENTENCES: dict[str, str] = {  # contracts 4.3: the 14 chat intents (DESIGN.md 9)
-    "need": "i need {item_count} {item}",
-    "have": "i have {item_count} {item}",
-    "give": "give me {item_count} {item}",
-    "where": "where is {item}",
-    "come": "come here",
-    "follow": "follow me",
-    "help": "help me",
-    "attack": "attack",
-    "flee": "flee",
-    "stop": "stop",
-    "wait": "wait",
-    "yes": "yes",
-    "no": "no",
-    "thanks": "thanks",
+# contracts 4.3: the 15 chat sentences of the 14 intents (DESIGN.md 9), as intent -> its forms.
+# The forms of one intent are told apart by their slot names (module docstring).
+SENTENCES: dict[str, tuple[str, ...]] = {
+    "need": ("i need {item_count} {item}",),
+    "have": ("i have {item_count} {item}",),
+    "give": ("give me {item_count} {item}",),
+    "where": ("where is {item}", "where is {block}"),  # draft 0.5: {block} is a resource block class
+    "come": ("come here",),
+    "follow": ("follow me",),
+    "help": ("help me",),
+    "attack": ("attack",),
+    "flee": ("flee",),
+    "stop": ("stop",),
+    "wait": ("wait",),
+    "yes": ("yes",),
+    "no": ("no",),
+    "thanks": ("thanks",),
 }
 INTENTS: tuple[str, ...] = tuple(SENTENCES)
 
@@ -194,6 +205,8 @@ DROPPED = "dropped"
 #   block         resource block classes (curated; fallbacks never fill a slot)
 #   item          v1 item classes
 #   chat_item     v1 item classes and the nonce words (chat item slots only, contracts 4.1)
+#   where_item    chat_item without the items whose phrase is a resource block's phrase
+#                 (where is {item}: those words name the block, contracts 4.3)
 #   entity_ref    EntityRef(ordinal, entity class | ("dropped", v1 item class))
 #   entity_class  curated entity classes that can be named (not none, player or item)
 #   player        player names (red_0 .. blue_19, human)
@@ -215,6 +228,10 @@ CONTEXT_DOMAINS: dict[str, dict[str, str]] = {
     "event": {"entity": "event_entity", "item": "event_item", "n": "count"},
     "result": {"station": "station", "container": "container", "cause": "cause"},
 }
+# Overrides for one sentence or goal: (context, intent or goal kind) -> slot -> domain.
+HEAD_DOMAINS: dict[tuple[str, str], dict[str, str]] = {
+    ("sentence", "where"): {"item": "where_item"},
+}
 INT_DOMAINS: dict[str, tuple[int, ...]] = {
     "furnace": FURNACES, "chest": CHESTS, "explore_dist": EXPLORE_DISTS, "strip_dist": STRIP_DISTS,
     "y_band": Y_BANDS, "mine_count": MINE_COUNTS, "item_count": ITEM_COUNTS, "wait_seconds": WAIT_SECONDS,
@@ -224,11 +241,13 @@ INT_DOMAINS: dict[str, tuple[int, ...]] = {
 CHOICE_SLOTS = ("template", "intent", "goal")
 
 
-def domain_of(slot: str, context: str = "command") -> str:
-    """The domain of a slot name in a context ("command", "sentence", "goal", "event", "result")."""
-    over = CONTEXT_DOMAINS.get(context, {})
-    if slot in over:
-        return over[slot]
+def domain_of(slot: str, context: str = "command", head: str | None = None) -> str:
+    """The domain of a slot name in a context ("command", "sentence", "goal", "event", "result");
+    ``head`` is the intent or goal kind, for the slots whose domain depends on it (``item`` of
+    ``where is {item}`` is ``where_item``)."""
+    for over in (HEAD_DOMAINS.get((context, head), {}) if head is not None else {}, CONTEXT_DOMAINS.get(context, {})):
+        if slot in over:
+            return over[slot]
     if slot in SLOT_DOMAINS:
         return SLOT_DOMAINS[slot]
     raise KeyError(f"unknown slot {slot!r} in a {context}")
@@ -266,8 +285,9 @@ class Choice:
 Element = Lit | Slot | Choice
 
 
-def compile_template(text: str, context: str = "command") -> tuple[Element, ...]:
-    """Template text -> elements. ``{ordinal} {entity}`` becomes the single slot ``entity``."""
+def compile_template(text: str, context: str = "command", head: str | None = None) -> tuple[Element, ...]:
+    """Template text -> elements. ``{ordinal} {entity}`` becomes the single slot ``entity``.
+    ``head`` is the intent or goal kind of a sentence or goal (``domain_of``)."""
     parts = text.split()
     out: list[Element] = []
     i = 0
@@ -286,7 +306,7 @@ def compile_template(text: str, context: str = "command") -> tuple[Element, ...]
             elif name == "goal":
                 out.append(Choice("goal", "goal"))
             else:
-                out.append(Slot(name, domain_of(name, context)))
+                out.append(Slot(name, domain_of(name, context, head)))
         else:
             if not p.islower() and not p.lstrip("-").isdigit():
                 raise ValueError(f"template words must be lower case: {p!r} in {text!r}")
@@ -298,14 +318,51 @@ def compile_template(text: str, context: str = "command") -> tuple[Element, ...]
 COMMAND_ELEMENTS: dict[str, dict[str, tuple[Element, ...]]] = {
     verb: {tid: compile_template(t) for tid, t in templates.items()} for verb, templates in COMMANDS.items()
 }
-SENTENCE_ELEMENTS: dict[str, tuple[Element, ...]] = {k: compile_template(t, "sentence") for k, t in SENTENCES.items()}
-GOAL_ELEMENTS: dict[str, tuple[Element, ...]] = {k: compile_template(t, "goal") for k, t in GOALS.items()}
+# intent -> its forms (one element tuple per sentence, in SENTENCES order)
+SENTENCE_ELEMENTS: dict[str, tuple[tuple[Element, ...], ...]] = {
+    k: tuple(compile_template(t, "sentence", k) for t in ts) for k, ts in SENTENCES.items()
+}
+GOAL_ELEMENTS: dict[str, tuple[Element, ...]] = {k: compile_template(t, "goal", k) for k, t in GOALS.items()}
 RESULT_ELEMENTS: dict[str, tuple[Element, ...]] = {k: compile_template(t, "result") for k, t in RESULTS.items()}
 EVENT_ELEMENTS: dict[str, tuple[Element, ...]] = {k: compile_template(t, "event") for k, t in EVENTS.items()}
 NESTED: dict[str, Choice] = {  # verbs whose last slot is a nested sentence or goal
     verb: e for verb, ts in COMMAND_ELEMENTS.items() for els in ts.values() for e in els if isinstance(e, Choice)
 }
-CHOICE_ELEMENTS: dict[str, dict[str, tuple[Element, ...]]] = {"intent": SENTENCE_ELEMENTS, "goal": GOAL_ELEMENTS}
+# Choice slot -> id -> forms: what a nested sentence (``intent``) or goal (``goal``) expands to.
+# Every goal has one form; the intent ``where`` has two.
+CHOICE_FORMS: dict[str, dict[str, tuple[tuple[Element, ...], ...]]] = {
+    "intent": SENTENCE_ELEMENTS,
+    "goal": {k: (els,) for k, els in GOAL_ELEMENTS.items()},
+}
+FRAME_FORMS: dict[str, dict[str, tuple[tuple[Element, ...], ...]]] = {  # frame kind -> head -> forms
+    "sentence": SENTENCE_ELEMENTS,
+    "goal": CHOICE_FORMS["goal"],
+    "event": {k: (els,) for k, els in EVENT_ELEMENTS.items()},
+    "result": {k: (els,) for k, els in RESULT_ELEMENTS.items()},
+}
+
+
+def form_slots(elements: Iterable[Element]) -> frozenset[str]:
+    """The slot names of a sentence or goal form (what tells two forms of one intent apart)."""
+    return frozenset(e.name for e in elements if isinstance(e, Slot))
+
+
+def frame_form(kind: str, head: str, slots: Iterable[str]) -> tuple[Element, ...]:
+    """The form of a sentence, goal, event or result whose slots are exactly ``slots``
+    (``frame_form("sentence", "where", {"block"})`` is ``where is {block}``). A head with one
+    form returns it whatever the slots (the renderer then reports a mismatch). ValueError for an
+    unknown head, or for slots that match none of several forms."""
+    forms = FRAME_FORMS[kind].get(head)
+    if forms is None:
+        raise ValueError(f"unknown {kind} {head!r}")
+    if len(forms) == 1:
+        return forms[0]
+    names = frozenset(slots)
+    for els in forms:
+        if form_slots(els) == names:
+            return els
+    shapes = " or ".join(repr(sorted(form_slots(els))) for els in forms)
+    raise ValueError(f"{kind} {head!r} has slots {shapes}, not {sorted(names)}")
 
 
 def multi_template(verb: str) -> bool:
@@ -352,7 +409,7 @@ def literal_words() -> dict[str, list[str]]:
 
     return {
         "command templates": lits(t for ts in COMMANDS.values() for t in ts.values()),
-        "chat sentences": lits(SENTENCES.values()),
+        "chat sentences": lits(t for ts in SENTENCES.values() for t in ts),
         "goal templates": lits(GOALS.values()),
         "result words": lits(RESULTS.values()),
         "event sentences": lits(EVENTS.values()),
@@ -397,7 +454,9 @@ def flag_of(verb: str) -> str | None:
 def check_static_grammar() -> None:
     """Sanity checks on the fixed text (run by the tests and the vocabulary build): every
     template, sentence and goal starts with a literal word, and each verb's templates start
-    with words no other verb starts with, so the first word of a command picks its verb."""
+    with words no other verb starts with, so the first word of a command picks its verb. The
+    forms of one intent have different slot-name sets (the slot names tell them apart) and give
+    each slot name one domain."""
     owner: dict[str, str] = {}
     for verb, ts in COMMAND_ELEMENTS.items():
         for els in ts.values():
@@ -405,10 +464,21 @@ def check_static_grammar() -> None:
                 raise ValueError(f"{verb}: every template must start with a literal word")
             if owner.setdefault(els[0].word, verb) != verb:
                 raise ValueError(f"first word {els[0].word!r} starts both {owner[els[0].word]!r} and {verb!r}")
-    for mapping in (SENTENCE_ELEMENTS, GOAL_ELEMENTS):
-        for els in mapping.values():
-            if not els or not isinstance(els[0], Lit):
-                raise ValueError("sentences and goals must start with a literal word")
+    for kind, table in FRAME_FORMS.items():
+        for head, forms in table.items():
+            if not forms:
+                raise ValueError(f"{kind} {head!r} has no form")
+            for els in forms:
+                if kind in ("sentence", "goal") and (not els or not isinstance(els[0], Lit)):
+                    raise ValueError("sentences and goals must start with a literal word")
+            shapes = [form_slots(els) for els in forms]
+            if len(set(shapes)) != len(shapes):
+                raise ValueError(f"two forms of {kind} {head!r} have the same slots: they could not be told apart")
+            doms: dict[str, str] = {}
+            for els in forms:
+                for e in els:
+                    if isinstance(e, Slot) and doms.setdefault(e.name, e.domain) != e.domain:
+                        raise ValueError(f"{kind} {head!r}: slot {e.name!r} has two domains")
 
 
 def first_words() -> Mapping[str, str]:

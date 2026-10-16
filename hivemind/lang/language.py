@@ -6,6 +6,8 @@
     lang.render(cmd)                               # 'mine 4 iron ore.'
     lang.encode(cmd); lang.decode(ids)             # word ids, '.' included, no <bos>
     lang.phrase("item", "iron_ingot")              # ('iron', 'ingot')
+    lang.phrase("biome", "birch_forest")           # ('birch', 'forest')
+    lang.concept("biome", ("plains",))             # 'plains'
     lang.result_words("INTERRUPTED", cause="creeper")   # ['interrupted', 'by', 'creeper']
     lang.render_event("player_gave_me", player="blue_7", n=26, item="bread")  # 'blue 7 gave me 20 bread'
 
@@ -16,6 +18,10 @@ of the words against the compiled templates, trying every way a phrase can end (
 ``zombie villager``), and it fails if the words have no reading or (a grammar bug) several.
 The decoder (``hivemind.lang.decoder``) is a separate implementation of the same grammar; the
 tests check that the two agree on every command.
+
+Sentences: the intent ``where`` has two forms, ``where is {item}`` and ``where is {block}``,
+told apart by the slot name (``grammar.frame_form``); the item form leaves out the items whose
+phrase is a resource block's (domain ``where_item``), so ``where is log`` is the block only.
 
 Values: block, item and entity classes by their class names; players as ``red_0`` .. ``blue_19``
 and ``human`` (phrase ``red 0``); addressees also ``everyone`` and ``team``; nonce words by
@@ -268,10 +274,13 @@ class Language:
         return tuple(self._phrase)
 
     def phrase(self, kind: str, name: Any) -> tuple[str, ...]:
-        """The words of a concept: kind is block, item, entity, player, setter, addressee,
-        nonce, number, ordinal, dir, pattern, station, container, cause, relation, place_kind
-        or equip_slot. Verbs, result codes, chat intents and goals have no phrase of their
-        own: they are named by their templates (``templates``, ``result_words``)."""
+        """The words of a concept: kind is block, item, entity, biome, player, setter,
+        addressee, nonce, number, ordinal, dir, face, time, pattern, station, container, cause,
+        relation, place_kind or equip_slot. Biomes are named by their class name
+        (``birch_forest`` -> ``birch forest``); faces (``top`` .. ``west``) and times of day
+        (``day``, ``dusk``, ``night``, ``dawn``) by their word (``hivemind.lang.world_words``).
+        Verbs, result codes, chat intents and goals have no phrase of their own: they are named
+        by their templates (``templates``, ``result_words``)."""
         try:
             return self._phrase[kind][name]
         except KeyError:
@@ -288,6 +297,10 @@ class Language:
             raise KeyError(f"no single {kind} with phrase {' '.join(words)!r}")
         return name
 
+    def phrase_ids(self, kind: str, name: Any) -> tuple[int, ...]:
+        """The word ids of a concept's phrase (``phrase_ids("time", "dusk")``)."""
+        return tuple(self._ids[w] for w in self.phrase(kind, name))
+
     def row(self, kind: str, name: Any) -> dict:
         """The concept row of the vocabulary file (class id, fallback, resource, v1, ...)."""
         return self._rows[kind][name]
@@ -303,7 +316,7 @@ class Language:
             return self._phrase["block"][v]
         if domain in ("item", "event_item"):
             return self._phrase["item"][v]
-        if domain == "chat_item":
+        if domain in ("chat_item", "where_item"):
             return self._phrase["nonce"][v] if v in self._phrase["nonce"] else self._phrase["item"][v]
         if domain in ("entity_class", "event_entity"):
             return self._phrase["entity"][v]
@@ -366,8 +379,9 @@ class Language:
 
     def class_phrase_ids(self, kind: str) -> np.ndarray:
         """int32 [number of class ids, longest phrase] of word ids, padded with <pad> (0), indexed
-        by class id (blocks: 256 rows, buried at 255): the phrase of every class for the
-        observation encoder (DESIGN.md 6.4)."""
+        by class id (blocks: 256 rows, ``unseen`` at 255; biomes by registry id): the phrase of
+        every class of a kind (block, item, entity, biome) for the observation encoder
+        (DESIGN.md 6.4)."""
         rows = [r for r in self.raw["concepts"] if r["kind"] == kind]
         n = 256 if kind == "block" else 1 + max(r["id"] for r in rows)
         width = max(len(r["phrase"]) for r in rows)
@@ -402,10 +416,8 @@ class Language:
         return out
 
     def _frame_words(self, frame: _Frame) -> list[str]:
-        table = {Sentence: G.SENTENCE_ELEMENTS, Goal: G.GOAL_ELEMENTS, Event: G.EVENT_ELEMENTS}[type(frame)]
-        els = table.get(frame._head)
-        if els is None:
-            raise ValueError(f"unknown {type(frame).__name__} {frame._head!r}")
+        kind = {Sentence: "sentence", Goal: "goal", Event: "event"}[type(frame)]
+        els = G.frame_form(kind, frame._head, frame.slots)  # the form whose slots these are
         values = frame.slots
         if isinstance(frame, Event) and "n" in values:
             n = values["n"]
@@ -464,8 +476,9 @@ class Language:
                      container: str | None = None) -> list[str]:
         """The result words of a failure code (DESIGN.md 5): ``no crafting table nearby``,
         ``chest full``, ``interrupted by creeper``. ``station`` is a block-class name
-        (crafting_table, furnace, bed); ``container`` is ``inventory`` (the default) or
-        ``chest``; ``cause`` is ``damage``, ``message`` or a hostile entity class."""
+        (crafting_table, furnace, bed); ``container`` is ``inventory`` (the default), ``chest``
+        or ``furnace`` (the furnace's own slots block ``smelt_start``); ``cause`` is ``damage``,
+        ``message`` or a hostile entity class."""
         els = G.RESULT_ELEMENTS.get(code)
         if els is None:
             raise ValueError(f"unknown result code {code!r}; one of {list(G.RESULT_CODES)}")
@@ -509,9 +522,8 @@ class Language:
     def _frame_paths(self, kind: str) -> list[FlatTemplate]:
         cached = self._paths.get(kind)
         if cached is None:
-            table = {"sentence": G.SENTENCE_ELEMENTS, "goal": G.GOAL_ELEMENTS, "event": G.EVENT_ELEMENTS,
-                     "result": G.RESULT_ELEMENTS}[kind]
-            cached = self._paths[kind] = [FlatTemplate(None, head, tuple(els)) for head, els in table.items()]  # type: ignore[arg-type]
+            cached = self._paths[kind] = [FlatTemplate(None, head, tuple(els))  # type: ignore[arg-type]
+                                          for head, forms in G.FRAME_FORMS[kind].items() for els in forms]
         return cached
 
     def _to_ids(self, words: Sequence[str]) -> list[int]:
@@ -687,14 +699,16 @@ class Language:
 
 
 def _expand(elements: Sequence[Element]) -> list[tuple[Lit | Slot | Mark, ...]]:
-    """Flatten nested choices: one element tuple per intent or goal, with a Mark for the choice."""
+    """Flatten nested choices: one element tuple per form of each intent or goal, with a Mark
+    for the choice (both forms of ``where`` carry ``Mark("intent", "where")``)."""
     out: list[tuple] = [()]
     for e in elements:
         if isinstance(e, Choice):
             nxt = []
             for prefix in out:
-                for head, sub in G.CHOICE_ELEMENTS[e.slot].items():
-                    nxt.append((*prefix, Mark(e.slot, head), *sub))
+                for head, forms in G.CHOICE_FORMS[e.slot].items():
+                    for sub in forms:
+                        nxt.append((*prefix, Mark(e.slot, head), *sub))
             out = nxt
         else:
             out = [(*prefix, e) for prefix in out]
