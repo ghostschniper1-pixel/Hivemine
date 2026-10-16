@@ -13,6 +13,7 @@ statistics measured in M3.
     world = generate(seed=7)                    # the 128 x 128 default preset
     world = generate(seed=7, config="forest")   # or "flat", or a WorldGenConfig
     x, y, z = spawn_point(world)                # feet position on the surface
+    world.biome_map[x, z]                       # the column's biome id (draft 0.5)
 
 Steps, in order (all randomness through ``CounterRNG`` with ``Purpose.WORLDGEN``, keyed by the
 step, the chunk or lattice point, and a draw index, so the result does not depend on the order
@@ -22,21 +23,33 @@ of evaluation and two seeds never share numbers):
    y 70 [est], so the surface lies mostly between 64 and 80 [est]; ``flat`` uses one height.
 2. **Water:** columns below sea level fill with water up to y 62 (sea level 63 [3]); a few dug
    pools [est] add small ponds above sea level.
-3. **Strata:** bedrock at y -64 with the vanilla rough layer (a gradient to y -59 [mem]),
-   deepslate at y <= 0 with a transition band up to y 8 [mem], stone above, then 3-4 dirt [est]
-   under a grass block; sand within 2 blocks [est] of water near water level, sand or gravel
-   [est] on the floor under water.
-4. **Caves:** random worms [est] (a Poisson number per chunk) carve tunnels so ores get
+3. **Biomes** (draft 0.5; DESIGN.md 4.4): one per column from a smooth value-noise field [est]
+   cut into bands along ``WorldGenConfig.biomes`` (default desert, plains, forest, birch forest,
+   so a desert borders plains and a birch forest borders a forest). Each biome must be true of
+   its column: ``BIOME_SURFACES`` decides the column's surface and plants (below), and every
+   biome of the palette must list exactly the ore-table rows that ``WorldGenConfig.biome`` places
+   (true of plains, forest, birch forest and desert; ``generate`` checks it). Only overworld
+   biomes, and never an underground one (``lush caves``, ``dripstone caves``, ``deep dark``).
+   Columns under water keep their land biome: a pond in a plain is plains in the game too.
+4. **Strata:** bedrock at y -64 with the vanilla rough layer (a gradient to y -59 [mem]),
+   deepslate at y <= 0 with a transition band up to y 8 [mem], stone above, then 3-4 layers [est]
+   of the biome's soil under its top block: dirt under a grass block, or in a desert sand under
+   sand over 3 layers of sandstone [mem: the desert surface rule puts sandstone under the sand;
+   depths est]; sand within 2 blocks [est] of water near water level, sand or gravel [est] on the
+   floor under water.
+5. **Caves:** random worms [est] (a Poisson number per chunk) carve tunnels so ores get
    exposed; carved cells at y <= -56 hold lava (the cave carver's ``lava_level`` [3]); cells next
    to water are left alone.
-5. **Ores:** per chunk, every row of the ore table for the biome (``plains`` by default): count,
+6. **Ores:** per chunk, every row of the ore table for the biome (``plains`` by default): count,
    rarity, origin height (uniform or trapezoid), then a vein shaped as the game's ``OreFeature``
    [mem] that replaces only its targets (``deepslate iron ore`` replaces deepslate and tuff),
    with ``discard_chance_on_air_exposure`` against cave air. ``ore_density`` scales the number
    of ore attempts (DESIGN.md 10.2 knob x{0.25, 0.5, 1, 2}); stone blobs (granite, dirt, ...)
    are not scaled.
-6. **Trees:** log trunks 4-6 high [est] under a leaf canopy [est] (oak with ``oak leaves``, birch
-   with ``leaves``, so each leaf class's words stay true of it); some short grass and flowers.
+7. **Trees:** log trunks 4-6 high [est] under a leaf canopy [est] (oak with ``oak leaves``, birch
+   with ``leaves``, so each leaf class's words stay true of it), as many per chunk as the column's
+   biome has [est] (forests dense, plains rare, deserts none; a birch forest only birch, a forest
+   mostly oak [mem]); then short grass and flowers on grass blocks and dead bushes on desert sand.
 """
 
 from __future__ import annotations
@@ -65,8 +78,39 @@ DEEPSLATE_ALWAYS_Y = 0  # [mem] surface rule "deepslate": always at and below y 
 DEEPSLATE_NEVER_Y = 8  # [mem] ... never at and above y 8, a linear gradient between
 
 # RNG layout: episode = step, tick = sub-index (octave, ore row, ...), entity = chunk or lattice key.
-STEP_HEIGHT, STEP_SOIL, STEP_POOLS, STEP_CAVES, STEP_ORES, STEP_VEINS, STEP_TREES, STEP_PLANTS = range(1, 9)
+STEP_HEIGHT, STEP_SOIL, STEP_POOLS, STEP_CAVES, STEP_ORES, STEP_VEINS, STEP_TREES, STEP_PLANTS, STEP_BIOMES = range(1, 10)
 _DISCARD_DRAW0 = 1 << 20  # draw indices of a vein's per-cell air-exposure draws start here
+
+# DESIGN.md 4.4 [design]: biomes a column biome never names (they are caves, in the game's 3-D cells).
+UNDERGROUND_BIOMES = frozenset({"lush_caves", "dripstone_caves", "deep_dark"})
+
+
+@dataclass(frozen=True)
+class BiomeSurface:
+    """What a test-world biome builds on its columns, so that its name is true of them (DESIGN.md
+    4.4). Densities are per chunk or per column, all [est] until M3 measures real chunks."""
+
+    top: str  # block on top of a dry column
+    soil: str  # the dirt_depth layers under it
+    under: str | None  # below the soil, ``under_depth`` layers
+    under_depth: int
+    trees_per_chunk: float  # mean tree attempts per chunk where the whole chunk has this biome
+    birch_fraction: float  # birch trees among them (the rest oak)
+    grass_chance: float  # short grass per grass-block column with air above
+    flower_chance: float
+    dead_bush_chance: float  # dead bushes per sand column with air above
+
+
+BIOME_SURFACES: dict[str, BiomeSurface] = {
+    # [est] vanilla plains have a few oaks [mem]
+    "plains": BiomeSurface("grass_block", "dirt", None, 0, 0.1, 0.0, 0.3, 0.02, 0.0),
+    # [est] vanilla forests mix oak and birch [mem]
+    "forest": BiomeSurface("grass_block", "dirt", None, 0, 5.0, 0.2, 0.15, 0.01, 0.0),
+    # [est] birch only [mem]
+    "birch_forest": BiomeSurface("grass_block", "dirt", None, 0, 5.0, 1.0, 0.15, 0.01, 0.0),
+    # [mem] sand over sandstone, no trees or grass, dead bushes; depths and density [est]
+    "desert": BiomeSurface("sand", "sand", "sandstone", 3, 0.0, 0.0, 0.0, 0.0, 0.01),
+}
 
 
 @dataclass(frozen=True)
@@ -78,7 +122,7 @@ class WorldGenConfig:
     surface_y: float = 70.0  # [est] mean surface height (surface mostly 64-80)
     octaves: tuple[tuple[int, float], ...] = ((64, 6.0), (32, 3.0), (16, 1.5), (8, 0.75))  # [est] (spacing, amplitude)
     flat: bool = False  # a flat world at round(surface_y)
-    dirt_depth: tuple[int, int] = (3, 4)  # [est] dirt layers under the grass block
+    dirt_depth: tuple[int, int] = (3, 4)  # [est] soil layers under the top block
     beach_distance: int = 2  # [est] sand within this many blocks of water ...
     beach_height: int = 2  # [est] ... on columns at most this far above the water
     pools_per_chunk: float = 0.05  # [est] dug ponds above sea level
@@ -90,18 +134,19 @@ class WorldGenConfig:
     stone_blobs: bool = True  # place the table's granite, diorite, andesite, tuff, dirt and gravel blobs
     ore_density: float = 1.0  # DESIGN.md 10.2 scarcity knob
     biome: str = "plains"  # which rows of the ore table apply (ore_table.OreFeature.in_biome)
-    trees_per_chunk: float = 1.5  # [est]
-    birch_fraction: float = 0.2  # [est]
+    # The column biomes, in band order along the biome noise (keys of BIOME_SURFACES) [est].
+    biomes: tuple[str, ...] = ("desert", "plains", "forest", "birch_forest")
+    biome_octaves: tuple[tuple[int, float], ...] = ((48, 1.0), (16, 0.25))  # [est] (spacing, amplitude)
+    biome_spread: float = 0.5  # [est] the bands split [-spread, spread] of the normalized noise evenly
+    vegetation: float = 1.0  # scales every biome's trees, grass, flowers and dead bushes
     trunk_height: tuple[int, int] = (4, 6)  # [est]
-    grass_chance: float = 0.15  # [est] short grass on a grass block
-    flower_chance: float = 0.01  # [est]
 
 
 PRESETS: dict[str, WorldGenConfig] = {
     "default": WorldGenConfig(),
-    "forest": WorldGenConfig(size_x=64, size_z=64, trees_per_chunk=5.0, pools_per_chunk=0.1),  # [est]
+    "forest": WorldGenConfig(size_x=64, size_z=64, biomes=("forest",), pools_per_chunk=0.1),  # [est]
     "flat": WorldGenConfig(size_x=64, size_z=64, flat=True, surface_y=64.0, pools_per_chunk=0.0, caves_per_chunk=0.0,
-                           trees_per_chunk=0.0, grass_chance=0.0, flower_chance=0.0),  # [est]
+                           biomes=("plains",), vegetation=0.0),  # [est]
 }
 
 
@@ -164,11 +209,12 @@ def _grow_max(a: np.ndarray, steps: int) -> np.ndarray:
     return out
 
 
-def _value_noise(rng: CounterRNG, sx: int, sz: int, spacing: int, octave: int) -> np.ndarray:
-    """Smoothly interpolated lattice noise in [-1, 1] on an sx x sz grid."""
+def _value_noise(rng: CounterRNG, sx: int, sz: int, spacing: int, octave: int, step: int = STEP_HEIGHT) -> np.ndarray:
+    """Smoothly interpolated lattice noise in [-1, 1] on an sx x sz grid (lattice draws keyed by
+    ``step`` and ``octave``)."""
     gx = np.arange(sx // spacing + 2)
     gz = np.arange(sz // spacing + 2)
-    lattice = rng.uniform_array(STEP_HEIGHT, octave, Purpose.WORLDGEN, _key(gx[:, None], gz[None, :]), 0) * 2.0 - 1.0
+    lattice = rng.uniform_array(step, octave, Purpose.WORLDGEN, _key(gx[:, None], gz[None, :]), 0) * 2.0 - 1.0
 
     def axis(n: int) -> tuple[np.ndarray, np.ndarray]:
         f = np.arange(n) / spacing
@@ -223,9 +269,43 @@ def _pools(rng: CounterRNG, cfg: WorldGenConfig, h: np.ndarray, water_top: np.nd
             water_top[disk] = level
 
 
+def check_biomes(cfg: WorldGenConfig, concepts: Concepts) -> None:
+    """Raise ValueError unless every biome of ``cfg.biomes`` can be true of its columns (module
+    docstring, step 3): an overworld biome that is not underground, with a ``BIOME_SURFACES``
+    entry, listing exactly the ore-table rows of ``cfg.biome``."""
+    if not cfg.biomes:
+        raise ValueError("a test world needs at least one biome")
+    rows = {r.name for r in ore_table(cfg.biome)}
+    for name in cfg.biomes:
+        b = concepts.biome(name)
+        if not b.overworld or name in UNDERGROUND_BIOMES:
+            raise ValueError(f"{name}: test-world columns take overworld surface biomes only")
+        if name not in BIOME_SURFACES:
+            raise ValueError(f"{name}: no BIOME_SURFACES entry says what this biome builds")
+        if {r.name for r in ore_table(name)} != rows:
+            raise ValueError(f"{name} lists other ore rows than {cfg.biome}, whose rows are placed everywhere")
+
+
+def biome_indices(rng: CounterRNG, cfg: WorldGenConfig) -> np.ndarray:
+    """int [size_x, size_z]: each column's index into ``cfg.biomes``. The octaves of
+    ``cfg.biome_octaves`` are summed and normalized by their amplitudes, then cut into
+    ``len(cfg.biomes)`` bands of equal width over [-spread, spread] [est] (the outer bands extend
+    to the ends)."""
+    n = len(cfg.biomes)
+    if n == 1:
+        return np.zeros((cfg.size_x, cfg.size_z), np.int64)
+    field = np.zeros((cfg.size_x, cfg.size_z))
+    for octave, (spacing, amplitude) in enumerate(cfg.biome_octaves):
+        field += amplitude * _value_noise(rng, cfg.size_x, cfg.size_z, spacing, octave, STEP_BIOMES)
+    field /= sum(a for _, a in cfg.biome_octaves)
+    edges = np.linspace(-cfg.biome_spread, cfg.biome_spread, n + 1)[1:-1]
+    return np.searchsorted(edges, field, side="right").astype(np.int64)
+
+
 def _strata(rng: CounterRNG, cfg: WorldGenConfig, ids: dict[str, int], h: np.ndarray,
-            water_top: np.ndarray) -> np.ndarray:
-    """Fill the columns: bedrock, deepslate, stone, dirt or sand, the top block and water."""
+            water_top: np.ndarray, biome: np.ndarray) -> np.ndarray:
+    """Fill the columns: bedrock, deepslate, stone, the biome's soil and top block (sand on beaches
+    and under water) and water. ``biome`` holds each column's index into ``cfg.biomes``."""
     sx, sz = h.shape
     y = np.arange(MIN_Y, MAX_Y + 1)[None, :, None]
     cols = _key(np.arange(sx)[:, None], np.arange(sz)[None, :])
