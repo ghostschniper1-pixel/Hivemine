@@ -101,7 +101,8 @@ def test_ids_and_reserved_classes(concepts: Concepts) -> None:
     assert C.UNSEEN_ID == 255 and not hasattr(C, "BURIED_ID")
     assert concepts.block_class("unseen") is unseen and concepts.class_by_phrase("block", ("unseen",)) is unseen
     assert not any("buried" in c.phrase or c.name == "buried" for c in concepts.block_classes)
-    assert "surface-only" in concepts.raw["block_classes"][-1]["note"]
+    note = concepts.raw["block_classes"][-1]["note"]  # the seen rule of DESIGN.md 6.1, draft 0.5
+    assert "surface-only" in note and "feet + 1.62" in note and "centre of a face" in note
     assert concepts.item_class(0).name == "none" and concepts.item_class_of("air").id == 0
     assert concepts.state_class.dtype == np.uint8
     for kind in ("item_classes", "entity_classes"):
@@ -155,8 +156,9 @@ def test_planted_violations_are_detected(rules) -> None:
 
 def test_planted_phrase_and_kind_violations_are_detected(rules, monkeypatch: pytest.MonkeyPatch) -> None:
     hints = list(C.FALLBACK_PHRASE_HINTS)
-    hints.insert(0, ("oak_slab", {}, "planks"))  # a fallback named like a curated class
-    hints.append(("stone", {}, "rock"))  # stone is curated: the hint matches nothing
+    hints.insert(0, C.H("oak_slab", {}, "planks", "*_slab"))  # a fallback named like a curated class
+    hints.append(C.H("stone", {}, "rock", "stone"))  # stone is curated: the hint matches nothing
+    hints.append(C.H("bell", {}, "bell", "bell no_such_block"))  # a pattern that matches no block
     monkeypatch.setattr(C, "FALLBACK_PHRASE_HINTS", tuple(hints))
     monkeypatch.setattr(C, "ITEM_FALLBACK_PHRASES", {**C.ITEM_FALLBACK_PHRASES, 16: ("stick",)})
     overrides = {k: v for k, v in C.ENTITY_KIND_OVERRIDES.items() if k != "hoglin"}  # type and category disagree
@@ -165,6 +167,8 @@ def test_planted_phrase_and_kind_violations_are_detected(rules, monkeypatch: pyt
     found = {(v.kind, v.cls, v.check) for v in result.violations}
     assert ("block", "other_planks", "phrase") in found  # a fallback phrase may repeat, but not a curated one
     assert ("block", "stone", "stale phrase hint") in found
+    stale = [v.detail for v in result.violations if (v.cls, v.check) == ("bell", "stale phrase hint")]
+    assert stale and all("no_such_block" in d for d in stale)
     assert ("item", "other_item_16", "phrase") in found
     assert ("entity", "hoglin", "kind") in found
     assert ("entity", "camel", "stale kind override") in found
@@ -331,18 +335,75 @@ def test_fallback_phrases_are_true_of_every_member(concepts: Concepts, rules) ->
     assert phrase_of("stone_slab", type="bottom", waterlogged="false") == "slab"
     for block in ("coal_block", "diamond_block", "netherite_block", "bricks", "polished_granite"):
         assert phrase_of(block) == "other pickaxe block", block
-    hints = {tuple(p.split()) for _b, _w, p in C.FALLBACK_PHRASE_HINTS}
+    # Review 3: a sea pickle is no flower pot, a bud is no cluster, a crystal on a wall is not
+    # hanging, and a zombie head is no skull.
+    assert phrase_of("sea_pickle", pickles="3", waterlogged="true") == "sea pickle"
+    assert phrase_of("flower_pot") == phrase_of("potted_cactus") == "flower pot"
+    for crystal in ("amethyst_cluster", "large_amethyst_bud", "medium_amethyst_bud", "small_amethyst_bud"):
+        assert phrase_of(crystal, facing="up") == "upright amethyst crystal", crystal
+        for facing in ("down", "north", "east", "south", "west"):
+            assert phrase_of(crystal, facing=facing) == "amethyst crystal", (crystal, facing)
+    for head in ("skeleton_skull", "wither_skeleton_skull", "zombie_head", "player_head", "creeper_head",
+                 "dragon_head", "piglin_head"):
+        assert phrase_of(head) == "head", head
+        assert phrase_of(head.replace("_skull", "_wall_skull").replace("_head", "_wall_head")) == "wall head"
+    assert phrase_of("crimson_fungus") == phrase_of("spore_blossom") == "small growth"  # fungi are not plants
+    hints = {h.phrase for h in C.FALLBACK_PHRASE_HINTS}
     for c in concepts.block_classes:
         if not c.fallback:
             continue
         assert re.fullmatch("other_" + "_".join(c.phrase) + r"(_\d+)?", c.name), c.name
-        if c.phrase in hints or c.phrase in {("other", "block")} | {("other", t, "block") for t in c.mineable}:
+        if c.phrase in hints:
+            # A hint phrase must be true of every state of the class, as some hint with that
+            # phrase declares (the build enforces this for the hint that named the class).
+            states = [(rules.block_of_state(s).name, rules.block_of_state(s).state_values(s))
+                      for lo, hi in c.state_ranges for s in range(lo, hi + 1)]
+            assert any(h.phrase == c.phrase and all(h.is_true_of(b, v) for b, v in states)
+                       for h in C.FALLBACK_PHRASE_HINTS), c.name
+            continue
+        if c.phrase in {("other", "block")} | {("other", t, "block") for t in c.mineable}:
             continue
         tail = c.phrase[1:] if c.phrase[0] == "other" else c.phrase  # "other" marks a curated name
         for m in c.members:
             assert C.words(rules.block(m).display_name)[-len(tail):] == tail, (c.name, m)
     assert {c.phrase for c in concepts.item_classes if c.fallback} == {
         ("other", "unstackable", "item"), ("other", "small", "stack", "item"), ("other", "item")}
+
+
+def test_phrase_hint_truth() -> None:
+    lantern = C.H("lantern", {}, "hanging lantern", "lantern soul_lantern", {"hanging": ("true",)})
+    assert lantern.is_true_of("soul_lantern", {"hanging": "true", "waterlogged": "false"})
+    assert not lantern.is_true_of("soul_lantern", {"hanging": "false"})
+    assert not lantern.is_true_of("lantern", {})  # a state without the property fails the filter
+    assert not lantern.is_true_of("sea_pickle", {"hanging": "true"})
+    raised = C.H("oak_trapdoor", {}, "raised trapdoor", "*_trapdoor", {"open": ("true",)}, {"half": ("top",)})
+    assert raised.is_true_of("iron_trapdoor", {"open": "true", "half": "bottom"})  # any filter may pass
+    assert raised.is_true_of("oak_trapdoor", {"open": "false", "half": "top"})
+    assert not raised.is_true_of("oak_trapdoor", {"open": "false", "half": "bottom"})
+    assert C.H("flower_pot", {}, "flower pot", "flower_pot potted_*").is_true_of("potted_cactus", {})
+
+
+def test_planted_false_hint_phrases_are_detected(rules, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contracts 3: the build fails when a hint's phrase is false of a member of the class it
+    names, by block (a sea pickle in the flower pots, coal blocks called "bell") or by state
+    (amethyst crystals on walls called "hanging")."""
+    hints = []
+    for h in C.FALLBACK_PHRASE_HINTS:
+        if h.phrase == ("amethyst", "crystal"):
+            h = C.H("amethyst_cluster", {"collision_height": 1.0}, "hanging amethyst crystal",
+                    "amethyst_cluster *_amethyst_bud", {"facing": ("down",)})
+        hints.append(h)
+    hints.append(C.H("bell", {}, "bell", "bell"))
+    monkeypatch.setattr(C, "FALLBACK_PHRASE_HINTS", tuple(hints))
+    blocks = [s for s in C.BLOCK_SPECS if s.name != "sea_pickle"]  # back into the flower pots' class
+    exceptions = [e for e in C.EXCEPTIONS if e.cls != "sea_pickle"]
+    result = C.build(rules, block_specs=blocks, exceptions=exceptions)
+    false = {v.cls: v.detail for v in result.violations if v.check == "phrase"}
+    assert "sea_pickle" in false["other_flower_pot"]
+    assert "facing=north" in false["other_hanging_amethyst_crystal"]
+    assert "facing=down" not in false["other_hanging_amethyst_crystal"]
+    assert "coal_block" in false["other_bell"]
+    assert not result.ok
 
 
 def test_block_and_entity_phrases_are_disjoint(concepts: Concepts) -> None:
@@ -441,10 +502,28 @@ def test_fallbacks(concepts: Concepts, rules) -> None:
     assert concepts.entity_class_of("blaze").name == "monster"
     assert concepts.entity_class_of("boat").name == "object"
     assert concepts.entity_class_of("hoglin").name == "monster"
-    assert concepts.entity_class_of("skeleton_horse").name == "animal"  # minecraft-data: "Hostile mobs"
-    assert concepts.entity_class_of("zombie_horse").name == "animal"
+    assert concepts.entity_class_of("skeleton_horse").name == "passive_mob"  # minecraft-data: "Hostile mobs"
+    assert concepts.entity_class_of("zombie_horse").name == "passive_mob"
+    assert concepts.entity_class_of("allay").name == "passive_mob"  # an allay is no animal (review 3)
     assert concepts.entity_class_of("evoker_fangs").name == "object"
     assert concepts.block_class_of_state(rules.block("oak_slab").default_state).fallback
+
+
+def test_entity_fallback_phrases_are_true_of_every_member(concepts: Concepts, rules) -> None:
+    """Each entity fallback's phrase says only what its kind says, so it is true of every member:
+    "monster" holds hostile mobs, "passive mob" passive mobs, "object" things that are not mobs
+    (minecraft-data's entity type and category, as fallback_entity_kind reads them)."""
+    not_mob_types = {"other", "projectile", "living"}  # "living": the armor stand
+    phrases = {"monster": ("monster",), "passive_mob": ("passive", "mob"), "object": ("object",)}
+    fallbacks = [c for c in concepts.entity_classes if c.fallback]
+    assert {c.name: c.phrase for c in fallbacks} == phrases
+    for c in fallbacks:
+        assert c.members, c.name
+        for m in c.members:
+            e = rules.entity(m)
+            assert C.fallback_entity_kind(e) == (c.kind, None), m
+            assert (e.type in not_mob_types) == (c.name == "object"), (c.name, m, e.type)
+    assert not {"animal"} & {w for c in fallbacks for w in c.phrase}
 
 
 def test_flags(concepts: Concepts) -> None:

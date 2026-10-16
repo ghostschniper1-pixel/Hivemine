@@ -54,28 +54,34 @@ no longer matches a violation also fails, so the list stays exact):
 
 Fallbacks. Block states that are not curated fall into classes keyed by the exact break
 inputs, the collision height class, the transparent/liquid/climbable/hazard/gravity/replaceable
-flags and the v1 item classes they can drop. Keying on everything would need 235 fallback
-classes next to 114 curated ones, more than a byte holds, so light, the solid flag and drop details other than
+flags and the v1 item classes they can drop. Keying on everything would need 231 fallback
+classes next to 115 curated ones, more than a byte holds, so light, the solid flag and drop details other than
 which v1 items can drop may vary inside a fallback class; each such class is listed in
 ``exceptions`` with the value it takes (most common light, solid only if all states are full
 cubes, the most common drop table) and, where the v1 drop counts differ by state, every
 variant (e.g. 2-5 snowballs for snow layers). A fallback's phrase is, in this order: a listed
-hint (``FALLBACK_PHRASE_HINTS``: "infested block", and state words for blocks split by state:
-"hanging lantern", "open fence gate"); the words all members' names end with (the whole name
-for a single member: "beacon"; "glazed terracotta", "carpet", "slab"), prefixed by ``other``
-if a curated class already has those words; else ``other <tool> block`` (or ``other block``).
-A member's name is never used for a class it does not describe: naming coal blocks "bell"
-would teach the agent a wrong meaning. Items outside v1 fall into ``other_item_{1,16,64}`` keyed by stack
-size only, with distinct phrases. Entities outside the curated list fall into ``monster``,
-``animal`` or ``object`` by minecraft-data's entity type and category; where the two disagree,
-``ENTITY_KIND_OVERRIDES`` decides (skeleton horse: animal, evoker fangs: object). Fallbacks
-are never resources and never v1 items.
+hint (``FALLBACK_PHRASE_HINTS``: "infested block", "head", and state words for blocks split by
+state: "hanging lantern", "open fence gate"); the words all members' names end with (the whole
+name for a single member: "beacon"; "glazed terracotta", "carpet", "slab"), prefixed by
+``other`` if a curated class already has those words; else ``other <tool> block`` (or
+``other block``). Each hint declares the vanilla blocks and states its phrase is true of
+(``PhraseHint``), and the build fails when the class it names holds anything else: "hanging
+lantern" is declared true only of lanterns with ``hanging=true``. A member's name is never used
+for a class it does not describe: naming coal blocks "bell" would teach the agent a wrong
+meaning. Items outside v1 fall into ``other_item_{1,16,64}`` keyed by stack size only, with
+distinct phrases. Entities outside the curated list fall into ``monster``, ``passive_mob`` or
+``object`` by minecraft-data's entity type and category; where the two disagree,
+``ENTITY_KIND_OVERRIDES`` decides (skeleton horse: passive, evoker fangs: object). Their
+phrases ("monster", "passive mob", "object") say only what the kind says, so they are true of
+every member (an allay is a passive mob, not an animal). Fallbacks are never resources and
+never v1 items.
 
 Reserved block classes. ``air`` is id 0 (air, cave air, void air). ``unseen`` is id 255 and
 has no members: a cell of the voxel window that the agent does not see this tick (draft 0.5,
-surface-only vision: no straight segment from the eyes reaches the cell through see-through
-cells). It is never stored in a world. Draft 0.4 called it ``buried``, which is false for a
-cave behind a wall; the id is unchanged.
+surface-only vision, DESIGN.md 6.1: no straight segment from the eye, at the feet + 1.62, to
+the centre of a face of the cell turned toward the eye (an opaque cell) or to the cell's centre
+(a see-through cell) crosses only see-through cells). It is never stored in a world. Draft 0.4
+called it ``buried``, which is false for a cave behind a wall; the id is unchanged.
 
 Biomes. ``biomes`` lists every 1.21.1 biome (the rules file's ``biomes``, i.e. the
 worldgen/biome registry) as a class of its own: ``id`` (the vanilla registry id, 0..63),
@@ -107,6 +113,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fnmatch
 import hashlib
 import io
 import json
@@ -306,6 +313,7 @@ BLOCK_SPECS: tuple[BlockSpec, ...] = (
     B("kelp", "kelp", "kelp_plant", phrase="kelp"),
     B("seagrass"),
     B("tall_seagrass"),
+    B("sea_pickle"),  # warm-ocean floor; its own class: the fallback it would join holds flower pots
     # crops (village farms)
     B("wheat", resource=True),
     B("carrots"),
@@ -547,8 +555,9 @@ ENTITY_SPECS: tuple[EntitySpec, ...] = (
     E("pufferfish", "passive"),
 )
 
-# Fallback entity classes by kind (names, phrases).
-ENTITY_FALLBACKS = (("monster", "hostile", ("monster",)), ("animal", "passive", ("animal",)),
+# Fallback entity classes by kind (names, phrases). A phrase says only what the kind says, so it
+# is true of every member: "animal" would be false of the allay, a passive mob that is no animal.
+ENTITY_FALLBACKS = (("monster", "hostile", ("monster",)), ("passive_mob", "passive", ("passive", "mob")),
                     ("object", "other", ("object",)))
 # The kind of a fallback entity comes from minecraft-data 1.20.5's entity type and category.
 # Where both say something and disagree, ENTITY_KIND_OVERRIDES must decide (the build fails
@@ -568,36 +577,81 @@ ENTITY_KIND_OVERRIDES: dict[str, str] = {  # all listed under "Hostile mobs"
     "hoglin": "hostile",  # [mem] type animal (it can be bred) but attacks players
 }
 
-# Phrase hints for fallback classes (see the module docstring), as (member block, fallback-key
-# values the class must have, phrase). For each member in state-id order, that block's hints are
-# tried in table order; the first match wins. The key values let a block that is split by state
-# name each part. Every hint must name some class (a stale hint fails the build).
-FALLBACK_PHRASE_HINTS: tuple[tuple[str, Mapping[str, Any], str], ...] = (
+@dataclass(frozen=True)
+class PhraseHint:
+    """A phrase for a fallback block class, and the vanilla states it is true of.
+
+    The hint names the fallback class that has ``block`` as a member and these fallback-key
+    values (``key``: lets a block that is split by state name each part). ``true_of`` declares
+    where the phrase is true: block-name patterns (``fnmatch``: ``*_trapdoor``) and, optionally,
+    property filters of which a state must pass at least one (each filter: property -> allowed
+    values; a state without the property fails it). The build fails, as a phrase violation, when
+    the class the hint names has a state the declaration does not cover, so a hint can never
+    call a sea pickle a flower pot (contracts 3: fallback phrases are true of every member).
+    """
+
+    block: str
+    key: Mapping[str, Any]
+    phrase: tuple[str, ...]
+    true_of: tuple[str, ...]
+    states: tuple[Mapping[str, tuple[str, ...]], ...] = ()
+
+    def is_true_of(self, block: str, values: Mapping[str, str]) -> bool:
+        """Whether the phrase is true of this vanilla block in the state with these values."""
+        if not any(fnmatch.fnmatchcase(block, p) for p in self.true_of):
+            return False
+        return not self.states or any(all(values.get(p) in allowed for p, allowed in f.items())
+                                      for f in self.states)
+
+
+def H(block: str, key: Mapping[str, Any], phrase: str, true_of: str,
+      *states: Mapping[str, tuple[str, ...]]) -> PhraseHint:
+    """A PhraseHint; ``true_of`` is a space-separated list of block-name patterns."""
+    return PhraseHint(block, key, tuple(phrase.split()), tuple(true_of.split()), states)
+
+
+# Phrase hints for fallback classes (see the module docstring and PhraseHint). For each member
+# in state-id order, that block's hints are tried in table order; the first match wins. Every
+# hint must name some class and every pattern must match some block (stale ones fail the build).
+FALLBACK_PHRASE_HINTS: tuple[PhraseHint, ...] = (
     # blocks split by state (collision class or drops)
-    ("snow", {"collision_height": 0.5}, "snow layers"),  # 2-5 layers (1 layer is the curated "snow")
-    ("snow", {"collision_height": 1.0}, "deep snow"),  # 6-8 layers: a full step up
-    ("lantern", {"collision_height": 1.0}, "hanging lantern"),
-    ("lantern", {"collision_height": 0.5}, "lantern"),
-    ("oak_fence_gate", {"collision_height": 0.0}, "open fence gate"),
-    ("oak_fence_gate", {"collision_height": 1.5}, "fence gate"),
-    ("oak_trapdoor", {"collision_height": 0.5}, "trapdoor"),  # closed in the bottom half
-    ("oak_trapdoor", {"collision_height": 1.0}, "raised trapdoor"),  # open, or in the top half
-    ("big_dripleaf", {"collision_height": 1.0}, "big dripleaf"),
-    ("big_dripleaf", {"collision_height": 0.0}, "tilted big dripleaf"),  # fully tilted: no collision
-    ("amethyst_cluster", {"collision_height": 0.5}, "amethyst cluster"),  # clusters and buds facing up
-    ("amethyst_cluster", {"collision_height": 1.0}, "hanging amethyst cluster"),  # on walls and ceilings
-    ("cave_vines", {"v1_drops": ["glow_berries"]}, "cave vines with glow berries"),
+    H("snow", {"collision_height": 0.5}, "snow layers", "snow",  # 2-5 layers (1 layer is the curated "snow")
+      {"layers": ("2", "3", "4", "5", "6", "7", "8")}),
+    H("snow", {"collision_height": 1.0}, "deep snow", "snow", {"layers": ("6", "7", "8")}),  # a full step up
+    H("lantern", {"collision_height": 1.0}, "hanging lantern", "lantern soul_lantern", {"hanging": ("true",)}),
+    H("lantern", {"collision_height": 0.5}, "lantern", "lantern soul_lantern"),
+    H("oak_fence_gate", {"collision_height": 0.0}, "open fence gate", "*_fence_gate", {"open": ("true",)}),
+    H("oak_fence_gate", {"collision_height": 1.5}, "fence gate", "*_fence_gate"),
+    H("oak_trapdoor", {"collision_height": 0.5}, "trapdoor", "*_trapdoor"),  # closed in the bottom half
+    H("oak_trapdoor", {"collision_height": 1.0}, "raised trapdoor", "*_trapdoor",  # open, or in the top half
+      {"open": ("true",)}, {"half": ("top",)}),
+    H("big_dripleaf", {"collision_height": 1.0}, "big dripleaf", "big_dripleaf"),
+    H("big_dripleaf", {"collision_height": 0.0}, "tilted big dripleaf", "big_dripleaf",  # fully tilted: no collision
+      {"tilt": ("partial", "full")}),
+    # Amethyst buds (small, medium, large) and clusters are all amethyst crystals. Facing up they
+    # stand on the floor (step height); on walls and ceilings they are a full step up, so a
+    # "hanging" phrase would be false for the ones on walls.
+    H("amethyst_cluster", {"collision_height": 0.5}, "upright amethyst crystal",
+      "amethyst_cluster *_amethyst_bud", {"facing": ("up",)}),
+    H("amethyst_cluster", {"collision_height": 1.0}, "amethyst crystal", "amethyst_cluster *_amethyst_bud"),
+    H("cave_vines", {"v1_drops": ["glow_berries"]}, "cave vines with glow berries", "cave_vines cave_vines_plant",
+      {"berries": ("true",)}),
     # (cave vines without berries share a class with weeping and twisting vines: a generic phrase)
-    ("candle_cake", {}, "cake with candle"),  # names end "... candle", but the thing is a cake
-    ("tnt", {}, "unstable tnt"),
+    H("candle_cake", {}, "cake with candle", "candle_cake *_candle_cake"),  # names end "candle"; it is a cake
+    H("tnt", {}, "unstable tnt", "tnt", {"unstable": ("true",)}),
     # members without a common name, or whose typical member would mislead
-    ("infested_stone", {}, "infested block"),
-    ("suspicious_sand", {}, "suspicious block"),
-    ("potted_oak_sapling", {}, "potted sapling"),
-    ("mangrove_propagule", {}, "small plant"),  # propagule, nether wart, fungi, spore blossom, small dripleaf
-    ("flower_pot", {}, "flower pot"),  # empty and potted plants without v1 drops
-    ("skeleton_skull", {}, "skull"),  # mob heads and skulls on the ground
-    ("skeleton_wall_skull", {}, "wall skull"),
+    H("infested_stone", {}, "infested block", "infested_*"),
+    H("suspicious_sand", {}, "suspicious block", "suspicious_sand suspicious_gravel"),
+    H("potted_oak_sapling", {}, "potted sapling", "potted_*_sapling"),
+    # A mangrove propagule, spore blossom and small dripleaf are plants, but nether wart and the
+    # crimson and warped fungi are fungi, not plants: "growth" is true of all of them.
+    H("mangrove_propagule", {}, "small growth",
+      "mangrove_propagule spore_blossom small_dripleaf nether_wart crimson_fungus warped_fungus"),
+    H("flower_pot", {}, "flower pot", "flower_pot potted_*"),  # empty, or holding a plant without v1 drops
+    # Skulls and heads: a skeleton skull is a skeleton's head, so "head" is true of every member;
+    # "skull" is false of a zombie, creeper, piglin, dragon or player head.
+    H("skeleton_skull", {}, "head", "*_skull *_head"),
+    H("skeleton_wall_skull", {}, "wall head", "*_wall_skull *_wall_head"),
 )
 FALLBACK_JUSTIFICATION = ("block ids must fit one byte (contracts 3); fallback classes key on exact break "
                           "inputs, collision class, nav and perception flags and the v1 items they can drop")
@@ -654,6 +708,12 @@ EXCEPTIONS: tuple[Exception_, ...] = (
                "berry bush age is not tracked by the class; bushes do not grow in v1",
                "a bush drops as a ripe one (age 3: 2-3 berries); in the real game younger bushes give "
                "fewer or none", drop_state={"age": "3"}),
+    Exception_("drops", "sea_pickle", "state-dependent drops",
+               "the number of pickles in a sea pickle block (1-4) is not tracked by the class (voxels hold "
+               "class ids only)",
+               "a sea pickle block drops one sea pickle (drop_state pickles=1, the default state); in the real "
+               "game a block of 2-4 pickles drops 2-4. Sea pickles are not a v1 item, so no v1 count changes",
+               drop_state={"pickles": "1"}),
 )
 
 
@@ -1067,12 +1127,13 @@ class Violation:
 
 @dataclass
 class _Fallback:
-    """A fallback block class while it is being named: its key (``fallback_key``), its state ids
-    and its member blocks in state-id order."""
+    """A fallback block class while it is being named: its key (``fallback_key``), its state ids,
+    its member blocks in state-id order and the hint that named it (if any)."""
 
     key: dict
     states: list[int]
     members: list[str]
+    hint: PhraseHint | None = None
 
 
 def _common_tail(phrases: Sequence[tuple[str, ...]]) -> tuple[str, ...]:
@@ -1304,6 +1365,8 @@ class _Builder:
             for s in fb.states:
                 self.state_class[s] = cname
                 self.block_states[cname].append(s)
+            if fb.hint is not None:
+                self._check_hint_truth(cname, fb.hint, fb.states)
         if len(self.block_order) > MAX_BLOCK_CLASS_ID + 1:
             raise BuildError(f"{len(self.block_order)} block classes ({self.curated_count} curated incl. air) do "
                              f"not fit ids 0..{MAX_BLOCK_CLASS_ID}")
@@ -1329,8 +1392,10 @@ class _Builder:
         used_hints: set[int] = set()
         out: list[tuple[str, ...]] = []
         for f in fallbacks:
-            phrase = self._fallback_hint(f, used_hints)
-            if phrase is None:
+            f.hint = self._fallback_hint(f, used_hints)
+            if f.hint is not None:
+                phrase = f.hint.phrase
+            else:
                 tail = _common_tail([names[m] for m in f.members])
                 if tail:
                     phrase = ("other", *tail) if tail in curated else tail
@@ -1338,19 +1403,42 @@ class _Builder:
                     tools = f.key.get("mineable") or []
                     phrase = ("other", tools[0], "block") if len(tools) == 1 else ("other", "block")
             out.append(phrase)
-        for i, (hint_block, want, _p) in enumerate(FALLBACK_PHRASE_HINTS):
+        for i, hint in enumerate(FALLBACK_PHRASE_HINTS):
             if i not in used_hints:
-                self.fail("block", hint_block, "stale phrase hint", f"{want}: matches no fallback class; remove it")
+                self.fail("block", hint.block, "stale phrase hint", f"{dict(hint.key)} {' '.join(hint.phrase)!r}: "
+                                                                    "matches no fallback class; remove it")
+            for pattern in hint.true_of:
+                if not any(fnmatch.fnmatchcase(b, pattern) for b in self.r.blocks):
+                    self.fail("block", hint.block, "stale phrase hint",
+                              f"{' '.join(hint.phrase)!r}: true_of pattern {pattern!r} matches no block")
         return out
 
-    def _fallback_hint(self, f: _Fallback, used: set[int]) -> tuple[str, ...] | None:
-        """The phrase of the first FALLBACK_PHRASE_HINTS entry that matches this class."""
+    def _fallback_hint(self, f: _Fallback, used: set[int]) -> PhraseHint | None:
+        """The first FALLBACK_PHRASE_HINTS entry that matches this class."""
         for m in f.members:
-            for i, (block, want, phrase) in enumerate(FALLBACK_PHRASE_HINTS):
-                if block == m and all(f.key.get(k) == v for k, v in want.items()):
+            for i, hint in enumerate(FALLBACK_PHRASE_HINTS):
+                if hint.block == m and all(f.key.get(k) == v for k, v in hint.key.items()):
                     used.add(i)
-                    return tuple(phrase.split())
+                    return hint
         return None
+
+    def _check_hint_truth(self, cls: str, hint: PhraseHint, states: Sequence[int]) -> None:
+        """Contracts 3: a hint's phrase must be true of every state of the class it names, as the
+        hint declares (PhraseHint.true_of and states). Fails once per class, naming up to four
+        states it is not true of."""
+        false_of = []
+        for s in states:
+            b = self.r.block_of_state(s)
+            values = b.state_values(s)
+            if not hint.is_true_of(b.name, values):
+                props = ",".join(f"{p}={values[p]}" for f in hint.states for p in f if p in values)
+                false_of.append(f"{b.name}[{props}]" if props else b.name)
+        if false_of:
+            uniq = list(dict.fromkeys(false_of))
+            self.fail("block", cls, "phrase",
+                      f"hint phrase {' '.join(hint.phrase)!r} is not true of {', '.join(uniq[:4])}"
+                      f"{' ...' if len(uniq) > 4 else ''} (declared true of {' '.join(hint.true_of)}"
+                      f"{' with ' + ' or '.join(map(str, map(dict, hint.states))) if hint.states else ''})")
 
     # -- block homogeneity --------------------------------------------------------
 
@@ -1715,10 +1803,12 @@ class _Builder:
             "requires_tool": False, "needs_tier": None, "tool_speeds": {}, "harvest_tools": None, "drops": None,
             "flags": {"solid": True, "collision_height": 1.0, "transparent": False, "liquid": False,
                       "climbable": False, "hazard": False, "gravity": False, "replaceable": False, "light": 0},
-            "note": ("perception only: a cell of the voxel window that the agent does not see this tick (no "
-                     "straight line from the eyes reaches it through see-through cells; DESIGN.md 6.1, draft 0.5 "
-                     "surface-only vision); never in a world. Its content is unknown (stone, ore, or the air of a "
-                     "cave behind a wall), so the flags are conservative placeholders: solid, opaque, unbreakable")})
+            "note": ("perception only: a cell of the voxel window that the agent does not see this tick "
+                     "(DESIGN.md 6.1, draft 0.5 surface-only vision: no straight segment from the eye, at the feet + "
+                     "1.62, to the centre of a face of the cell turned toward the eye (an opaque cell) or to the "
+                     "cell's centre (a see-through cell) crosses only see-through cells); never in a world. Its "
+                     "content is unknown (stone, ore, or the air of a cave behind a wall), so the flags are "
+                     "conservative placeholders: solid, opaque, unbreakable")})
         item_classes = [self._item_entry(c) for c in self.item_order]
         entity_classes = [self._entity_entry(c) for c in self.entity_order]
 
@@ -1796,8 +1886,9 @@ class _Builder:
              "justification": "waterlogged states keep the class of the dry state",
              "approximation": "water inside slabs, stairs, fences and similar blocks is ignored"},
             {"kind": "block", "class": "*", "check": "light",
-             "justification": "light emission is per block in the data (lit furnaces, lit redstone ore and "
-                              "redstone lamps are not distinguished)",
+             "justification": "light emission is per block in the data (lit furnaces, lit redstone ore, "
+                              "redstone lamps and sea pickles, whose light grows with their count and which "
+                              "are dark out of water [mem], are not distinguished)",
              "approximation": "block light from state-dependent sources is taken as the block's data value"},
         ]
 
