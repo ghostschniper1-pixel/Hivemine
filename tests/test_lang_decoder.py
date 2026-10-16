@@ -297,6 +297,52 @@ def test_dependent_options_follow_the_tentative_value(lang: Language) -> None:
     assert dec.allowed_words() == ["under"]
 
 
+def test_where_forms_after_where_is(lang: Language) -> None:
+    """Draft 0.5: after "where is" both forms are live, and the phrase decides (no extra choice)."""
+    prov = Restricted(lang, ["chat"], {"addressee": {"team"}, "intent": {"where"}, "block": {"iron_ore", "log"},
+                                       "item": {"iron_ingot", "iron_nugget", "stick"}})
+    dec = lang.decoder(prov)
+    for w in ["tell", "team", "where", "is"]:
+        assert dec.forced
+        dec.feed_word(w)
+    assert sorted(dec.allowed_words()) == ["iron", "log", "stick"] and not dec.forced
+    dec.feed_word("iron")
+    assert sorted(dec.allowed_words()) == ["ingot", "nugget", "ore"] and dec.n_threads == 2
+    dec.feed_word("ore")
+    dec.feed_word(".")
+    assert dec.command() == Command("chat", (("addressee", "team"), ("sentence", Sentence("where", block="iron_ore"))))
+    dec = lang.decoder(prov)
+    for w in ["tell", "team", "where", "is", "log", "."]:
+        dec.feed_word(w)
+    assert dec.command()["sentence"] == Sentence("where", block="log")
+    # no blocks known: only the item form is left (and the other way round)
+    for keep, words, expected in (({"block": set(), "item": {"iron_ingot", "stick"}}, ["iron"],
+                                   Sentence("where", item="iron_ingot")),
+                                  ({"item": set()}, ["iron"], Sentence("where", block="iron_ore"))):
+        p2 = Restricted(lang, ["chat"], {**prov.keep, **keep})
+        dec = lang.decoder(p2)
+        for w in ["tell", "team", "where", "is", *words]:
+            dec.feed_word(w)
+        assert dec.forced
+        while not dec.done:
+            dec.feed(int(dec.allowed().argmax()))
+        assert dec.command()["sentence"] == expected
+
+
+def test_where_item_refuses_items_named_like_a_block(lang: Language) -> None:
+    """A provider may not offer the item log for "where is {item}": "where is log" is the block."""
+
+    class Bad(Restricted):
+        def options(self, verb, slot, chosen):
+            return ["log"] if slot == "item" else super().options(verb, slot, chosen)
+
+    dec = Decoder(lang, Bad(lang, ["chat"], {"intent": {"where"}, "block": {"iron_ore"}}), Flags.all())
+    with pytest.raises(ValueError, match="not a valid where_item"):
+        for w in ("tell", "team", "where", "is"):
+            dec.feed_word(w)
+        dec.allowed()
+
+
 def test_block_and_entity_after_go_to_the_nearest(lang: Language) -> None:
     prov = Restricted(lang, ["goto"], {"block": {"iron_ore"}, "entity": {EntityRef(1, "iron_golem")},
                                        "template": {"block", "entity"}})
@@ -397,6 +443,23 @@ def test_numpy_values_become_plain_and_bools_are_refused(lang: Language) -> None
             dec.allowed()
 
 
+def test_slot_domain_depends_on_the_intent(lang: Language) -> None:
+    assert slot_domain("chat", "item", {"addressee": "team", "intent": "where"}) == "where_item"
+    assert slot_domain("chat", "item", {"intent": "need"}) == "chat_item"
+    assert slot_domain("chat", "block", {"intent": "where"}) == "block" and slot_domain("chat", "block") == "block"
+    assert slot_domain("chat", "addressee", {}) == "addressee" and slot_domain("give", "item") == "item"
+    assert slot_domain("plan", "item", {"goal": "get"}) == "item"
+    with pytest.raises(KeyError, match="depends"):
+        slot_domain("chat", "item")  # chat_item or where_item: the intent settles it
+    with pytest.raises(KeyError):
+        slot_domain("chat", "block", {"intent": "need"})
+    with pytest.raises(KeyError):
+        slot_domain("mine", "item")
+    full = FullProvider(lang)
+    assert full.options("chat", "item", {"intent": "where"}) == lang.domains["where_item"]
+    assert full.options("chat", "item", {"intent": "have"}) == lang.domains["chat_item"]
+
+
 def test_plan_entity_slot_takes_entity_classes(lang: Language) -> None:
     """Inside ``plan to kill {mine_count} {entity}`` the slot ``entity`` names a kind of mob."""
     assert slot_domain("plan", "entity") == "entity_class" and slot_domain("attack", "entity") == "entity_ref"
@@ -488,6 +551,19 @@ def test_automaton_walker_matches_decoder(lang: Language, auto, provider_kind: s
             wk.feed(w)
         assert wk.done and not wk.allowed().any()
         assert wk.command() == dec.command()
+
+
+def test_automaton_walker_on_the_where_forms(lang: Language, auto) -> None:
+    prov = Restricted(lang, ["chat"], {"addressee": {"team"}, "intent": {"where"}, "block": {"iron_ore", "stone"},
+                                       "item": {"iron_ingot", "stone_pickaxe"}})
+    for text in ("tell team where is iron ore.", "tell team where is iron ingot.", "tell team where is stone.",
+                 "tell team where is stone pickaxe."):
+        dec, wk = lang.decoder(prov), AutomatonWalker(auto, lang, prov, Flags())
+        for w in lang.encode(lang.parse(text)):
+            assert (dec.allowed() == wk.allowed()).all(), dec.text()
+            dec.feed(w)
+            wk.feed(w)
+        assert wk.done and wk.command() == dec.command() == lang.parse(text)
 
 
 def test_automaton_walker_respects_flags(lang: Language, auto) -> None:
