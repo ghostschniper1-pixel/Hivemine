@@ -207,18 +207,24 @@ def test_constants_carry_source_labels(rules: dict) -> None:
 
 def test_mechanics_constants_from_memory(rules: dict) -> None:
     """The five values mechanics.py once kept as code defaults are in the file, labelled [mem];
-    the draft-0.3 fatigue formula keeps its [13] label (DESIGN 4.3)."""
+    the draft-0.3 fatigue formula keeps its [13] label (DESIGN 4.3) under names that say it is
+    the draft's, not the game's."""
     k = rules["constants"]
     assert k["exhaustion_cap"] == {"value": 40.0, "source": "[mem]"}
     assert k["break_mining_fatigue_table"] == {"value": [0.3, 0.09, 0.0027, 0.00081], "source": "[mem]"}
     assert k["invulnerability_reset_ticks"] == {"value": 20, "source": "[mem]"}
     assert k["max_sky_light"] == {"value": 15, "source": "[mem]"}
-    assert k["sky_darken_night_min"] == {"value": 4, "source": "[mem]"}
-    assert k["break_mining_fatigue_base"] == {"value": 0.3, "source": "[13]"}
-    assert k["break_mining_fatigue_max_level"] == {"value": 4, "source": "[13]"}
+    assert k["sky_darken_not_day_min"] == {"value": 4, "source": "[mem]"}
+    assert k["draft03_mining_fatigue_base"] == {"value": 0.3, "source": "[13]"}
+    assert k["draft03_mining_fatigue_max_level"] == {"value": 4, "source": "[13]"}
     # the table agrees with the draft formula at levels 1-2 only
-    table, base = k["break_mining_fatigue_table"]["value"], k["break_mining_fatigue_base"]["value"]
+    table, base = k["break_mining_fatigue_table"]["value"], k["draft03_mining_fatigue_base"]["value"]
     assert [math.isclose(t, base ** (i + 1)) for i, t in enumerate(table)] == [True, True, False, False]
+    # the only fatigue values under game-sounding names are the game's table
+    assert sorted(n for n in k if "fatigue" in n and not n.startswith("draft03_")) == ["break_mining_fatigue_table"]
+    # the old names, which made a wrong formula and a non-night threshold look like game rules, are gone
+    for old in ("break_mining_fatigue_base", "break_mining_fatigue_max_level", "sky_darken_night_min"):
+        assert old not in k, old
     # the reset time leaves [18]'s 10 ticks of invulnerability
     assert k["invulnerability_reset_ticks"]["value"] - k["invulnerability_ticks"]["value"] == 10
 

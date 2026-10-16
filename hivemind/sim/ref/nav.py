@@ -19,37 +19,43 @@ fills it and the cell above. Each block class gets the flags ``Movements.getBloc
 its vanilla members, from the same minecraft-data fields the rules file holds:
 
 - *safe* (the body may be in it): no bounding box, or a ladder, or a carpet (collision top
-  < 0.1), and not avoided. Water, short grass, flowers, vines, snow layers and open fence gates'
-  neighbours are safe; an open fence gate is not (its block has a bounding box).
-- *physical* (may be stood on): a bounding box and not fence-like (collision top > 1: fences,
-  walls, fence gates in any state).
+  < 0.1), and not avoided. Water, short grass, flowers, vines and snow layers (minecraft-data
+  gives snow no bounding box) are safe; a fence gate is not, open or closed (its block has one).
+- *physical* (may be stood on): a bounding box and not fence-like (the lowest state's first
+  collision box taller than 1: fences and walls). Fence gates count as physical, because their
+  lowest state is an open gate with no box.
 - *liquid* (water, lava), *climbable* (ladder only; the package leaves vines out), *replaceable*
   (air, water, lava), *falls* (sand, gravel), and per state the collision *height*.
 - *never broken*: the package's own list (chest, and every block minecraft-data marks not
-  diggable) plus ``NEVER_BREAK``; *avoided* (never safe, so broken if it is in the way): the
-  package's (fire, cobweb, lava) plus ``AVOID``. The bridge must load the same additions into
+  diggable) plus ``never_break_classes`` (stations, beds, doors, fence gates); *avoided* (never
+  safe, so broken if it is in the way): the package's (fire, cobweb, lava) plus every hazard class
+  (``avoid_classes``). The bridge must load the same additions into
   ``Movements.blocksCantBreak`` and ``blocksToAvoid``: ``bridge_block_lists`` gives the vanilla
   names (bridge/PROTOCOL.md 4.4).
 
-A class takes the view of most of its block states (ties: the lowest state id); every class is
-uniform except the fallback ``other_other_block_7`` (torchflower crop, pitcher crop, pitcher
-plant: safe, while the package sees the pitcher crop as a solid block). Heights are uniform in
-most classes; where members differ (a fallback holding chests at 0.875 and full blocks), the
-height of most states is used, which only matters to the 1.2-block jump test.
+A class takes the view of most of its block states (ties: the lowest state id). The flags are
+uniform in every class except the fallback ``other_other_block_7`` (torchflower crop, pitcher
+crop, pitcher plant: safe, while the package sees the pitcher crop as a solid block). Heights
+differ inside 25 classes, all fallbacks or partial blocks (snow layers 2-8, soul sand and soil,
+walls, amethyst buds, chests with barrels); the height of most states is used, which matters
+only to the 1.2-block jump test and the half-block pillar test.
 
 **Moves** (``getNeighbors``), in this order: for west, east, north, south: *forward* (dig the head
 and feet cells if needed; with no support below, place one block there unless the target is
 water: swimming); *jump up* one block (placing up to two blocks under the target if it has no
 support); *drop down* (dig through the target column if needed, then fall onto the first solid
-block at most ``maxDropDown`` = 4 below the feet' current floor level, i.e. a fall of at most 3,
-or into water at any depth); then the four *diagonals* (one side column clear, the cheaper one
+block at most ``maxDropDown`` = 4 below the current feet cell, so the feet fall at most 3, or
+into water at any depth); then the four *diagonals* (one side column clear, the cheaper one
 dug if needed; level, one up, or one down); then *down* (dig the block below and fall, or climb
 down a ladder) and *up* (climb a ladder, or jump and place a block under the feet:
 ``allow1by1towers``). No parkour (``allowParkour = false``); doors and fence gates are never
-opened (``canOpenDoors = false``) and, being in ``NEVER_BREAK``, are walls whether open or closed.
+opened (``canOpenDoors = false``) and, never being broken, are walls whether open or closed.
 Nothing is dug next to a liquid (``dontCreateFlow``) or under sand or gravel
 (``dontMineUnderFallingBlock``). In water the agent swims at the surface level: it may move
-across and step out, never up through water (``getMoveUp`` refuses liquid feet cells).
+across and step out onto a ledge just under the surface, never up through water (``getMoveUp``
+refuses liquid feet cells); from deep water a block level with the surface is too high to jump on
+(the floor below is water). Like the package, a plan never sees its own placed blocks: after a
+pillar step the next jump is judged from the empty cell below the feet.
 
 **Costs** are the package's: forward 1, jump up 2, drop down 1, diagonal sqrt(2) (+1 up), up and
 down 1; each placed block ``placeCost`` 1; each block dug in the way (1 + 3 * seconds) *
@@ -487,7 +493,7 @@ class BlockView:
     cant_break: tuple[bool, ...]
     height: tuple[float, ...]  # collision top above the cell's bottom; 0 without collision
     state: tuple[int, ...]  # the lowest vanilla state with exactly this view (-1: none)
-    uniform: tuple[bool, ...]  # every state of the class has this view
+    uniform: tuple[bool, ...]  # every state of the class has these flags (heights may differ)
 
 
 def _block_flags(b, never: frozenset[str], avoid: frozenset[str]) -> tuple[bool, ...]:
@@ -531,7 +537,7 @@ def block_view(concepts: Concepts, never_break: tuple[str, ...], avoid: tuple[st
             view, state, uniform = wall, -1, True
         else:
             view = max(counts, key=lambda v: (counts[v], -first_state[(cls, v)]))
-            state, uniform = first_state[(cls, view)], len(counts) == 1
+            state, uniform = first_state[(cls, view)], len({v[:-1] for v in counts}) == 1
         for i, v in enumerate((*view, state, uniform)):
             cols[i].append(v)
     return BlockView(*(tuple(c) for c in cols))

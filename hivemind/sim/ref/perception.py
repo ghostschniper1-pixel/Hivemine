@@ -4,18 +4,23 @@ This is the **only** source the notebook and the action masks may use for blocks
 runs the same functions on the blocks Mineflayer holds (bridge/PROTOCOL.md 7.2), so the
 simulator and the real game perceive alike. Usage::
 
-    from hivemind.sim.ref.perception import perceive, voxel_window, sightings
-    p = perceive(world, feet=(x, y, z), tick=world.tick)   # window every call, rays when due
+    from hivemind.sim.ref.perception import perceive, voxel_window, sightings, SightingCache
+    cache = SightingCache()                                  # one per agent (optional, exact)
+    p = perceive(world, feet=(x, y, z), tick=world.tick, cache=cache)  # window always, rays when due
     p.window.classes            # uint8 (15, 7, 15) [x, y, z]: class ids, 255 = buried
-    p.sightings.counts          # {class id: visible blocks}; None when the rays were not due
+    p.sightings.counts          # {class id: sighted blocks}; None when the rays were not due
     sightings(world, eye, xray=True)    # ablation only: flagged ``xray`` in the result
 
 Definitions (DESIGN.md 6.1):
 
 - **See-through cells:** classes with the ``transparent`` flag (air, glass, leaves, water,
-  torches, short grass, ...), except ``barrier``: the barrier stands for the world edge
-  (DESIGN.md 11.3 walls the evaluation areas with it), and nothing beyond it can look back in.
-  The bridge applies the same rule to barrier blocks.
+  torches, short grass, ...), except ``barrier`` and ``lava``. The barrier stands for the world
+  edge (DESIGN.md 11.3 walls the evaluation areas with it), and nothing beyond it can look back
+  in; lava is flagged transparent in the data, but no player sees through a lava pool [mem]. The
+  bridge runs this same function, so it applies the same rule; its world mirror must be clipped to
+  the evaluation area with barrier outside (bridge/PROTOCOL.md 7.2), or the window would show
+  real terrain beyond the wall where the simulator shows ``buried``. Above y 191 the world reads
+  as air (``World.get``), as in the game.
 - **Exposed:** a cell is exposed when at least one of its six faces touches a see-through cell.
 - **Voxel window:** the 15 x 15 x 7 cells around the agent's feet cell (x and z -7..+7, y -3..+3),
   indexed [x, y, z] like the world. Exposed cells show their class, others the reserved class
@@ -25,14 +30,28 @@ Definitions (DESIGN.md 6.1):
 - **Line of sight:** a ray from the eye (feet + 1.62 [mem]) to the centre of an exposed face that
   faces the eye; every cell the ray crosses before reaching the face must be see-through. The
   cells are walked with a 3-D DDA (Amanatides and Woo); when the ray crosses two cell planes at
-  once (an edge or a corner), it steps x before y before z, a fixed rule both sides share.
-- **Resource sightings:** every block of a resource class (``concepts.resource``) whose centre is
-  within 24 blocks [est] of the eye and that has a face in line of sight. The result lists each
-  sighted block (class, position, distance) and the number of visible blocks per class.
+  once (an edge or a corner), it steps x before y before z, a fixed rule both sides share. A cube
+  has at most 3 faces facing a point outside it, so a block costs at most 3 rays.
+- **Resource sightings** (bounded; this replaces DESIGN.md 6.1's "fixed set of rays", which no
+  code defined): the candidates are the exposed blocks of resource classes
+  (``concepts.resource``) whose centres lie within 24 blocks [est] of the eye, taken nearest
+  first (ties: x, then y, then z). A candidate whose class already has ``PER_CLASS`` = 8 [est]
+  sightings is skipped without rays. Otherwise its facing open faces are traced, and it is
+  sighted if any ray is clear. Tracing stops before the first candidate that would take the call
+  past ``RAY_BUDGET`` = 768 rays [est]; the result then says ``complete=False``. So a call costs
+  at most 768 rays of at most ~43 cell steps each, whatever the terrain. The notebook keeps 48
+  places (DESIGN.md 6.3), so 8 positions per class are plenty. Without the caps (both None) every
+  sighted block is reported: at the spawn of a 128 x 128 test world that is 1,700-2,600 blocks
+  and 4,400-6,500 rays per call, too much for the M4 budget of <= 800 us per decision
+  (DESIGN.md 4.6). With the caps, calls at 75 random standing spots in generated test worlds
+  (surface and caves) used a median of 210 rays (90th percentile 500; 2 calls hit the budget).
 - **Ray schedule:** sightings are computed every 5 ticks [est] (``RaySchedule``); the window is
-  cheap and is computed on every call.
-- **X-ray ablation** (DESIGN.md 6.1): every resource block within 24, exposed or not, which is what
-  Mineflayer's ``findBlocks`` gives. Results carry ``xray=True`` and never count toward exit tests.
+  cheap and is computed on every call. ``SightingCache`` reuses the last result while the eye has
+  not moved and no block within the sight box has changed, which gives exactly the same output
+  (an agent digging in place casts no rays between block changes).
+- **X-ray ablation** (DESIGN.md 6.1): resource blocks within 24, exposed or not, which is what
+  Mineflayer's ``findBlocks`` gives, with the same per-class cap and no rays. Results carry
+  ``xray=True`` and never count toward exit tests.
 
 Honesty: in normal mode nothing here reads a cell that is not exposed, except to learn that it
 is not see-through. Changing hidden cells to other opaque classes therefore never changes the
@@ -43,7 +62,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -61,15 +80,19 @@ WINDOW_HALF_XZ = 7  # DESIGN.md 6.2: 15 x 15 (x, z)
 WINDOW_HALF_Y = 3  # DESIGN.md 6.2: 7 levels, y -3..+3
 WINDOW_SHAPE = (2 * WINDOW_HALF_XZ + 1, 2 * WINDOW_HALF_Y + 1, 2 * WINDOW_HALF_XZ + 1)
 RAY_PERIOD = 5  # DESIGN.md 6.1 [est] sightings checked every 5 ticks
+PER_CLASS = 8  # [est] sightings kept per resource class per call (the notebook holds 48 places)
+RAY_BUDGET = 768  # [est] rays per sightings call (module docstring)
+_BATCH = 128  # candidates traced per vectorized batch (does not change the result)
 
 # Faces in a fixed order: -x, +x, -y, +y, -z, +z.
 FACES = np.array([(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)], np.int64)
 
 
 def see_through_table(concepts: Concepts) -> np.ndarray:
-    """bool[256]: the classes a line of sight passes (transparent, except barrier and buried)."""
+    """bool[256]: the classes a line of sight passes (transparent, except barrier, lava and buried)."""
     see = concepts.transparent.copy()
     see[concepts.block_class("barrier").id] = False
+    see[concepts.block_class("lava").id] = False  # [mem] nobody sees through lava
     see[BURIED] = False
     return see
 
@@ -248,13 +271,20 @@ class Sighting:
 
 @dataclass(frozen=True)
 class Sightings:
-    """The resource blocks sighted at one tick (sorted by distance, then x, y, z)."""
+    """The resource blocks sighted at one tick (sorted by distance, then x, y, z).
+
+    ``counts`` is the number sighted per class (at most ``per_class``); ``rays`` the rays traced;
+    ``complete`` is False when the ray budget stopped the call before every candidate was
+    examined (the nearest candidates are always examined first).
+    """
 
     tick: int
     eye: tuple[float, float, float]
     xray: bool
     items: tuple[Sighting, ...]
     counts: dict[int, int] = field(default_factory=dict)
+    rays: int = 0
+    complete: bool = True
 
     def of(self, cls: int) -> tuple[Sighting, ...]:
         return tuple(s for s in self.items if s.cls == cls)
@@ -263,16 +293,22 @@ class Sightings:
         return next((s for s in self.items if s.cls == cls), None)
 
 
+def _sight_box(eye: np.ndarray, sight_range: float) -> tuple[np.ndarray, np.ndarray]:
+    """(base, top): the half-open world box ``sightings`` reads (one cell of margin)."""
+    ec = np.floor(eye).astype(np.int64)
+    r = int(math.ceil(sight_range)) + 1
+    return ec - r - 1, ec + r + 2
+
+
 def sightings(world: World, eye: Sequence[float], tick: int = 0, *, xray: bool = False,
-              sight_range: float = SIGHT_RANGE) -> Sightings:
-    """Resource blocks within ``sight_range`` of the eye that have a face in line of sight
-    (``xray``: every resource block in range, flagged as the ablation)."""
+              sight_range: float = SIGHT_RANGE, per_class: int | None = PER_CLASS,
+              ray_budget: int | None = RAY_BUDGET) -> Sightings:
+    """Resource blocks within ``sight_range`` of the eye that have a face in line of sight, nearest
+    first, at most ``per_class`` per class and ``ray_budget`` rays per call (module docstring;
+    None lifts a cap). ``xray``: resource blocks in range whether exposed or not, no rays."""
     see_table, resource = _tables(world)
     eye_arr = np.asarray(eye, float)
-    ec = np.floor(eye_arr).astype(np.int64)
-    r = int(math.ceil(sight_range)) + 1
-    base = ec - r - 1  # world cell of region[0, 0, 0]; one extra cell of margin
-    top = ec + r + 2
+    base, top = _sight_box(eye_arr, sight_range)
     region = world.region(int(base[0]), int(base[1]), int(base[2]), int(top[0]), int(top[1]), int(top[2]))
     see = see_table[region]
     inner = region[1:-1, 1:-1, 1:-1]
@@ -282,29 +318,52 @@ def sightings(world: World, eye: Sequence[float], tick: int = 0, *, xray: bool =
     if not xray:
         candidate &= exposed_mask(see)
     cells = np.argwhere(candidate)  # interior indices
-    if xray or cells.size == 0:
-        visible = np.ones(len(cells), bool)
-    else:
-        visible = _cells_in_sight(see, base, eye_arr, cells)
-    world_cells = cells[visible] + base[None, :] + 1
-    classes = inner[tuple(cells[visible].T)] if len(world_cells) else np.zeros(0, np.uint8)
-    dists = np.sqrt(dist2[tuple(cells[visible].T)]) if len(world_cells) else np.zeros(0)
-    order = np.lexsort((world_cells[:, 2], world_cells[:, 1], world_cells[:, 0], dists)) if len(world_cells) else []
-    items = tuple(Sighting(int(classes[i]), (int(world_cells[i, 0]), int(world_cells[i, 1]), int(world_cells[i, 2])),
-                           float(dists[i])) for i in order)
+    world_cells = cells + base[None, :] + 1
+    dists = np.sqrt(dist2[tuple(cells.T)])
+    order = np.lexsort((world_cells[:, 2], world_cells[:, 1], world_cells[:, 0], dists))
+    cells, world_cells, dists = cells[order], world_cells[order], dists[order]
+    classes = inner[tuple(cells.T)].astype(np.int64)
+    cap = len(cells) + 1 if per_class is None else per_class
+    budget = math.inf if (ray_budget is None or xray) else ray_budget
     counts: dict[int, int] = {}
-    for s in items:
-        counts[s.cls] = counts.get(s.cls, 0) + 1
+    chosen: list[int] = []
+    rays, complete = 0, True
+    for b0 in range(0, len(cells), _BATCH):
+        idx = np.arange(b0, min(b0 + _BATCH, len(cells)))
+        idx = idx[[counts.get(int(c), 0) < cap for c in classes[idx]]]  # classes already full: skip
+        if idx.size == 0:
+            continue
+        if xray:
+            n_rays, visible = np.zeros(len(idx), np.int64), np.ones(len(idx), bool)
+        else:
+            n_rays, visible = _faces_in_sight(see, base, eye_arr, cells[idx])
+        # The definition is sequential (nearest first); the batch only computes ahead.
+        for i, n, vis in zip(idx.tolist(), n_rays.tolist(), visible.tolist()):
+            c = int(classes[i])
+            if counts.get(c, 0) >= cap:
+                continue
+            if rays + n > budget:
+                complete = False
+                break
+            rays += n
+            if vis:
+                counts[c] = counts.get(c, 0) + 1
+                chosen.append(i)
+        if not complete:
+            break
+    items = tuple(Sighting(int(classes[i]), (int(world_cells[i, 0]), int(world_cells[i, 1]), int(world_cells[i, 2])),
+                           float(dists[i])) for i in chosen)
     return Sightings(tick, (float(eye_arr[0]), float(eye_arr[1]), float(eye_arr[2])), xray, items,
-                     dict(sorted(counts.items())))
+                     dict(sorted(counts.items())), rays, complete)
 
 
-def _cells_in_sight(see: np.ndarray, base: np.ndarray, eye: np.ndarray, cells: np.ndarray) -> np.ndarray:
-    """For interior cells (indices into ``see[1:-1, 1:-1, 1:-1]``), whether some exposed face that
-    faces the eye is in line of sight."""
+def _faces_in_sight(see: np.ndarray, base: np.ndarray, eye: np.ndarray,
+                    cells: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """For interior cells (indices into ``see[1:-1, 1:-1, 1:-1]``): how many open faces face the
+    eye (the rays a cell costs, at most 3), and whether one of them is in line of sight."""
     world_cells = cells + base[None, :] + 1
     ray_cell, ray_end, ray_last = [], [], []
-    for f, normal in enumerate(FACES):
+    for normal in FACES:
         nb = cells + 1 + normal[None, :]  # the neighbour's index in ``see``
         open_face = see[nb[:, 0], nb[:, 1], nb[:, 2]]
         centre = world_cells + 0.5 + 0.5 * normal[None, :]
@@ -315,9 +374,42 @@ def _cells_in_sight(see: np.ndarray, base: np.ndarray, eye: np.ndarray, cells: n
         ray_last.append(world_cells[use] + normal[None, :])
     which = np.concatenate(ray_cell)
     ok = trace_rays(see, base, eye, np.concatenate(ray_end), np.concatenate(ray_last))
+    n_rays = np.bincount(which, minlength=len(cells))
     visible = np.zeros(len(cells), bool)
     visible[which[ok]] = True
-    return visible
+    return n_rays, visible
+
+
+class SightingCache:
+    """Reuses an agent's last ``Sightings`` while its eye is exactly where it was and no block in
+    the box ``sightings`` reads has changed (``World.changes_since``); the output is the same as a
+    fresh call, with the new tick. Keep one per agent."""
+
+    def __init__(self) -> None:
+        self._key: tuple | None = None
+        self._cursor = 0
+        self._result: Sightings | None = None
+        self.hits = 0
+
+    def get(self, world: World, eye: Sequence[float], tick: int, **options) -> Sightings:
+        eye_t = (float(eye[0]), float(eye[1]), float(eye[2]))
+        key = (id(world), world.generation, eye_t, tuple(sorted(options.items())))
+        if key == self._key and self._result is not None and self._unchanged(world, eye_t, options):
+            self._cursor = world.change_count
+            self.hits += 1
+            return replace(self._result, tick=tick)
+        self._result = sightings(world, eye_t, tick, **options)
+        self._key, self._cursor = key, world.change_count
+        return self._result
+
+    def _unchanged(self, world: World, eye: tuple[float, float, float], options: dict) -> bool:
+        try:
+            changes = world.changes_since(self._cursor)
+        except ValueError:  # the log was trimmed past our cursor
+            return False
+        base, top = _sight_box(np.asarray(eye), options.get("sight_range", SIGHT_RANGE))
+        return not any(base[0] <= c.x < top[0] and base[1] <= c.y < top[1] and base[2] <= c.z < top[2]
+                       for c in changes)
 
 
 # ---------------------------------------------------------------------------
@@ -353,11 +445,16 @@ class Perception:
 
 
 def perceive(world: World, feet: Sequence[float], tick: int | None = None, *, xray: bool = False,
-             schedule: RaySchedule | None = RaySchedule(), sight_range: float = SIGHT_RANGE) -> Perception:
-    """Window and (on scheduled ticks, or always with ``schedule=None``) resource sightings."""
+             schedule: RaySchedule | None = RaySchedule(), sight_range: float = SIGHT_RANGE,
+             cache: SightingCache | None = None) -> Perception:
+    """Window and (on scheduled ticks, or always with ``schedule=None``) resource sightings,
+    through ``cache`` when one is given."""
     tick = world.tick if tick is None else tick
     eye = eye_of(feet)
     due = schedule is None or schedule.due(tick)
-    seen = sightings(world, eye, tick, xray=xray, sight_range=sight_range) if due else None
+    seen = None
+    if due:
+        seen = (cache.get(world, eye, tick, xray=xray, sight_range=sight_range) if cache is not None
+                else sightings(world, eye, tick, xray=xray, sight_range=sight_range))
     return Perception(tick, (float(feet[0]), float(feet[1]), float(feet[2])), eye, voxel_window(world, feet), seen,
                       xray)

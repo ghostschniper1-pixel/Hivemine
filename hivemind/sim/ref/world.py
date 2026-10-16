@@ -11,31 +11,45 @@ DESIGN.md 4.4 (world model), 4.2 (what is exact) and 4.5 (tick model). Usage::
     world.ticking_chunks()                      # bool[chunks_x, chunks_z]
 
 **Voxels.** One byte per cell holding a block-class id (contracts 3): ``blocks[x, y - MIN_Y, z]``
-for x in [0, size_x), y in [-64, 191] (256 levels, DESIGN.md 4.4 D3), z in [0, size_z). Every cell
-outside that box reads as ``barrier`` (hardness -1, unbreakable): the world edge, matching the
-barrier walls of the real-game evaluation areas (DESIGN.md 11.3). The class flags (solid,
-transparent, liquid, hazard, collision height, climbable, gravity, replaceable, light) come from
-``load_concepts()`` and are shared by perception and the nav grid.
+for x in [0, size_x), y in [-64, 191] (256 levels, DESIGN.md 4.4 D3), z in [0, size_z). Cells
+beside the box (x or z outside) and below it read as ``barrier`` (hardness -1, unbreakable): the
+world edge, matching the barrier walls of the real-game evaluation areas (DESIGN.md 11.3). Cells
+above it (y > 191, inside x and z) read as air: start areas keep their terrain at or below y 191
+(DESIGN.md 4.4) and the game has air above, up to y 319; nothing can be placed there. The class
+flags (solid, transparent, liquid, hazard, collision height, climbable, gravity, replaceable,
+light) come from ``load_concepts()`` and are shared by perception and the nav grid.
 
 **Change tracking.** ``set`` appends a ``BlockChange`` to a log. Consumers (nav caches,
 perception caches, the viewer) keep a cursor: ``changes = world.changes_since(cursor)``, then
 ``cursor = world.change_count``. ``load`` (bulk replace, used by worldgen and resets) clears the
 log and bumps ``generation`` so consumers know to rebuild.
 
-**Light** (DESIGN.md 4.2: approximate). Block light is a 4-bit BFS from light-emitting classes:
-a cell's light is max(own emission, brightest transparent-path neighbour - 1), and light passes
-only through transparent classes (air, glass, leaves, water, ...). Water and leaves dim light by
-1 per block like air [mem: in the game they dim sky light more]. Sky light comes from a heightmap
-of the highest non-transparent cell per column: 15 above it, 0 at or below it (no sideways spread
-under overhangs; the real game spreads it [mem]). The day-night level of sky light is
-``mechanics.surface_sky_light``; the arrays here hold the raw value. ``set`` relights only the box
-of cells within 15 of the change (a change cannot alter light farther away), which gives exactly
-the result of a full recomputation (tested).
+**Light** (DESIGN.md 4.2: approximate) uses each class's *light filter*: minecraft-data's
+``filter_light`` of its members (``light_filter_table``), the game's own light data. It is 0 for
+air, glass, torches, plants, snow layers, slabs, stairs, fences, carpets, chests, farmland and dirt
+paths; 1 for water, lava, leaves, ice and cobwebs; 15 for full blocks and tinted glass. The
+rendering flag ``transparent`` is not used for light (perception uses it for sight): a snow
+layer is not transparent but lets all light through. Fallback classes whose members differ take
+the filter of most of their states.
+
+- Block light is a 4-bit flood from light-emitting classes: light entering a cell with filter
+  f < 15 loses max(1, f) levels, and filter-15 cells stop it (the light engine's
+  ``level - max(1, lightBlock)`` [mem]); so water and leaves pass block light like air.
+- Sky light falls straight down each column: a cell has 15 minus the filters of every cell from
+  the top of the world down to and including it, and 0 at or below the column's highest filter-15
+  cell (the heightmap). Water and leaves thus dim it by 1 per block [mem]. There is no sideways
+  spread under overhangs (the real game spreads it [mem]).
+- Blocks the game occludes by shape (a bottom slab's floor face) pass light like air here [mem].
+
+The day-night level of sky light is ``mechanics.surface_sky_light``; the arrays here hold the raw
+value. ``set`` relights only the box of cells within 15 of the change (a change cannot alter light
+farther away), which gives exactly the result of a full recomputation (tested).
 
 **Entities** live in fixed slot tables with in-use flags (DESIGN.md 4.4; Craftax caps entity
-counts the same way [40]): agents <= 40, mobs <= 32, dropped items <= 64, furnaces <= 16, chests
-<= 16. Each table is a structure of arrays; the modules that own a kind (mobs, inventory,
-actions) may add fields with ``SlotTable.add_field``.
+counts the same way [40]): agents <= 40, mobs <= 32, dropped items <= 64, furnaces <= 16, and
+chests <= 8 per agent slot (320; contracts 4.3: ``my chest 1``-``8``). Each table is a structure
+of arrays; the modules that own a kind (mobs, inventory, actions) may add fields with
+``SlotTable.add_field``.
 
 **Clock.** ``tick`` counts game ticks since the episode began; ``day_time`` is the game's day
 time (``/time query daytime`` [mem]), which the night skip can move forward without ticking.
@@ -47,7 +61,9 @@ server, DESIGN.md 11.2), the 16x16 chunk column (cx, cz) ticks when
 of (2d + 1)^2 = 441 chunks, +-160 blocks around the agent's chunk [72]. The Chebyshev square
 comes from 1.18+ chunk-ticket propagation, which spreads to all 8 neighbours [mem]; whether the
 outermost ring also ticks entities is checked by the harness's chunk-ticking report in M2
-(DESIGN.md 11.3). A chunk index is ``floor(x / 16)``; the world's chunks start at x = z = 0.
+(DESIGN.md 11.3). Every agent slot in use holds a ticket, dead or alive: a dead player stays in
+the level, at the place it died, until it respawns [mem]; the M2 report checks this too. A chunk
+index is ``floor(x / 16)``; the world's chunks start at x = z = 0.
 """
 
 from __future__ import annotations
@@ -55,11 +71,12 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from hivemind.rules import load_concepts
+from hivemind.rules import load_concepts, load_rules
 from hivemind.sim.ref.mechanics import time_of_day
 
 if TYPE_CHECKING:
@@ -75,8 +92,10 @@ DEFAULT_SIZE = 128  # DESIGN.md 4.4: a 128 x 128 single-agent world
 AIR = 0  # contracts 3: class 0 is air
 BURIED = 255  # contracts 3: class 255 is "buried" (perception only, never stored in a world)
 
-# Fixed entity slot capacities (DESIGN.md 4.4; chests: 16 per world for now, the task's cap).
-ENTITY_CAPACITY: dict[str, int] = {"agents": 40, "mobs": 32, "items": 64, "furnaces": 16, "chests": 16}
+CHESTS_PER_AGENT = 8  # DESIGN.md 4.4: from M9 chests <= 8 per agent (contracts 4.3: my chest 1-8)
+# Fixed entity slot capacities (DESIGN.md 4.4); chests scale with the agent slots.
+ENTITY_CAPACITY: dict[str, int] = {"agents": 40, "mobs": 32, "items": 64, "furnaces": 16,
+                                   "chests": CHESTS_PER_AGENT * 40}
 CHEST_SLOTS = 27  # [mem] a single chest holds 27 stacks
 
 
@@ -180,6 +199,27 @@ def _entity_tables(capacity: Mapping[str, int]) -> dict[str, SlotTable]:
     return {kind: SlotTable(kind, capacity[kind], specs[kind]) for kind in specs}
 
 
+@lru_cache(maxsize=8)
+def light_filter_table(concepts: Concepts) -> np.ndarray:
+    """uint8[256]: each block class's light filter, minecraft-data's ``filter_light`` (0..15) of
+    most of its block states (ties: the lowest state id). Curated classes are uniform; 17 fallback
+    classes mix 0 with 1 or 15. Ids that are not block classes get 15."""
+    rules = load_rules()
+    votes: dict[int, dict[int, int]] = {}
+    first: dict[tuple[int, int], int] = {}
+    for b in rules.blocks.values():
+        for state in range(b.min_state, b.max_state + 1):
+            cls = int(concepts.state_class[state])
+            votes.setdefault(cls, {})
+            votes[cls][b.filter_light] = votes[cls].get(b.filter_light, 0) + 1
+            first.setdefault((cls, b.filter_light), state)
+    table = np.full(BURIED + 1, MAX_LIGHT, np.uint8)
+    for cls, counts in votes.items():
+        table[cls] = max(counts, key=lambda f: (counts[f], -first[(cls, f)]))
+    table.setflags(write=False)
+    return table
+
+
 @dataclass(frozen=True)
 class BlockChange:
     """One tracked ``set``: position, old and new class, and the world tick."""
@@ -204,7 +244,8 @@ class World:
         self.size_x, self.size_z = int(size_x), int(size_z)
         self.barrier = c.block_class("barrier").id
         # Class property tables (indexed by class id), shared with perception and nav.
-        self.transparent: np.ndarray = c.transparent
+        self.transparent: np.ndarray = c.transparent  # rendering flag (sight), not used for light
+        self.light_filter: np.ndarray = light_filter_table(c)
         self.emission: np.ndarray = c.light
         self.blocks = np.zeros((self.size_x, HEIGHT, self.size_z), np.uint8)
         self.block_light = np.zeros_like(self.blocks)
@@ -216,6 +257,8 @@ class World:
         self._log_offset = 0
         cap = dict(ENTITY_CAPACITY)
         cap.update(entity_capacity or {})
+        if "chests" not in (entity_capacity or {}):
+            cap["chests"] = CHESTS_PER_AGENT * cap["agents"]
         tables = _entity_tables(cap)
         self.agents: SlotTable = tables["agents"]
         self.mobs: SlotTable = tables["mobs"]
@@ -247,9 +290,12 @@ class World:
     # -- voxels -----------------------------------------------------------------------
 
     def get(self, x: int, y: int, z: int) -> int:
-        """The block class at a cell; ``barrier`` outside the world."""
-        if 0 <= x < self.size_x and MIN_Y <= y <= MAX_Y and 0 <= z < self.size_z:
-            return int(self.blocks[x, y - MIN_Y, z])
+        """The block class at a cell; ``barrier`` beside and below the world, air above it."""
+        if 0 <= x < self.size_x and 0 <= z < self.size_z:
+            if MIN_Y <= y <= MAX_Y:
+                return int(self.blocks[x, y - MIN_Y, z])
+            if y > MAX_Y:
+                return AIR
         return self.barrier
 
     def set(self, x: int, y: int, z: int, cls: int) -> int:
@@ -264,22 +310,26 @@ class World:
         self.blocks[x, y - MIN_Y, z] = cls
         self._log.append(BlockChange(x, y, z, old, int(cls), self.tick))
         self._update_heightmap(x, y, z, cls)
-        if self.emission[old] != self.emission[cls] or self.transparent[old] != self.transparent[cls]:
+        if self.emission[old] != self.emission[cls] or self.light_filter[old] != self.light_filter[cls]:
             self._relight_box(x - MAX_LIGHT, y - MAX_LIGHT, z - MAX_LIGHT,
                               x + MAX_LIGHT + 1, y + MAX_LIGHT + 1, z + MAX_LIGHT + 1)
         return old
 
     def region(self, x0: int, y0: int, z0: int, x1: int, y1: int, z1: int, *, light: bool = False) -> np.ndarray:
         """Classes of the half-open box [x0, x1) x [y0, y1) x [z0, z1), indexed [x, y - y0, z],
-        with ``barrier`` outside the world (or block light 0 with ``light=True``)."""
+        read as ``get`` does (barrier beside and below the world, air above it), or block light
+        (0 outside the world) with ``light=True``."""
         src = self.block_light if light else self.blocks
         out = np.full((x1 - x0, y1 - y0, z1 - z0), 0 if light else self.barrier, np.uint8)
         ax0, ax1 = max(x0, 0), min(x1, self.size_x)
         ay0, ay1 = max(y0, MIN_Y), min(y1, MAX_Y + 1)
         az0, az1 = max(z0, 0), min(z1, self.size_z)
-        if ax0 < ax1 and ay0 < ay1 and az0 < az1:
-            out[ax0 - x0:ax1 - x0, ay0 - y0:ay1 - y0, az0 - z0:az1 - z0] = \
-                src[ax0:ax1, ay0 - MIN_Y:ay1 - MIN_Y, az0:az1]
+        if ax0 < ax1 and az0 < az1:
+            if ay0 < ay1:
+                out[ax0 - x0:ax1 - x0, ay0 - y0:ay1 - y0, az0 - z0:az1 - z0] = \
+                    src[ax0:ax1, ay0 - MIN_Y:ay1 - MIN_Y, az0:az1]
+            if not light and y1 > MAX_Y + 1:
+                out[ax0 - x0:ax1 - x0, max(MAX_Y + 1, y0) - y0:, az0 - z0:az1 - z0] = AIR
         return out
 
     def load(self, blocks: np.ndarray) -> None:
@@ -319,37 +369,52 @@ class World:
 
     # -- heightmap and sky light ----------------------------------------------------------
 
+    def _blocks_sky(self, cls: np.ndarray | int) -> np.ndarray | bool:
+        return self.light_filter[cls] >= MAX_LIGHT
+
     def recompute_heightmap(self) -> None:
-        """Highest non-transparent cell per column (MIN_Y - 1 when the column is all transparent)."""
-        opaque = ~self.transparent[self.blocks]
+        """Highest cell per column whose light filter is 15 (MIN_Y - 1 when there is none)."""
+        opaque = self._blocks_sky(self.blocks)
         any_opaque = opaque.any(axis=1)
         top = HEIGHT - 1 - np.argmax(opaque[:, ::-1, :], axis=1)
         self.heightmap = np.where(any_opaque, top + MIN_Y, MIN_Y - 1).astype(np.int16)
 
     def _update_heightmap(self, x: int, y: int, z: int, cls: int) -> None:
         h = int(self.heightmap[x, z])
-        if not self.transparent[cls]:
+        if self._blocks_sky(cls):
             if y > h:
                 self.heightmap[x, z] = y
         elif y == h:
-            column = ~self.transparent[self.blocks[x, :y - MIN_Y, z]]
-            below = np.flatnonzero(column)
+            below = np.flatnonzero(self._blocks_sky(self.blocks[x, :y - MIN_Y, z]))
             self.heightmap[x, z] = (below[-1] + MIN_Y) if below.size else MIN_Y - 1
 
     def sky_light(self, x: int, y: int, z: int) -> int:
-        """Raw sky light: 15 above the column's highest non-transparent cell, else 0."""
-        if not (0 <= x < self.size_x and 0 <= z < self.size_z):
+        """Raw sky light (module docstring): 15 minus the light filters of the column's cells from
+        the top down to this one; 0 at or below the heightmap and outside the world's sides."""
+        if not (0 <= x < self.size_x and 0 <= z < self.size_z) or y < MIN_Y:
             return 0
-        return MAX_LIGHT if y > self.heightmap[x, z] else 0
+        if y > MAX_Y:
+            return MAX_LIGHT
+        if y <= self.heightmap[x, z]:
+            return 0
+        dim = int(self.light_filter[self.blocks[x, y - MIN_Y:, z]].sum(dtype=np.int64))
+        return max(MAX_LIGHT - dim, 0)
 
     def sky_light_region(self, x0: int, y0: int, z0: int, x1: int, y1: int, z1: int) -> np.ndarray:
-        """``sky_light`` over a half-open box, indexed like ``region`` (0 outside the world)."""
-        hm = np.full((x1 - x0, z1 - z0), MAX_Y + 1, np.int32)  # outside: never lit
+        """``sky_light`` over a half-open box, indexed like ``region``."""
+        out = np.zeros((x1 - x0, y1 - y0, z1 - z0), np.uint8)
         ax0, ax1, az0, az1 = max(x0, 0), min(x1, self.size_x), max(z0, 0), min(z1, self.size_z)
-        if ax0 < ax1 and az0 < az1:
-            hm[ax0 - x0:ax1 - x0, az0 - z0:az1 - z0] = self.heightmap[ax0:ax1, az0:az1]
-        ys = np.arange(y0, y1)[None, :, None]
-        return np.where(ys > hm[:, None, :], MAX_LIGHT, 0).astype(np.uint8)
+        if ax0 >= ax1 or az0 >= az1:
+            return out
+        xs, zs = slice(ax0 - x0, ax1 - x0), slice(az0 - z0, az1 - z0)
+        lo, hi = max(y0, MIN_Y), min(y1, MAX_Y + 1)
+        if lo < hi:
+            f = self.light_filter[self.blocks[ax0:ax1, lo - MIN_Y:, az0:az1]].astype(np.int32)
+            dim = np.cumsum(f[:, ::-1, :], axis=1)[:, ::-1, :]  # filters from the top down to each cell
+            out[xs, lo - y0:hi - y0, zs] = np.clip(MAX_LIGHT - dim[:, :hi - lo, :], 0, MAX_LIGHT)
+        if y1 > MAX_Y + 1:
+            out[xs, max(MAX_Y + 1, y0) - y0:, zs] = MAX_LIGHT
+        return out
 
     # -- block light -------------------------------------------------------------------------
 
@@ -389,7 +454,8 @@ class World:
         inner[x0 - px0:x1 - px0, i0 - pi0:i1 - pi0, z0 - pz0:z1 - pz0] = True
         lit = np.where(inner, self.emission[cls], self.block_light[px0:px1, pi0:pi1, pz0:pz1]).astype(np.int16)
         if lit.max() > 0:  # no source and no light at the boundary: the box is dark
-            lit = propagate_light(lit, inner & self.transparent[cls])
+            f = self.light_filter[cls]
+            lit = propagate_light(lit, inner & (f < MAX_LIGHT), np.maximum(f, 1))
         self.block_light[x0:x1, i0:i1, z0:z1] = lit[x0 - px0:x1 - px0, i0 - pi0:i1 - pi0, z0 - pz0:z1 - pz0]
 
     # -- clock --------------------------------------------------------------------------------
@@ -413,16 +479,18 @@ class World:
         """The chunk column containing a position (``floor(x / 16)``)."""
         return math.floor(x) // CHUNK_SIZE, math.floor(z) // CHUNK_SIZE
 
-    def agent_positions(self) -> np.ndarray:
-        """Positions (n, 3) of the agents in use and alive."""
+    def agent_positions(self, alive_only: bool = False) -> np.ndarray:
+        """Positions (n, 3) of the agent slots in use (only the live ones with ``alive_only``).
+        A dead agent keeps its chunks ticking until it respawns (module docstring, [mem])."""
         idx = self.agents.active()
-        idx = idx[self.agents.alive[idx]]
+        if alive_only:
+            idx = idx[self.agents.alive[idx]]
         return self.agents.pos[idx]
 
     def ticking_chunks(self, positions: Iterable[Sequence[float]] | np.ndarray | None = None,
                        distance: int = SIMULATION_DISTANCE) -> np.ndarray:
         """bool[chunks_x, chunks_z]: which of the world's chunk columns tick (``ticking_chunks``),
-        for the given (x, y, z) or (x, z) positions, by default the live agents'."""
+        for the given (x, y, z) or (x, z) positions, by default every agent slot in use."""
         pts = self.agent_positions() if positions is None else positions
         return ticking_chunks(self.chunks_x, self.chunks_z, pts, distance)
 
@@ -470,14 +538,16 @@ def ticking_chunks(chunks_x: int, chunks_z: int, positions: Iterable[Sequence[fl
     return mask
 
 
-def propagate_light(lit: np.ndarray, update: np.ndarray) -> np.ndarray:
-    """Spread light: repeat ``lit = max(lit, neighbour - 1)`` on ``update`` cells until stable.
+def propagate_light(lit: np.ndarray, update: np.ndarray, cost: np.ndarray | int = 1) -> np.ndarray:
+    """Spread light: repeat ``lit = max(lit, neighbour - cost)`` on ``update`` cells until stable.
 
-    ``lit`` holds each cell's fixed value (emission, or the boundary light); after at most 14
-    rounds (light 15 reaches 14 cells) every update cell holds the brightest path value, which is
-    what a breadth-first flood gives.
+    ``lit`` holds each cell's fixed value (emission, or the boundary light); ``cost`` is the
+    loss on entering each cell (>= 1: max(1, light filter)). After at most 14 rounds (light 15
+    crosses at most 14 cells) every update cell holds the brightest path value, which is what a
+    breadth-first flood gives.
     """
     lit = lit.astype(np.int16)
+    cost = np.asarray(cost, np.int16)
     for _ in range(MAX_LIGHT):
         nb = np.zeros_like(lit)
         np.maximum(nb[1:], lit[:-1], out=nb[1:])
@@ -486,7 +556,7 @@ def propagate_light(lit: np.ndarray, update: np.ndarray) -> np.ndarray:
         np.maximum(nb[:, :-1], lit[:, 1:], out=nb[:, :-1])
         np.maximum(nb[:, :, 1:], lit[:, :, :-1], out=nb[:, :, 1:])
         np.maximum(nb[:, :, :-1], lit[:, :, 1:], out=nb[:, :, :-1])
-        new = np.where(update, np.maximum(lit, nb - 1), lit)
+        new = np.where(update, np.maximum(lit, nb - cost), lit)
         if np.array_equal(new, lit):
             break
         lit = new
@@ -494,7 +564,8 @@ def propagate_light(lit: np.ndarray, update: np.ndarray) -> np.ndarray:
 
 
 def flood_light_reference(world: World) -> np.ndarray:
-    """Block light by a plain breadth-first flood from every source (slow; for tests)."""
+    """Block light by a plain flood from every source (slow; for tests): light entering a cell
+    with filter f < 15 loses max(1, f)."""
     from collections import deque
 
     out = np.zeros_like(world.blocks)
@@ -505,13 +576,14 @@ def flood_light_reference(world: World) -> np.ndarray:
     sx, sy, sz = out.shape
     while queue:
         x, i, z = queue.popleft()
-        v = int(out[x, i, z]) - 1
-        if v <= 0:
-            continue
+        level = int(out[x, i, z])
         for dx, di, dz in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)):
             nx, ni, nz = x + dx, i + di, z + dz
-            if 0 <= nx < sx and 0 <= ni < sy and 0 <= nz < sz and world.transparent[world.blocks[nx, ni, nz]] \
-                    and out[nx, ni, nz] < v:
+            if not (0 <= nx < sx and 0 <= ni < sy and 0 <= nz < sz):
+                continue
+            f = int(world.light_filter[world.blocks[nx, ni, nz]])
+            v = level - max(1, f)
+            if f < MAX_LIGHT and v > 0 and out[nx, ni, nz] < v:
                 out[nx, ni, nz] = v
                 queue.append((nx, ni, nz))
     return out

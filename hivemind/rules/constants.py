@@ -45,11 +45,12 @@ GAME: dict[str, Const] = {
     # Mining Fatigue I-IV multiply the speed by this table (Player.getDestroySpeed switches on the
     # amplifier; prismarine-block 1.23.0 has the same table). DESIGN 4.3. Irrelevant in v1.
     "break_mining_fatigue_table": Const((0.3, 0.09, 0.0027, 0.00081), "[mem]"),  # [mem]
-    # Draft 0.3's formula only, speed *= 0.3^min(fatigue, 4) as quoted from [13] (DESIGN 4.3). Not
-    # the game's rule: it is 10x too large at levels 3-4. Kept for comparison
-    # (mechanics.mining_fatigue_multiplier(design_formula=True)); the simulator uses the table above.
-    "break_mining_fatigue_base": Const(0.3, "[13]"),  # [13] draft-0.3 formula only
-    "break_mining_fatigue_max_level": Const(4, "[13]"),  # [13] draft-0.3 formula only
+    # NOT the game's rule: design draft 0.3's fatigue formula, speed *= 0.3^min(fatigue, 4), as
+    # quoted from [13] (DESIGN 4.3). It is 10x too large at levels 3-4. The names start with
+    # "draft03_" so that no reader of the rules file (which has no comments) takes it for game
+    # data; only mechanics.mining_fatigue_multiplier(design_formula=True) reads it, for comparison.
+    "draft03_mining_fatigue_base": Const(0.3, "[13]"),  # [13] draft-0.3 formula only
+    "draft03_mining_fatigue_max_level": Const(4, "[13]"),  # [13] draft-0.3 formula only
     "break_underwater_multiplier": Const(0.2, "[13]"),  # [13] without Aqua Affinity
     "break_airborne_multiplier": Const(0.2, "[13]"),  # [13] not on the ground: /5
     "break_server_accept_fraction": Const(0.7, "[mem]"),  # [mem] server accepts "finished" at 70%
@@ -95,9 +96,11 @@ GAME: dict[str, Const] = {
     "bed_monster_check_horizontal": Const(8.0, "[mem]"),  # [mem] no sleep with a monster within 8 blocks
     "bed_monster_check_vertical": Const(5.0, "[mem]"),  # [mem] ... and 5 blocks up or down
     "max_sky_light": Const(15, "[mem]"),  # [mem] sky light under open sky at noon; surface light = 15 - skyDarken
-    # [mem] Level.isDay() is skyDarken < 4, so beds work only at skyDarken >= 4 (with [15]'s
-    # 12542..23459 in clear weather, checked by tests/test_mechanics.py)
-    "sky_darken_night_min": Const(4, "[mem]"),  # [mem]
+    # [mem] Level.isDay() is skyDarken < 4, so from skyDarken 4 up it is no longer "day" in the
+    # game's sense: beds work only then ([15]'s 12542..23459 in clear weather, checked by
+    # tests/test_mechanics.py). This is not [15]'s night (night_start_tick..night_end_tick,
+    # 13000..22999), which starts 458 ticks later and ends 460 ticks earlier.
+    "sky_darken_not_day_min": Const(4, "[mem]"),  # [mem]
     # Combat [18] (DESIGN 4.3)
     "player_base_attack_damage": Const(1.0, "[18]"),  # [18] fist
     "player_base_attack_speed": Const(4.0, "[mem]"),  # [mem] attacks per second without an item

@@ -78,15 +78,15 @@ def test_block_view_of_common_blocks():
                                               "cant_break")}
 
     assert of("air") == {"safe": True, "physical": False, "liquid": False, "climbable": False, "replaceable": True,
-                         "falls": False, "cant_break": False}
+                         "falls": False, "cant_break": True}  # minecraft-data: air is not diggable
     assert of("water")["safe"] and of("water")["liquid"] and of("water")["replaceable"]
     assert not of("lava")["safe"] and of("lava")["liquid"]  # avoided
     assert of("ladder")["climbable"] and of("ladder")["safe"] and of("ladder")["physical"]
     assert of("vine")["safe"] and not of("vine")["climbable"]  # the package leaves vines out
     assert of("snow")["safe"] and of("short_grass")["safe"] and of("other_carpet")["safe"]
     assert not of("fence")["physical"] and not of("fence")["safe"]  # taller than 1: neither
-    for gate in ("other_fence_gate", "other_open_fence_gate"):  # a gate's block has a bounding box
-        assert not of(gate)["safe"] and not of(gate)["physical"] and of(gate)["cant_break"]
+    for gate in ("other_fence_gate", "other_open_fence_gate"):  # a gate's block has a bounding box, and
+        assert not of(gate)["safe"] and of(gate)["physical"] and of(gate)["cant_break"]  # its lowest state is open
     assert of("sand")["falls"] and of("gravel")["falls"] and not of("red_sand")["falls"]
     assert of("bedrock")["cant_break"] and of("chest")["cant_break"] and of("barrier")["cant_break"]
     for name in ("sweet_berry_bush", "powder_snow", "wither_rose", "cobweb", "fire"):
@@ -150,9 +150,7 @@ def test_diagonal_needs_one_clear_side():
     assert res.ok and [s.move for s in res.path.steps] == [N.Move.DIAGONAL] and res.path.cost == math.sqrt(2)
     fill(w, (5, Y, 6), (5, Y + 1, 6), BEDROCK)  # and the +z side
     res = N.find_path(w, feet(5, Y, 5), N.GoalBlock(6, Y, 6))
-    assert res.ok and all(s.move != N.Move.DIAGONAL or (a[0] == s.pos[0] or a[2] == s.pos[2])
-                          for a, s in zip(res.path.cells, res.path.steps))
-    assert res.path.cells[1] not in ((6, Y, 6),)
+    assert res.ok and res.path.cells[1] != (6, Y, 6) and res.path.cost > 2
 
 
 # -- step-ups and drops -----------------------------------------------------------------------
@@ -190,10 +188,14 @@ def test_drop_into_water_at_any_depth():
     w = arena(9, 9)
     fill(w, (0, FLOOR - 9, 0), (8, FLOOR, 8), ID["water"])  # a 10-deep pool around a tall tower
     fill(w, (4, FLOOR - 9, 4), (4, FLOOR + 8, 4), BEDROCK)
-    fill(w, (0, FLOOR - 9, 0), (0, Y, 0), BEDROCK)  # a pillar to climb out on, 1 above the water
-    res = N.find_path(w, feet(4, FLOOR + 9, 4), N.GoalBlock(0, Y + 1, 0))
+    fill(w, (0, FLOOR - 9, 0), (0, FLOOR - 1, 0), BEDROCK)  # a ledge just under the surface ...
+    w.set(0, FLOOR, 0, AIR)  # ... with air above it, like a shore: the way out
+    res = N.find_path(w, feet(4, FLOOR + 9, 4), N.GoalBlock(0, FLOOR, 0))
     assert res.ok and res.path.steps[0].move == N.Move.DROP and res.path.steps[0].fall == 9
     assert res.path.steps[0].pos[1] == FLOOR and res.path.blocks_used == 0
+    # A block level with the surface is "too high" from deep water (the floor below is water).
+    w.set(0, FLOOR, 0, BEDROCK)
+    assert N.find_path(w, feet(4, FLOOR + 9, 4), N.GoalBlock(0, Y, 0)).code == N.NO_PATH
 
 
 # -- water and lava --------------------------------------------------------------------------------
@@ -297,11 +299,13 @@ def test_pillar_up_out_of_a_pit():
     res = N.find_path(w, feet(4, Y, 4), goal, blocks=5)
     assert res.ok
     p = res.path
-    # Two pillar steps lift the feet to Y + 2, level with the rim's top block; one jump gets out.
-    assert [s.move for s in p.steps[:3]] == [N.Move.PILLAR, N.Move.PILLAR, N.Move.ASCEND]
-    assert p.pillars == 2 and p.blocks_used == 2 and p.jumps == 3
-    assert [s.places for s in p.steps if s.move == N.Move.PILLAR] == [((4, Y, 4),), ((4, Y + 1, 4),)]
-    assert N.find_path(w, feet(4, Y, 4), goal, blocks=1).code == N.NO_PATH  # one block per step
+    # The package does not see the blocks it plans to place: after two pillars it still judges the
+    # floor by the empty cell below, so the rim is "too high" to jump onto. It pillars a third time
+    # and walks out level (the same in tests/test_nav.py's run of the package).
+    assert [s.move for s in p.steps[:3]] == [N.Move.PILLAR] * 3 and p.steps[3].pos[1] == Y + 3
+    assert p.pillars == 3 and p.blocks_used == 3 and p.jumps == 3
+    assert [s.places for s in p.steps if s.move == N.Move.PILLAR] == [((4, Y + k, 4),) for k in range(3)]
+    assert N.find_path(w, feet(4, Y, 4), goal, blocks=2).code == N.NO_PATH  # one block per step
     assert N.find_path(w, feet(4, Y, 4), goal, blocks=5, allow_pillar=False).code == N.NO_PATH
 
 

@@ -57,11 +57,33 @@ def test_constants_come_from_the_rules_file(rules: Rules, c: MechanicsConstants)
         (0.3, 0.09, 0.0027, 0.00081)
     assert c.invulnerability_reset_ticks == rules.constant("invulnerability_reset_ticks") == 20
     assert c.max_sky_light == rules.constant("max_sky_light") == 15
-    assert c.sky_darken_night_min == rules.constant("sky_darken_night_min") == 4
+    assert c.sky_darken_not_day_min == rules.constant("sky_darken_not_day_min") == 4
+    assert (c.draft03_mining_fatigue_base, c.draft03_mining_fatigue_max_level) == \
+        (rules.constant("draft03_mining_fatigue_base"), rules.constant("draft03_mining_fatigue_max_level")) == (0.3, 4)
 
 
 def test_mechanics_constants_have_no_code_defaults() -> None:
     assert all(f.default is MISSING and f.default_factory is MISSING for f in fields(MechanicsConstants))
+
+
+def test_old_constant_names_are_only_aliases(c: MechanicsConstants) -> None:
+    # Kept until mining_fatigue_multiplier and sky_is_dark read the new names; never fields.
+    names = {f.name for f in fields(MechanicsConstants)}
+    for old, new in [("break_mining_fatigue_base", "draft03_mining_fatigue_base"),
+                     ("break_mining_fatigue_max_level", "draft03_mining_fatigue_max_level"),
+                     ("sky_darken_night_min", "sky_darken_not_day_min")]:
+        assert old not in names and new in names
+        assert getattr(c, old) == getattr(c, new)
+
+
+def test_sky_darken_not_day_is_not_the_night_of_the_clock(c: MechanicsConstants) -> None:
+    # The rename's reason: the threshold is Level.isDay()'s (the bed window), which is 918 ticks a
+    # day longer than [15]'s night (night_start_tick..night_end_tick).
+    not_day = [t for t in range(24000) if m.sky_darken(t) >= c.sky_darken_not_day_min]
+    night = [t for t in range(24000) if m.is_night(t)]
+    assert (not_day[0], not_day[-1], len(not_day)) == (c.bed_use_start_tick, c.bed_use_end_tick - 1, 10918)
+    assert (night[0], night[-1], len(night)) == (c.night_start_tick, c.night_end_tick - 1, 10000)
+    assert set(night) < set(not_day) and len(set(not_day) - set(night)) == 918
 
 
 def _stub_rules(rules: Rules) -> tuple[dict, SimpleNamespace]:
@@ -78,7 +100,8 @@ def test_from_rules_takes_rules_values(rules: Rules) -> None:
 
 
 @pytest.mark.parametrize("name", ["smelt_ticks", "exhaustion_cap", "break_mining_fatigue_table",
-                                  "invulnerability_reset_ticks", "max_sky_light", "sky_darken_night_min"])
+                                  "invulnerability_reset_ticks", "max_sky_light", "sky_darken_not_day_min",
+                                  "draft03_mining_fatigue_base"])
 def test_from_rules_fails_loudly_on_a_missing_constant(rules: Rules, name: str) -> None:
     consts, stub = _stub_rules(rules)
     del consts[name]

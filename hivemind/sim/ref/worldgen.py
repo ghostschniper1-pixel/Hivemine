@@ -664,8 +664,9 @@ def generate(seed: int, config: WorldGenConfig | str = "default", *, concepts: C
 def standable_surface(world: World, x: int, z: int) -> int | None:
     """The feet y of a safe surface spot in column (x, z), or None.
 
-    Safe [est]: the column's top non-transparent block is solid, not a hazard, not a log (no
-    spawning on a tree), and the two cells above it are free of collision, liquid and hazards.
+    Safe [est]: the column's highest light-blocking block (``world.heightmap``: water, leaves,
+    plants and snow layers do not count) is solid, not a hazard, not a log (no spawning on a
+    tree), and the two cells above it are free of collision, liquid and hazards.
     """
     c = world.concepts
     y = int(world.heightmap[x, z])

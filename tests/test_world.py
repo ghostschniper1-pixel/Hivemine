@@ -7,6 +7,7 @@ import pytest
 
 from hivemind.rules import load_concepts
 from hivemind.sim.ref.world import (
+    CHESTS_PER_AGENT,
     ENTITY_CAPACITY,
     MAX_Y,
     MIN_Y,
@@ -15,6 +16,7 @@ from hivemind.sim.ref.world import (
     SlotsFull,
     World,
     flood_light_reference,
+    light_filter_table,
     ticking_chunks,
 )
 
@@ -26,6 +28,11 @@ LAVA = C.block_class("lava").id
 MAGMA = C.block_class("magma_block").id
 LEAVES = C.block_class("oak_leaves").id
 BARRIER = C.block_class("barrier").id
+WATER = C.block_class("water").id
+SNOW = C.block_class("snow").id  # one snow layer
+GRASS = C.block_class("grass_block").id
+TINTED = C.block_class("other_tinted_glass").id
+SLAB = C.block_class("other_slab").id
 
 
 def small_world() -> World:
@@ -51,10 +58,13 @@ def test_get_set_and_world_edge():
     assert w.get(3, 60, 3) == STONE and w.get(3, 61, 3) == 0
     assert w.set(3, 61, 3, GLASS) == 0
     assert w.get(3, 61, 3) == GLASS
-    for x, y, z in ((-1, 10, 0), (24, 10, 0), (0, 10, -1), (0, 10, 24), (0, MIN_Y - 1, 0), (0, MAX_Y + 1, 0)):
+    for x, y, z in ((-1, 10, 0), (24, 10, 0), (0, 10, -1), (0, 10, 24), (0, MIN_Y - 1, 0), (-1, MAX_Y + 1, 0)):
         assert w.get(x, y, z) == BARRIER
         with pytest.raises(IndexError):
             w.set(x, y, z, STONE)
+    assert w.get(0, MAX_Y + 1, 0) == 0 and w.get(23, 319, 23) == 0  # above the voxels: air, as in the game
+    with pytest.raises(IndexError):
+        w.set(0, MAX_Y + 1, 0, STONE)  # but nothing can be placed there
     assert C.hardness[BARRIER] < 0  # unbreakable
     with pytest.raises(ValueError):
         w.set(1, 1, 1, 255)  # "buried" is a perception class, never a voxel
@@ -66,6 +76,8 @@ def test_region_pads_with_barrier():
     assert r.shape == (5, 3, 5)
     assert (r[:2] == BARRIER).all() and (r[:, :, :2] == BARRIER).all()
     assert (r[2:, 0, 2:] == STONE).all() and (r[2:, 2, 2:] == 0).all()
+    top = w.region(-1, MAX_Y - 1, 0, 2, MAX_Y + 3, 2)  # rows 190..193
+    assert (top[0] == BARRIER).all() and (top[1:, 2:] == 0).all()
 
 
 def test_change_log_cursor_and_trim():
@@ -90,6 +102,16 @@ def test_change_log_cursor_and_trim():
 # -- heightmap and sky light ---------------------------------------------------------------
 
 
+def test_light_filters_come_from_the_game_data():
+    f = light_filter_table(C)
+    for name, value in (("air", 0), ("glass", 0), ("torch", 0), ("short_grass", 0), ("snow", 0),
+                        ("other_slab", 0), ("fence", 0), ("other_fence_gate", 0), ("chest", 0), ("farmland", 0),
+                        ("water", 1), ("lava", 1), ("oak_leaves", 1), ("ice", 1), ("cobweb", 1),
+                        ("stone", 15), ("dirt", 15), ("log", 15), ("other_tinted_glass", 15)):
+        assert f[C.block_class(name).id] == value, name
+    assert not C.transparent[SNOW] and not C.transparent[SLAB] and C.transparent[TINTED]  # not the sight flag
+
+
 def test_heightmap_and_sky_light():
     w = small_world()
     assert (w.heightmap == 60).all()
@@ -97,15 +119,60 @@ def test_heightmap_and_sky_light():
     w.set(5, 70, 5, STONE)  # a roof
     assert w.heightmap[5, 5] == 70
     assert w.sky_light(5, 65, 5) == 0 and w.sky_light(5, 71, 5) == 15
-    w.set(5, 70, 5, GLASS)  # transparent roof: sky light passes
+    w.set(5, 70, 5, GLASS)  # glass filters nothing: sky light passes
     assert w.heightmap[5, 5] == 60 and w.sky_light(5, 65, 5) == 15
-    w.set(5, 75, 5, LEAVES)  # leaves are transparent
+    w.set(5, 75, 5, LEAVES)  # leaves dim sky light by 1 per block
     assert w.heightmap[5, 5] == 60
-    w.set(5, 60, 5, 0)  # dig the top: the next opaque cell below
+    assert w.sky_light(5, 76, 5) == 15 and w.sky_light(5, 75, 5) == 14 and w.sky_light(5, 65, 5) == 14
+    w.set(5, 74, 5, LEAVES)
+    assert w.sky_light(5, 65, 5) == 13
+    w.set(5, 60, 5, 0)  # dig the top: the next light-blocking cell below
     assert w.heightmap[5, 5] == 59
     region = w.sky_light_region(4, 58, 4, 7, 62, 7)
-    assert region[1, :, 1].tolist() == [0, 0, 15, 15]  # y 58, 59 dark; 60, 61 lit
+    assert region[1, :, 1].tolist() == [0, 0, 13, 13]  # y 58, 59 dark; 60, 61 under two leaves
     assert region[0, :, 0].tolist() == [0, 0, 0, 15]
+    w.set(6, 80, 6, TINTED)  # tinted glass blocks light although it can be seen through
+    assert w.heightmap[6, 6] == 80 and w.sky_light(6, 79, 6) == 0
+
+
+def test_sky_light_region_equals_pointwise():
+    w = small_world()
+    for x, y, z, cls in ((3, 70, 3, LEAVES), (3, 66, 3, WATER), (4, 64, 4, STONE), (5, 61, 5, SNOW),
+                         (5, 62, 5, LEAVES), (6, 63, 6, TINTED)):
+        w.set(x, y, z, cls)
+    box = (-2, 55, -1, 9, MAX_Y + 3, 8)
+    region = w.sky_light_region(*box)
+    expected = np.array([[[w.sky_light(x, y, z) for z in range(box[2], box[5])] for y in range(box[1], box[4])]
+                         for x in range(box[0], box[3])])
+    assert np.array_equal(region, expected)
+    assert region[3, MAX_Y + 2 - box[1], 3] == 15 and region[0, 10, 3] == 0  # above: sky; beside: 0
+
+
+def test_snow_layer_lets_light_through():
+    """A snow layer is not transparent (sight) but filters no light: sky and torch light reach the
+    agent standing in it, and it does not raise the heightmap."""
+    w = World(16, 16)
+    b = w.blocks.copy()
+    b[:, : 64 - MIN_Y + 1, :] = GRASS
+    b[:, 65 - MIN_Y, :] = SNOW
+    w.load(b)
+    w.set(8, 65, 8, TORCH)
+    assert (w.heightmap == 64).all()
+    assert w.sky_light(9, 65, 8) == 15 and w.block_light_at(9, 65, 8) == 13 and w.light(9, 65, 8) == 15
+    assert w.block_light_at(12, 65, 8) == 10
+    w.set(8, 66, 8, SLAB)  # a slab above passes light too (shape occlusion is not modelled)
+    assert w.sky_light(8, 65, 8) == 15 and w.heightmap[8, 8] == 64
+
+
+def test_water_dims_sky_light_by_depth_and_passes_block_light():
+    w = small_world()
+    for x in range(4, 9):
+        for z in range(4, 9):
+            for y in (58, 59, 60):
+                w.set(x, y, z, WATER)  # a 3-deep pond
+    assert [w.sky_light(6, y, 6) for y in (61, 60, 59, 58, 57)] == [15, 14, 13, 12, 0]
+    w.set(3, 61, 6, TORCH)
+    assert w.block_light_at(5, 60, 6) == 14 - 3  # three steps, water costs 1 like air
 
 
 # -- block light ----------------------------------------------------------------------------
@@ -148,7 +215,7 @@ def test_incremental_light_equals_full_recompute_and_bfs():
     """Random edits: the incremental relight equals a full recomputation and a plain BFS."""
     w = small_world()
     cells = [(x, y, z) for x in range(2, 22, 3) for y in (58, 60, 61, 63) for z in range(2, 22, 4)]
-    choices = (0, STONE, GLASS, TORCH, LAVA, LEAVES, MAGMA)
+    choices = (0, STONE, GLASS, TORCH, LAVA, LEAVES, MAGMA, WATER, SNOW, TINTED, SLAB)
     for i, (x, y, z) in enumerate(cells):
         w.set(x, y, z, choices[(i * 7 + x + z) % len(choices)])
     for x, y, z in cells[::3]:
@@ -164,10 +231,13 @@ def test_incremental_light_equals_full_recompute_and_bfs():
 
 def test_entity_slot_capacities():
     w = World(16, 16)
-    assert ENTITY_CAPACITY == {"agents": 40, "mobs": 32, "items": 64, "furnaces": 16, "chests": 16}
+    assert CHESTS_PER_AGENT == 8  # DESIGN.md 4.4: my chest 1-8 per agent
+    assert ENTITY_CAPACITY == {"agents": 40, "mobs": 32, "items": 64, "furnaces": 16, "chests": 320}
     for kind, cap in ENTITY_CAPACITY.items():
         table = getattr(w, kind)
         assert table.capacity == cap and len(table) == 0 and table.in_use.shape == (cap,)
+    assert World(16, 16, entity_capacity={"agents": 4}).chests.capacity == 32  # scales with agents
+    assert World(16, 16, entity_capacity={"agents": 4, "chests": 5}).chests.capacity == 5
 
 
 def test_slot_alloc_free_and_fields():
@@ -189,7 +259,7 @@ def test_slot_alloc_free_and_fields():
         w.mobs.alloc()
     with pytest.raises(SlotsFull):
         w.mobs.alloc()
-    assert w.chests.slots.shape == (16, 27, 2)
+    assert w.chests.slots.shape == (320, 27, 2)
 
 
 def test_copy_is_deep():
@@ -241,11 +311,13 @@ def test_ticking_uses_floor_for_chunk_of_position():
     assert a[9].any() and not b[9].any() and b[30].any() and not a[30].any()
 
 
-def test_world_ticking_uses_live_agents():
+def test_world_ticking_uses_agent_slots_dead_or_alive():
     w = World(16 * 30, 16)
     assert not w.ticking_chunks().any()
     i = w.agents.alloc(pos=(5.0, 64.0, 5.0))
     assert w.ticking_chunks()[:11].all() and not w.ticking_chunks()[11:].any()
     assert w.is_ticking(10 * 16 + 1, 3) and not w.is_ticking(11 * 16 + 1, 3)
-    w.agents.alive[i] = False
+    w.agents.alive[i] = False  # a dead player stays in the level until it respawns [mem]
+    assert w.ticking_chunks()[:11].all() and len(w.agent_positions(alive_only=True)) == 0
+    w.agents.free(i)
     assert not w.ticking_chunks().any()

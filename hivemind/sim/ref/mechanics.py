@@ -63,8 +63,8 @@ class MechanicsConstants:
     break_delay_ticks: int
     break_haste_per_level: float
     break_mining_fatigue_table: tuple[float, ...]  # [mem] levels I-IV (a list in the rules file)
-    break_mining_fatigue_base: float  # [13] draft-0.3 formula only (design_formula=True)
-    break_mining_fatigue_max_level: int  # [13] draft-0.3 formula only
+    draft03_mining_fatigue_base: float  # [13] draft 0.3's formula, not the game's (design_formula=True)
+    draft03_mining_fatigue_max_level: int  # [13] draft 0.3's formula, not the game's
     break_underwater_multiplier: float
     break_airborne_multiplier: float
     break_server_accept_fraction: float
@@ -104,7 +104,7 @@ class MechanicsConstants:
     bed_use_end_tick: int
     hostile_spawn_max_sky_light: int
     max_sky_light: int
-    sky_darken_night_min: int
+    sky_darken_not_day_min: int  # [mem] not Level.isDay() (beds); not [15]'s night (night_*_tick)
     # Combat [18]
     player_base_attack_damage: float
     player_base_attack_speed: float
@@ -137,6 +137,23 @@ class MechanicsConstants:
             v = rules.constant(f.name)
             values[f.name] = tuple(v) if isinstance(v, list) else v
         return cls(**values)
+
+    # Old names of three renamed constants, read only by ``mining_fatigue_multiplier`` and
+    # ``sky_is_dark`` below. TEMPORARY: delete these once those two functions use the new names.
+    @property
+    def break_mining_fatigue_base(self) -> float:
+        """Old name of ``draft03_mining_fatigue_base`` (draft 0.3's formula, not the game's)."""
+        return self.draft03_mining_fatigue_base
+
+    @property
+    def break_mining_fatigue_max_level(self) -> int:
+        """Old name of ``draft03_mining_fatigue_max_level`` (draft 0.3's formula, not the game's)."""
+        return self.draft03_mining_fatigue_max_level
+
+    @property
+    def sky_darken_night_min(self) -> int:
+        """Old name of ``sky_darken_not_day_min`` (never [15]'s night)."""
+        return self.sky_darken_not_day_min
 
 
 _CONSTANTS: dict[str, MechanicsConstants] = {}
