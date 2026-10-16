@@ -181,8 +181,9 @@ PRESETS: dict[str, PerceptionConfig] = {
 DEFAULT_PRESET = "M"  # DESIGN.md 6.4: M is the default
 
 
-def preset(config: str | PerceptionConfig) -> PerceptionConfig:
-    return PRESETS[config] if isinstance(config, str) else config
+def config_of(preset: str | PerceptionConfig) -> PerceptionConfig:
+    """A preset by name ("S", "M"), or a config as given."""
+    return PRESETS[preset] if isinstance(preset, str) else preset
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +435,7 @@ class VoxelWindow(_ArrayEq):
 def voxel_window(world: World, feet: Sequence[float], config: str | PerceptionConfig = DEFAULT_PRESET, *,
                  xray: bool = False) -> VoxelWindow:
     """The window of a preset around the feet cell (module docstring); ``xray``: the ablation."""
-    cfg = preset(config)
+    cfg = config_of(config)
     fx, fy, fz = feet_cell(feet)
     x0, y0, z0 = fx - cfg.half_xz, fy - cfg.half_y, fz - cfg.half_xz
     sx, sy, sz = cfg.window_shape
@@ -465,7 +466,7 @@ class WindowCache:
 
     def get(self, world: World, feet: Sequence[float], config: str | PerceptionConfig = DEFAULT_PRESET, *,
             xray: bool = False) -> VoxelWindow:
-        cfg = preset(config)
+        cfg = config_of(config)
         feet_t = (float(feet[0]), float(feet[1]), float(feet[2]))
         key = (id(world), world.generation, feet_t, cfg, xray)
         if key == self._key and self._result is not None and self._unchanged(world, self._result, cfg):
@@ -736,6 +737,9 @@ def panorama(world: World, eye: Sequence[float], config: PanoramaConfig | None =
         hit_cell.astype(np.int32).reshape(*shape, 3), steps)
 
 
+_cast_panorama = panorama  # ``perceive`` has a flag of the same name
+
+
 # ---------------------------------------------------------------------------
 # Resource sightings
 # ---------------------------------------------------------------------------
@@ -885,7 +889,7 @@ def perceive(world: World, feet: Sequence[float], tick: int | None = None, *,
     the preset has one (pass False for in-macro recasts), and the sightings from both.
     ``agent``: the observer's slot, whose own box the panorama skips. ``xray``: the ablation
     (module docstring), flagged in every part of the result."""
-    cfg = globals()["preset"](preset)
+    cfg = config_of(preset)
     tick = world.tick if tick is None else tick
     feet_t = (float(feet[0]), float(feet[1]), float(feet[2]))
     eye = eye_of(feet_t)
@@ -893,7 +897,7 @@ def perceive(world: World, feet: Sequence[float], tick: int | None = None, *,
               else voxel_window(world, feet_t, cfg, xray=xray))
     pano = None
     if panorama and cfg.panorama is not None:
-        pano = globals()["panorama"](world, eye, cfg.panorama, exclude_agent=agent)
+        pano = _cast_panorama(world, eye, cfg.panorama, exclude_agent=agent)
     if xray:
         seen = xray_sightings(world, eye, tick, per_class=per_class)
     else:
