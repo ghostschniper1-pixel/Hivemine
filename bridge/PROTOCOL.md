@@ -2,10 +2,10 @@
 
 The wire protocol between the Python conductor and the Node hosts that run the Mineflayer bots (DESIGN.md 11.1, contracts section 7).
 
-**Status:** a specification for M2 (minimal bridge) and M7 (full bridge). Nothing implements it yet. Parts marked **provisional** are expected to change when the wrappers are written in M2; changes that only add optional fields keep protocol version 1 (section 4.3). Labels as in DESIGN.md: [n] a reference there, [mem] unverified memory, [est] an estimate. Facts marked *(checked)* were read from the pinned package sources (mineflayer 4.39.0, minecraft-protocol 1.68.0, mineflayer-pathfinder 2.4.5, @msgpack/msgpack 3.1.3) on 2026-10-16.
+**Status:** a specification for M2 (minimal bridge) and M7 (full bridge). Nothing implements it yet. Parts marked **provisional** are expected to change when the wrappers are written in M2; changes that only add optional fields keep protocol version 1 (section 4.3). Labels as in DESIGN.md: [n] a reference there, [mem] unverified memory, [est] an estimate. Facts marked *(checked)* were read from the pinned package sources (mineflayer 4.39.0, minecraft-protocol 1.68.0, prismarine-registry 1.12.0, mineflayer-pathfinder 2.4.5, @msgpack/msgpack 3.1.3, installed with `npm ci` from `package-lock.json`) or the pinned mcmeta 1.21.1 data on 2026-10-16.
 
 Three rules shape everything below:
-1. **Node never parses English.** The conductor sends the command text (for logs), the parsed form from `hivemind.lang` and a concrete `plan`. There is one parser, on the Python side (DESIGN.md 5).
+1. **Node never parses English.** The conductor sends the command text (for logs), the parsed form from `hivemind.lang` and a concrete `plan`, which is what Node executes. There is one parser, on the Python side (DESIGN.md 5). The `plan` is a deviation from contracts section 7 and DESIGN.md 11.1, which say Node runs the parsed form (section 6.1 says why, and what it requires).
 2. **Node never decides what the agent knows.** It forwards what the bot's own client received (blocks, entities, chat, damage, windows). Perception, the notebook, masks and every class or phrase live in Python, shared with the simulator (DESIGN.md 2, principle 6). Targets come from the notebook, never from `findBlocks` (no X-ray).
 3. **Node speaks vanilla.** Blocks, items and entities are vanilla names without the `minecraft:` prefix (`deepslate_iron_ore`, `raw_iron`, `zombie`) and block state ids. Python maps them to classes and words with `data/concepts-1.21.1.json` and `data/block_classes-1.21.1.csv`.
 
@@ -60,8 +60,8 @@ Example: `{"t": "ping", "nonce": 1}` is the frame `00 00 00 0f 82 a1 74 a4 70 69
 | `host_id` | str | echo of `HIVEMIND_HOST_ID` |
 | `game_version` | str | `1.21.1` |
 | `node` | str | `process.version` |
-| `packages` | map | installed versions: `mineflayer`, `mineflayer-pathfinder`, `@msgpack/msgpack`, `minecraft-data`, `minecraft-protocol`, ... |
-| `lock_sha256` | str | SHA-256 of `bridge/package-lock.json` |
+| `packages` | map | every installed package: its path as the lock writes it (`node_modules/mineflayer`, `node_modules/@msgpack/msgpack`, `node_modules/prismarine-physics/node_modules/vec3`) → the `version` in that folder's `package.json`. Node visits every folder `node_modules/<name>` and `node_modules/@<scope>/<name>` at any depth under `bridge/` (not `.bin`, not `package.json` files inside a package's own subfolders). An `npm ci` tree gives exactly the lock's 99 entries *(checked)* |
+| `lock_sha256` | str | SHA-256 of `bridge/package-lock.json` after turning CRLF into LF; for the record only (the check uses `packages`) |
 | `mcdata` | map | `{version, sha256: {path: hash}}`: hashes of the minecraft-data files listed in `data/sources.json` (`data/pc/1.21.1/blocks.json`, ...), read from `node_modules/minecraft-data` |
 
 ### 4.2 `hello` from the conductor (reply)
@@ -76,7 +76,12 @@ Example: `{"t": "ping", "nonce": 1}` is the frame `00 00 00 0f 82 a1 74 a4 70 69
 | `settings` | map | section 4.4 |
 | `tables` | map | section 4.5 |
 
-The conductor instead answers `bye{reason}` and closes when the protocol number differs, the session differs, `game_version` is not `1.21.1`, or any `mcdata` hash differs from the pins in `data/sources.json`. That last check matters: Node reports block state ids, and Python maps them with tables built from the pinned files. In `bridge/package-lock.json` minecraft-data is 3.117.0, and all eleven pinned files are byte-identical to the pins *(checked)*.
+The conductor instead answers `bye{reason}` and closes when:
+- the protocol number differs, the session differs, or `game_version` is not `1.21.1`;
+- any `mcdata` hash differs from the pins in `data/sources.json`. Node reports block state ids, and Python maps them with tables built from the pinned files. In `bridge/package-lock.json` minecraft-data is 3.117.0, and all eleven pinned files are byte-identical to the pins *(checked)*;
+- `packages` differs from the `packages` section of `bridge/package-lock.json`, compared by path and version, not by file bytes: a missing package (other than those the lock marks `optional`), an extra one, or another version. The M2 duration, dig and lag fits hold only for the pinned stack (mineflayer, mineflayer-pathfinder, prismarine-physics, prismarine-block, ...), so a host with any other version must not play (bridge/README.md: "A new Mineflayer is a bridge change").
+
+Committed text files keep LF on every OS (`bridge/.gitattributes`), and every hash of a text file in the bridge is taken after turning CRLF into LF, so a Windows checkout gives the same values.
 
 Node writes all of these values, its own and the conductor's, into each bot's telemetry `session.json` (DESIGN.md 11.4); the conductor writes them into `runs/<id>/run.json`.
 
@@ -141,6 +146,8 @@ tell everyone i need 3 iron ingot.  {verb: "chat",   args: {sentence: {intent: "
 ```
 
 Node uses `parsed.verb` to choose the wrapper and reads everything else from `plan`. It does not interpret `args`: those values are class names (`iron_ore`, `log`), and turning a class into something to act on needs the notebook. A class-level `mine 4 log.` becomes a list of known log positions; `craft 4 planks.` becomes a vanilla recipe the inventory can satisfy. This keeps the honesty rule (targets come only from what the agent perceived) on the Python side.
+
+**Deviation from the contract.** Contracts section 7 and DESIGN.md 11.1 have `act{agent, req, command, parsed, deadline_ticks, deadline_ms}`, and Node "runs the parsed form". Here Node runs `plan`; `parsed` only picks the wrapper. Running the parsed form would need the notebook, the class tables and the recipe book on the Node side, which rule 2 forbids. The change is requested in the contract (contracts section 7, DESIGN.md 11.1), and it comes with a requirement: the plan must come from **one resolver** in `hivemind/` (command + notebook + inventory → plan: which known positions, in which order; which vanilla recipe and item variant), used both by the conductor and by the simulator's macros. Real-versus-simulator replays from the same snapshot (DESIGN.md 11.4) compare success per verb only if both sides pick the same targets and recipes. No contract owns that resolver yet (section 13).
 
 ### 6.2 `plan` per verb (provisional, fixed with the wrappers in M2)
 
@@ -257,14 +264,14 @@ Python runs the shared perception (DESIGN.md 6.1) and the notebook on a mirror o
 
 | `kind` | Fields | Source |
 |---|---|---|
-| `chat` | `from` (username), `uuid`, `text`, `chat_type` (registry name, e.g. `chat`, `msg_command_incoming`, `team_msg_command_incoming`), `from_self` | player chat only, from Mineflayer's `message` event with the sender *(checked: `lib/plugins/chat.js`)*. System messages are not forwarded. The conductor reads `text` with the human tokenizer (DESIGN.md 9) |
+| `chat` | `from` (username), `uuid`, `text`, `chat_type` (registry name without namespace: `chat`, `msg_command_incoming`, `team_msg_command_incoming`, ...; the 1.21.1 names are the files in mcmeta `data/minecraft/chat_type` *(checked)*), `from_self` | player chat only, from the raw `playerChat` event of the client (`bot._client.on('playerChat', data)`): `uuid` = `data.sender`, `text` = `data.plainMessage`, `from` = the username of that UUID in `bot.players`. `chat_type` = `bot.registry.chatFormattingById[i].name` with `i = data.type.chatType ?? data.type` (prismarine-registry 1.12.0 already applies 1.21's offset of 1). Mineflayer's own `message` event cannot be used for the type: it passes the constant `'chat'` for every player message *(checked: mineflayer `lib/plugins/chat.js`, prismarine-registry `lib/pc/index.js`)*. A `playerChat` without `sender` (the `profileless_chat` packet, e.g. `/say` over RCON) and system messages are not forwarded. The conductor reads `text` with the human tokenizer (DESIGN.md 9) |
 | `hurt` | `victim` and `source` (`EntityRef`, `source` nil if none), `damage_type` (registry name, e.g. `player_attack`, `mob_attack`, `fall`, `lava`), `health` (own health after the hit, when the victim is the bot) | the `damage_event` packet, which names the source entity; Mineflayer emits `entityHurt(entity, source)` from it *(checked: `lib/plugins/entities.js`)*. Sent for the bot and for every tracked entity |
-| `death` | `killer` (`EntityRef` or nil), `death_key` (translation key, e.g. `death.attack.player`), `args` (the key's arguments as names), `pos` | the death message's translation key and arguments: structured data, not English text. `death.attack.player` is `%1$s was slain by %2$s` in the pinned language file, so `args[1]` is the killer |
+| `death` | `killer` (`EntityRef` or nil), `death_key` (translation key, e.g. `death.attack.player`), `args` (the key's arguments as names), `pos` | the death message's translation key and arguments: structured data, not English text. `death.attack.player` is `%1$s was slain by %2$s` in the pinned language file, so `args[1]` is the killer. With the gamerule `showDeathMessages` false the message is empty, so `servertool.py check-gamerules` keeps it at the vanilla default, true |
 | `kick` | `reason` (text component as JSON), `logged_in` | Mineflayer `kicked(reason, loggedIn)` *(checked)* |
 | `correction` | `from`, `to`, `dist` | Mineflayer `forcedMove`: a server position correction or teleport *(checked)* |
 | `entity_dead` | `entity` (`EntityRef`), `pos` | entity status 3 [mem] |
 | `pickup` | `collector` (`EntityRef`), `item: {name, count}`, `item_entity` (id) | the collect packet (Mineflayer `playerCollect`) *(checked)* |
-| `lid` | `pos`, `viewers` (int) | Mineflayer `chestLidMove`: a chest the bot can see was opened or closed *(checked: `lib/plugins/block_actions.js`)* |
+| `lid` | `pos`, `block` (`chest` or `trapped_chest`), `viewers` (int: players that now have it open; no names) | Mineflayer `chestLidMove(block, viewers, block2)`, for a double chest once, at the right half. It fires for **any** chest block loaded in the bot's client whose open count changes, with no line-of-sight or distance test: Mineflayer checks only that `bot.blockAt(pos)` is loaded *(checked: `lib/plugins/block_actions.js`)*. The server sends block events to every player within 64 blocks of the chest [mem], through walls. So a `lid` event is heard, not seen; Node forwards it only for `chest` and `trapped_chest` (the same `block_action` packet also reaches it for other blocks) |
 | `respawn` | `pos` | after Node respawns the bot |
 
 ## 9. What the notebook gets from the real game
@@ -274,9 +281,11 @@ The owner asked how an agent remembers where things were, who is an enemy and ho
 | Notebook table | Fed by |
 |---|---|
 | Places (`iron ore`, `my furnace 2`, `my chest 1`, `my bed`, `lava`) | perception on the world mirror (7.2) every `state`; own stations from the positions in successful `place` results |
-| Players (relation, last seen, last message, damage, kills, gifts, thefts) | `state.entities` (name, position, `team`, from which the relation word follows, as a player sees name colours); `chat` events (last message words); `hurt` events (damage each way, from `source` and `victim`); `death` and `entity_dead` (kills each way); `pickup` events and `give` results (items given each way, attributed from the notebook's own perception history); `lid` events and container contents (items taken from my chests) |
-| Containers (contents as last seen) | `raw_state.container` after `store` and `take`, passed to `notebook.on_container_view`. A drop since the last look becomes `3 iron ingot missing from my chest 1`; the thief is named only if the agent saw the chest opened (`lid`) with that player beside it |
+| Players (relation, last seen, last message, damage, kills, gifts, times seen opening my chests) | `state.entities` (name, position, `team`, from which the relation word follows, as a player sees name colours), filtered by the shared perception (below); `chat` events (last message words); `hurt` events (damage each way, from `source` and `victim`); `death` and `entity_dead` (kills each way); `pickup` events and `give` results (items given each way, attributed by the fixed rule of DESIGN.md 6.3 from the notebook's own perception history); `lid` events on the agent's own chests (times seen opening my chests, by the rule below) |
+| Containers (contents as last seen) | `raw_state.container` after `store` and `take`, passed to `notebook.on_container_view`. A drop since the last look becomes `3 iron ingot missing from my chest 1`. No event ever names a thief: the game does not tell a client who took what (DESIGN.md 6.3) |
 | Events (ring buffer of sentences) | written by the conductor from the above, in the vocabulary's event sentences (contracts 4.3) |
+
+**Perception before attribution.** Node forwards what the client received, and the client receives more than the agent may use: `state.entities` holds every tracked entity within `entity_radius`, whether or not it is in line of sight, and `lid` events arrive through walls (section 8). The conductor therefore runs the same perception function as the simulator (DESIGN.md 6.1) on the world mirror before the notebook uses an entity: a player counts as *visible* only if perception says so at that tick. The `{player} opened my chest {chest}` rule of DESIGN.md 6.3 is then applied unchanged: one of the agent's own chests gets a `lid` event with more viewers while the agent is not using it, and the opener is named only if exactly one other visible player is within 6 blocks [est] of the chest; otherwise the event is `someone opened my chest {chest}`. The simulator produces `lid` events with the same range as the server (measured in M7 [est]), so both sides write the same sentences.
 
 Nothing reaches the notebook from RCON, from server-side state or from Mineflayer searches over all loaded blocks.
 
@@ -314,6 +323,8 @@ Node  → result  {agent: "red 0", req: 1, code: "INTERRUPTED", cause: "damage",
 
 - **Slot names in `parsed.args`.** Contracts 4.4 writes `("count", 4)` for `mine`, while 4.5 lists the slot names `mine_count` and `item_count`. The protocol passes whatever `hivemind.lang` settles on; Node does not read `args`.
 - **`plan` fields per verb** (6.2) are fixed with the wrappers in M2.
+- **`plan` in the contract and its resolver** (6.1): contracts section 7 and DESIGN.md 11.1 still describe `act` without `plan`; the change is requested. The resolver (command + notebook + inventory → plan) must be one function in `hivemind/`, shared with the simulator's macros; its owner and module are not decided yet.
+- **Block-event range** for `lid`: 64 blocks is [mem]; M7 measures it, and the simulator uses the measured value (DESIGN.md 6.3).
 - **Kick results:** `TIMEOUT` with `aborted: kick` for now (6.6).
 - **Light** in the world mirror (7.2).
 - **Mirror bandwidth:** a column is 16 deflated sections; the bytes per bot per second at walking speed are measured in M2 [est].

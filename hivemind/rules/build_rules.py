@@ -40,7 +40,10 @@ Representation choices not fixed by the contract:
 - recipes add ``special`` (bool).
 
 The build cross-checks overlapping sources and fails on any disagreement that is not
-listed in a ``TOLERATED_*`` table below with its reason.
+listed in a ``TOLERATED_*`` table below with its reason (``build`` raises
+``CrossCheckError``; ``main`` prints every check first). minecraft-data's 1.20 ``blockLoot``
+and ``entityLoot`` are compared with the 1.21.1 loot tables for information only (known to
+be stale).
 """
 
 from __future__ import annotations
@@ -136,6 +139,16 @@ class BuildError(RuntimeError):
     """A source is missing, malformed, or a cross-check failed."""
 
 
+class CrossCheckError(BuildError):
+    """Fatal cross-check mismatches; ``checks`` holds every check (for the report)."""
+
+    def __init__(self, checks: list[CrossCheck]):
+        failed = fatal_failures(checks)
+        super().__init__("cross-check mismatches: " + "; ".join(
+            f"{c.name} ({len(c.mismatches)}, first: {c.mismatches[0]})" for c in failed))
+        self.checks = checks
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -190,6 +203,11 @@ class CrossCheck:
         status = "ok" if not self.mismatches else ("FAIL" if self.fatal else "info")
         return (f"[{status:4}] {self.name}: {self.compared} compared, {len(self.mismatches)} mismatches, "
                 f"{len(self.tolerated)} tolerated")
+
+
+def fatal_failures(checks: Iterable[CrossCheck]) -> list[CrossCheck]:
+    """The fatal checks that found mismatches (the build fails if there is any)."""
+    return [c for c in checks if c.fatal and c.mismatches]
 
 
 # ---------------------------------------------------------------------------
@@ -527,8 +545,8 @@ def _armor_table(known_items: set[str]) -> dict[str, dict]:
             item = f"{material}_{piece}"
             if item not in known_items:
                 raise BuildError(f"armor constant names an unknown item {item}")
-            out[item] = {"slot": slot, "points": a.points[C.ARMOR_SLOTS.index(slot)],
-                         "toughness": a.toughness, "knockback_resistance": a.knockback_resistance}
+            out[item] = {"slot": slot, "points": a.points.value[C.ARMOR_SLOTS.index(slot)],
+                         "toughness": a.toughness.value, "knockback_resistance": a.knockback_resistance.value}
     for item, (slot, points, toughness, kb, _src) in C.ARMOR_EXTRA.items():
         if item not in known_items:
             raise BuildError(f"armor constant names an unknown item {item}")
@@ -892,13 +910,21 @@ def check_recipes(src: Sources, recipes: list[dict]) -> CrossCheck:
                     missing = sorted(set(alts) - got)
                     chk.mismatches.append(f"mcmeta recipe {rid} slot {k}: minecraft-data lacks {missing}")
 
-    # Shapeless: minecraft-data holds exactly the first-alternative instance of each recipe.
+    # Shapeless: minecraft-data holds exactly the first-alternative instance of each recipe, so
+    # the other alternatives of a slot (tag members, listed alternatives) cannot be compared.
     raw_item_tags = src.tags["item"]
     mc_shapeless: Counter = Counter()
+    unchecked_alts, unchecked_recipes = 0, 0
     for r in recipes:
         if r["type"] == "crafting_shapeless":
             first = tuple(sorted(first_alternative(ing, raw_item_tags) for ing in src.recipes[r["id"]]["ingredients"]))
             mc_shapeless[(r["result"]["item"], r["result"]["count"], first)] += 1
+            extra = sum(len(alts) - 1 for alts in r["ingredients"])
+            unchecked_alts += extra
+            unchecked_recipes += extra > 0
+    if unchecked_alts:
+        chk.tolerated.append(f"shapeless: {unchecked_alts} non-first ingredient alternatives in {unchecked_recipes} "
+                             "recipes are NOT compared (minecraft-data keeps only the first alternative)")
     for key in sorted(set(md_shapeless) | set(mc_shapeless)):
         chk.compared += 1
         n_md, n_mc = md_shapeless[key], mc_shapeless[key]
@@ -957,17 +983,21 @@ def check_derived_loot(src: Sources, blocks: dict[str, dict]) -> CrossCheck:
     return chk
 
 
-def _loot_items(node: Any) -> set[str]:
-    """Item names an (mcmeta) loot table can produce, ignoring conditions."""
+def _loot_items(node: Any, loot: dict[str, Any] | None = None, seen: frozenset[str] = frozenset()) -> set[str]:
+    """Item names an (mcmeta) loot table can produce, ignoring conditions. With ``loot``,
+    ``minecraft:loot_table`` entries are followed into the referenced tables."""
     out: set[str] = set()
     if isinstance(node, dict):
         if node.get("type") == "minecraft:item" and "name" in node:
             out.add(strip_ns(node["name"]))
+        ref = node.get("value") if node.get("type") == "minecraft:loot_table" else None
+        if loot is not None and isinstance(ref, str) and strip_ns(ref) in loot and strip_ns(ref) not in seen:
+            out |= _loot_items(loot[strip_ns(ref)], loot, seen | {strip_ns(ref)})
         for v in node.values():
-            out |= _loot_items(v)
+            out |= _loot_items(v, loot, seen)
     elif isinstance(node, list):
         for v in node:
-            out |= _loot_items(v)
+            out |= _loot_items(v, loot, seen)
     return out
 
 
@@ -987,14 +1017,38 @@ def check_stale_loot(src: Sources, blocks: dict[str, dict]) -> CrossCheck:
     return chk
 
 
+def check_stale_entity_loot(src: Sources) -> CrossCheck:
+    """Informational: minecraft-data 1.20 entityLoot vs mcmeta 1.21.1 entity loot (known to be
+    stale). The 1.21.1 side is the union of ``entities/<name>`` and its sub-tables (sheep
+    colours), following ``minecraft:loot_table`` references."""
+    chk = CrossCheck("entity loot: minecraft-data 1.20 vs mcmeta 1.21.1 (info only)", fatal=False)
+    for entry in src.md["entity_loot"]:
+        name = entry["entity"]
+        if name not in src.entity_registry:
+            chk.mismatches.append(f"{name}: not a 1.21.1 entity")
+            continue
+        chk.compared += 1
+        tables = [k for k in src.loot if k == f"entities/{name}" or k.startswith(f"entities/{name}/")]
+        mc = set().union(*(_loot_items(src.loot[k], src.loot) for k in tables))
+        md = {d["item"] for d in entry["drops"]}
+        if md != mc:
+            chk.mismatches.append(f"{name}: 1.20 {sorted(md)} vs 1.21.1 {sorted(mc)}")
+    return chk
+
+
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
 
 
 def build(sources_dir: Path = DEFAULT_DEST, sources_json: Path = DEFAULT_SOURCES_JSON,
-          verify: bool = True) -> tuple[dict, list[CrossCheck], list[str]]:
-    """Build the rules dict. Returns (rules, cross-checks, notes); raises BuildError on failure."""
+          verify: bool = True, strict: bool = True) -> tuple[dict, list[CrossCheck], list[str]]:
+    """Build the rules dict. Returns (rules, cross-checks, notes); raises BuildError on failure.
+
+    ``strict`` (the default) raises ``CrossCheckError`` when a fatal cross-check finds a
+    mismatch (contracts 2: the build fails on disagreement); ``strict=False`` returns the
+    checks so the caller can report them (``main`` does, then fails).
+    """
     pins = load_pins(sources_json)
     if verify:
         problems = verify_all(sources_json, sources_dir)
@@ -1031,7 +1085,10 @@ def build(sources_dir: Path = DEFAULT_DEST, sources_json: Path = DEFAULT_SOURCES
         check_display_names(src),
         check_derived_loot(src, blocks),
         check_stale_loot(src, blocks),
+        check_stale_entity_loot(src),
     ]
+    if strict and fatal_failures(checks):
+        raise CrossCheckError(checks)
     notes.append(f"recipes: {len(recipes)} ({sum(r['special'] for r in recipes)} flagged special); "
                  f"types {dict(sorted(Counter(r['type'] for r in recipes).items()))}")
     notes.append(f"loot tables: {sum(k.startswith('blocks/') for k in loot_tables)} block, "
@@ -1068,14 +1125,13 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     try:
-        rules, checks, notes = build(args.sources, args.sources_json)
+        rules, checks, notes = build(args.sources, args.sources_json, strict=False)  # report, then fail below
     except BuildError as exc:
         print(f"build failed: {exc}", file=sys.stderr)
         return 1
     for note in notes:
         print(note)
     print("cross-checks:")
-    failed = False
     for chk in checks:
         print("  " + chk.line())
         limit = None if args.verbose else 10
@@ -1086,8 +1142,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.verbose:
             for t in chk.tolerated:
                 print(f"      tolerated: {t}")
-        failed |= chk.fatal and bool(chk.mismatches)
-    if failed:
+    if fatal_failures(checks):
         print("build failed: cross-check mismatches (see above)", file=sys.stderr)
         return 1
 

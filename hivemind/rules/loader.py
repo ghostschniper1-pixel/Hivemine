@@ -338,9 +338,10 @@ class Rules:
     def mining_speed(self, tool: str | None, block: str) -> float:
         """Tool speed on a block from the 1.21.1 tool rules (no enchantments or effects).
 
-        ``tool`` None (or an item without a tool component) is the bare hand: 1.0.
+        ``tool`` None (or an item without a tool component) is the bare hand: 1.0. Unknown block
+        or item names raise ``KeyError`` (as in ``can_harvest``).
         """
-        block = _name(block)
+        block = self.block(block).name
         t = self.item(tool).tool if tool else None
         if t is not None:
             for rule in t.rules:

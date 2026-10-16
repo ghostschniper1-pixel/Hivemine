@@ -6,12 +6,15 @@ Subcommands:
   render            write an instance's server.properties from the frozen template
   check-properties  compare an instance's server.properties (as rewritten by the server) with the template
   rcon              send commands over RCON, from --file and/or the command line
-  check-gamerules   read the frozen gamerules and the difficulty back over RCON and compare
-  check-mods        hash server.jar and mods/*.jar and compare them with mods-1.21.1.json
+  check-gamerules   read every gamerule and the difficulty back over RCON and compare
+  check-mods        check Java, server.jar, the Fabric launcher and mods/*.jar against mods-1.21.1.json
   check-generator   compare vanilla data-generator output with the pinned sources and data/rules-1.21.1.json
 
 Instance K (0-9) uses game port 25565 + K and RCON port 25575 + K, both bound to 127.0.0.1.
 The RCON password comes from the environment variable HIVEMIND_RCON_PASSWORD and is never printed.
+
+Exit codes: 0 every check passed, 1 a difference was found, 2 an I/O or RCON error,
+3 (check-generator only) INCOMPLETE: nothing differed, but some checks could not run.
 """
 
 from __future__ import annotations
@@ -23,8 +26,9 @@ import os
 import re
 import socket
 import struct
+import subprocess
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,11 +38,13 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 TEMPLATE = HERE / "server.properties"
 GAMERULES = HERE / "gamerules-1.21.1.mcfunction"
+GAMERULE_DEFAULTS = HERE / "gamerule-defaults-1.21.1.json"
 MODS = HERE / "mods-1.21.1.json"
 RULES = REPO / "data" / "rules-1.21.1.json"
 SOURCES = REPO / "data" / "sources.json"
 MCMETA_DATA = REPO / "data" / "sources" / "mcmeta-1.21.1-data"
 
+GAME_VERSION = "1.21.1"  # contracts section 0
 GAME_PORT_BASE = 25565  # [mem] vanilla default server-port
 RCON_PORT_BASE = 25575  # [24] DESIGN.md 11.2
 MAX_INSTANCES = 10  # game ports 25565..25574 stay below the RCON base
@@ -179,11 +185,59 @@ def overrides(instance: int, password: str | None, seed: str | None, control: st
 
 
 def sha256_file(path: Path) -> str:
+    """SHA-256 of a file's bytes (jars and other binary files)."""
     h = hashlib.sha256()
     with path.open("rb") as f:
         for block in iter(lambda: f.read(1 << 20), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def sha256_text(path: Path) -> str:
+    """SHA-256 of a committed text file with CRLF and CR turned into LF.
+
+    The hash then does not depend on how Git checked the file out (Git for Windows may use CRLF).
+    """
+    data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(data).hexdigest()
+
+
+def read_sidecar(directory: Path) -> dict[str, Any] | None:
+    """The hivemind-instance.json that `render` wrote into an instance folder, or None."""
+    path = directory / SIDECAR
+    if not path.exists():
+        return None
+    return json.loads(path.read_text("utf-8"))
+
+
+@dataclass(frozen=True)
+class InstanceSettings:
+    """What an instance was rendered with: from its sidecar if present, else from the command line."""
+
+    instance: int
+    seed: str | None
+    control: str
+    seed_known: bool  # False: no sidecar and no --seed, so level-seed cannot be checked
+    from_sidecar: bool
+
+
+def instance_settings(args: argparse.Namespace) -> InstanceSettings:
+    """Resolve instance, seed and control for a check; command-line values must agree with the sidecar."""
+    cli = {"instance": args.instance, "seed": getattr(args, "seed", None), "control": args.control}
+    directory = getattr(args, "dir", None)
+    side = read_sidecar(Path(directory)) if directory else None
+    if side is None:
+        seed = cli["seed"]
+        return InstanceSettings(instance=0 if cli["instance"] is None else cli["instance"], seed=seed,
+                                control=cli["control"] or "none", seed_known=seed is not None,
+                                from_sidecar=False)
+    conflicts = [f"--{key} {value!r} but {SIDECAR} has {side.get(key)!r}"
+                 for key, value in cli.items() if value is not None and value != side.get(key)]
+    if conflicts:
+        raise SystemExit(f"{Path(directory) / SIDECAR} disagrees with the command line: " + "; ".join(conflicts)
+                         + ". Re-render the instance, or drop the argument.")
+    return InstanceSettings(instance=int(side["instance"]), seed=side.get("seed"),
+                            control=side.get("control") or "none", seed_known=True, from_sidecar=True)
 
 
 def render_text(template: str, values: dict[str, str]) -> str:
@@ -211,7 +265,7 @@ def cmd_render(args: argparse.Namespace) -> int:
     values = overrides(args.instance, pw, args.seed, args.control)
     header = (
         f"# Rendered by bridge/server/servertool.py for instance {args.instance} "
-        f"(template sha256 {sha256_file(TEMPLATE)[:16]}). Do not edit; re-render instead.\n"
+        f"(template sha256 {sha256_text(TEMPLATE)[:16]}). Do not edit; re-render instead.\n"
     )
     (target / "server.properties").write_text(header + render_text(TEMPLATE.read_text("utf-8"), values),
                                              encoding="utf-8")
@@ -222,8 +276,9 @@ def cmd_render(args: argparse.Namespace) -> int:
         "rcon_port": rcon,
         "seed": args.seed,
         "control": args.control,
-        "template_sha256": sha256_file(TEMPLATE),
-        "gamerules_sha256": sha256_file(GAMERULES),
+        "template_sha256": sha256_text(TEMPLATE),
+        "gamerules_sha256": sha256_text(GAMERULES),
+        "gamerule_defaults_sha256": sha256_text(GAMERULE_DEFAULTS),
         "rendered_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
     (target / SIDECAR).write_text(json.dumps(sidecar, indent=2) + "\n", encoding="utf-8")
@@ -238,10 +293,14 @@ def cmd_check_properties(args: argparse.Namespace) -> int:
     live = parse_properties(live_path.read_text("utf-8"))
     expected = parse_properties(TEMPLATE.read_text("utf-8"))
     pw = rcon_password(required=False)
-    expected.update(overrides(args.instance, pw, args.seed, args.control))
+    s = instance_settings(args)
+    origin = SIDECAR if s.from_sidecar else "the command line"
+    print(f"instance {s.instance}, seed {s.seed!r}, control {s.control} (from {origin})")
+    expected.update(overrides(s.instance, pw, s.seed, s.control))
     problems = []
     for key, want in expected.items():
-        if key == "level-seed" and args.seed is None:
+        if key == "level-seed" and not s.seed_known:
+            print(f"NOTE level-seed not checked: no {SIDECAR} in {args.dir} and no --seed")
             continue
         if key == "rcon.password":
             have = live.get(key, "")
@@ -389,34 +448,68 @@ _GAMERULE_REPLY = re.compile(r"currently set to:\s*(\S+)")  # [mem] "Gamerule X 
 _DIFFICULTY_REPLY = re.compile(r"difficulty is (\w+)", re.IGNORECASE)  # [mem] "The difficulty is Normal"
 
 
-def frozen_gamerules(control: str) -> dict[str, str]:
+def _rule_text(value: Any) -> str:
+    """A gamerule value as the server prints it: true/false or a decimal integer."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def gamerule_defaults(path: Path = GAMERULE_DEFAULTS) -> dict[str, str]:
+    """{rule: vanilla default} for every 1.21.1 gamerule (names checked, defaults [mem]; see the file)."""
+    return {rule: _rule_text(v) for rule, v in json.loads(path.read_text("utf-8"))["rules"].items()}
+
+
+def frozen_gamerules(control: str, path: Path = GAMERULES) -> dict[str, str]:
     """{rule: value} from the active lines of the gamerules file, with a control applied."""
     rules = {}
-    for cmd in read_commands(GAMERULES):
+    for cmd in read_commands(path):
         parts = cmd.split()
-        if len(parts) == 3 and parts[0] == "gamerule":
-            rules[parts[1]] = parts[2]
+        if parts[0] != "gamerule":
+            continue  # another command (e.g. 'weather clear'): applied by `rcon --file`, not read back here
+        if len(parts) != 3:
+            raise SystemExit(f"{path.name}: expected 'gamerule <name> <value>', got {cmd!r}")
+        rules[parts[1]] = parts[2]
     if control == "keep-inventory":
         rules["keepInventory"] = "true"
     return rules
 
 
+def expected_gamerules(control: str) -> dict[str, tuple[str, str]]:
+    """{rule: (value, origin)} for every gamerule: the vanilla default unless frozen or set by a control."""
+    defaults = gamerule_defaults()
+    frozen = frozen_gamerules(control)
+    unknown = sorted(set(frozen) - set(defaults))
+    if unknown:
+        raise SystemExit(f"{GAMERULES.name} sets {unknown}, which are not 1.21.1 gamerules ({GAMERULE_DEFAULTS.name})")
+    want = {rule: (value, "vanilla default [mem]") for rule, value in defaults.items()}
+    want.update({rule: (value, "frozen") for rule, value in frozen.items()})
+    return want
+
+
 def cmd_check_gamerules(args: argparse.Namespace) -> int:
-    want = frozen_gamerules(args.control)
+    s = instance_settings(args)
+    port = args.port if args.port is not None else ports(s.instance)[1]
+    want = expected_gamerules(s.control)
     want_difficulty = parse_properties(TEMPLATE.read_text("utf-8"))["difficulty"]
+    print(f"instance {s.instance} (RCON port {port}), control {s.control}")
     problems = 0
-    with Rcon(_rcon_port(args), rcon_password()) as rc:
-        for rule, value in want.items():
+    with Rcon(port, rcon_password()) as rc:
+        for rule, (value, origin) in want.items():
             reply = rc.command(f"gamerule {rule}")
             m = _GAMERULE_REPLY.search(reply)
             ok = bool(m) and m.group(1).lower() == value.lower()
             problems += not ok
-            print(f"{'ok  ' if ok else 'DIFF'} {rule} = {value}   (server: {reply!r})")
+            line = f"{'ok  ' if ok else 'DIFF'} {rule} = {value} ({origin})"
+            print(line if ok else f"{line}   server: {reply!r}")
         reply = rc.command("difficulty")
         m = _DIFFICULTY_REPLY.search(reply)
         ok = bool(m) and m.group(1).lower() == want_difficulty
         problems += not ok
-        print(f"{'ok  ' if ok else 'DIFF'} difficulty = {want_difficulty}   (server: {reply!r})")
+        print(f"{'ok  ' if ok else 'DIFF'} difficulty = {want_difficulty} (frozen)   server: {reply!r}")
+    if problems:
+        print(f"note: on a fresh world, a DIFF on a 'vanilla default' rule means {GAMERULE_DEFAULTS.name} is wrong "
+              f"(its defaults are [mem]); otherwise the world was changed")
     print(f"{'FAIL' if problems else 'PASS'} {len(want) + 1} checks, {problems} problems")
     return 1 if problems else 0
 
@@ -425,36 +518,131 @@ def cmd_check_gamerules(args: argparse.Namespace) -> int:
 # Mods and jars
 # ---------------------------------------------------------------------------------------------
 
-def _pinned(value: Any) -> bool:
-    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+_HASH_FORMATS = {"sha256": re.compile(r"[0-9a-f]{64}"), "sha1": re.compile(r"[0-9a-f]{40}")}
+_JAVA_VERSION = re.compile(r'version "(\d+)')  # [mem] first line of `java -version`, e.g. openjdk version "21.0.4"
+
+
+def _is_todo(value: Any) -> bool:
+    """True for a pin that is not filled in yet: missing, empty, or text starting with TODO or 'planned'."""
+    if not isinstance(value, str):
+        return value is None
+    return not value.strip() or value.strip().lower().startswith(("todo", "planned"))
+
+
+@dataclass
+class PinCheck:
+    """Collects the pins of mods-1.21.1.json: unpinned entries and problems."""
+
+    unpinned: list[str] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)
+
+    def pin(self, label: str, value: Any, kind: str = "text") -> str | None:
+        """The pinned value, or None if it is still TODO (recorded) or malformed (a problem)."""
+        if _is_todo(value):
+            self.unpinned.append(label)
+            return None
+        text = str(value).strip()
+        if kind in _HASH_FORMATS and not _HASH_FORMATS[kind].fullmatch(text):
+            self.problems.append(f"{label}: {value!r} is not a lower-case hex {kind}")
+            return None
+        return text
+
+
+def java_version(java: str) -> str | None:
+    """The output of `<java> -version` (Java prints it on stderr), or None if it cannot run."""
+    try:
+        out = subprocess.run([java, "-version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (out.stderr or out.stdout).strip() or None
+
+
+def _jar_hashes(path: Path) -> tuple[str, str]:
+    """(sha256, sha1) of a file."""
+    data = path.read_bytes()
+    return hashlib.sha256(data).hexdigest(), hashlib.sha1(data).hexdigest()
 
 
 def cmd_check_mods(args: argparse.Namespace) -> int:
-    pins = json.loads(MODS.read_text("utf-8"))
+    """Every entry of the pins file must be filled in and match the instance (README section 4, step 4)."""
+    pins_path = Path(args.pins)
+    pins = json.loads(pins_path.read_text("utf-8"))
     inst = Path(args.dir)
-    jars = {p.name: sha256_file(p) for p in sorted((inst / "mods").glob("*.jar"))}
-    problems = []
-    server_jar = inst / pins["server_jar"]["file"]
-    if server_jar.exists():
-        digest = sha256_file(server_jar)
-        sha1 = hashlib.sha1(server_jar.read_bytes()).hexdigest()
-        print(f"server.jar sha256 {digest}  sha1 {sha1}")
-        if _pinned(pins["server_jar"]["sha256"]) and digest != pins["server_jar"]["sha256"]:
-            problems.append("server.jar differs from the pinned sha256")
+    pc = PinCheck()
+    if pins.get("game_version") != GAME_VERSION:
+        pc.problems.append(f"{pins_path.name} is for {pins.get('game_version')!r}, not {GAME_VERSION}")
+
+    # Java: the major version always; the exact `java -version` line once it is pinned.
+    java = pins["java"]
+    java_pin = pc.pin("java.version", java.get("version"))
+    out = java_version(args.java)
+    if out is None:
+        pc.problems.append(f"cannot run `{args.java} -version`; pass --java <the java that starts the server>")
     else:
-        problems.append(f"{server_jar} not found")
-    unpinned = [m["name"] for m in pins["mods"] if not _pinned(m["sha256"])]
-    pinned = {m["sha256"]: m["name"] for m in pins["mods"] if _pinned(m["sha256"])}
-    for digest, name in pinned.items():
+        # The version line; skip notices such as "Picked up JAVA_TOOL_OPTIONS: ..." printed before it.
+        lines = [line.strip() for line in out.splitlines() if line.strip()]
+        first = next((line for line in lines if _JAVA_VERSION.search(line)), lines[0])
+        print(f"java: {first}")
+        m = _JAVA_VERSION.search(first)
+        if not m or int(m.group(1)) != int(java["major"]):
+            pc.problems.append(f"java major version is not {java['major']}: {first!r}")
+        if java_pin is not None and first != java_pin:
+            pc.problems.append(f"java: {first!r} != pinned {java_pin!r}")
+
+    # The vanilla server jar: SHA-256 and Mojang's SHA-1.
+    sj = pins["server_jar"]
+    pin256 = pc.pin("server_jar.sha256", sj.get("sha256"), "sha256")
+    pin1 = pc.pin("server_jar.sha1", sj.get("sha1"), "sha1")
+    server_jar = inst / sj["file"]
+    if server_jar.exists():
+        d256, d1 = _jar_hashes(server_jar)
+        print(f"{sj['file']} sha256 {d256}  sha1 {d1}")
+        if pin256 is not None and d256 != pin256:
+            pc.problems.append(f"{sj['file']} differs from the pinned sha256")
+        if pin1 is not None and d1 != pin1:
+            pc.problems.append(f"{sj['file']} differs from the pinned sha1")
+    else:
+        pc.problems.append(f"{server_jar} not found (the Fabric launcher downloads it on the first start)")
+
+    # The Fabric loader, through the jar that starts the server (launcher or fabric-server-launch.jar).
+    loader = pins["loader"]
+    pc.pin("loader.version", loader.get("version"))
+    pc.pin("loader.installer_version", loader.get("installer_version"))
+    launcher = pc.pin("loader.launcher_file", loader.get("launcher_file"))
+    launcher_pin = pc.pin("loader.launcher_sha256", loader.get("launcher_sha256"), "sha256")
+    if launcher is not None:
+        path = inst / launcher
+        if path.exists():
+            digest = sha256_file(path)
+            print(f"{launcher} sha256 {digest}")
+            if launcher_pin is not None and digest != launcher_pin:
+                pc.problems.append(f"{launcher} differs from the pinned launcher_sha256")
+        else:
+            pc.problems.append(f"{path} not found")
+    else:
+        for path in sorted(inst.glob("*.jar")):
+            if path.name != sj["file"]:
+                print(f"{path.name} sha256 {sha256_file(path)}  (launcher candidate)")
+
+    # Mods: every pinned jar present, and once all are pinned, nothing else in mods/.
+    mod_pins: dict[str, str] = {}
+    for m in pins["mods"]:
+        pc.pin(f"mods.{m['name']}.version", m.get("version"))
+        digest = pc.pin(f"mods.{m['name']}.sha256", m.get("sha256"), "sha256")
+        if digest is not None:
+            mod_pins[digest] = m["name"]
+    all_mods_pinned = len(mod_pins) == len(pins["mods"])
+    jars = {p.name: sha256_file(p) for p in sorted((inst / "mods").glob("*.jar"))}
+    for digest, name in mod_pins.items():
         if digest not in jars.values():
-            problems.append(f"pinned mod {name} not found in mods/")
+            pc.problems.append(f"pinned mod {name} not found in mods/")
     for jar, digest in jars.items():
-        status = f"= {pinned[digest]}" if digest in pinned else "not pinned"
-        print(f"mods/{jar} sha256 {digest}  {status}")
-        if digest not in pinned and not unpinned:
-            problems.append(f"mods/{jar} is not in the pinned set")
-    if unpinned:
-        problems.append(f"NOT FROZEN: still TODO-pin in {MODS.name}: {', '.join(unpinned)}")
+        print(f"mods/{jar} sha256 {digest}  {'= ' + mod_pins[digest] if digest in mod_pins else 'not pinned'}")
+        if digest not in mod_pins and all_mods_pinned:
+            pc.problems.append(f"mods/{jar} is not in the pinned set")
+
+    problems = pc.problems + ([f"NOT FROZEN: still TODO-pin in {pins_path.name}: {', '.join(pc.unpinned)}"]
+                              if pc.unpinned else [])
     for p in problems:
         print("DIFF", p)
     print(f"{'FAIL' if problems else 'PASS'} {len(jars)} mod jars, {len(problems)} problems")
@@ -467,24 +655,46 @@ def cmd_check_mods(args: argparse.Namespace) -> int:
 
 @dataclass
 class Check:
-    """Outcome of one comparison: differences found, items compared, or a reason it was skipped."""
+    """Outcome of one comparison: differences found, items compared, or a reason it could not finish."""
 
     name: str
     compared: int = 0
     diffs: list[str] = field(default_factory=list)
     skipped: str | None = None
 
-    def report(self, max_examples: int) -> bool:
-        if self.skipped:
-            print(f"SKIP {self.name}: {self.skipped}")
-            return True
-        if not self.diffs:
+    @property
+    def status(self) -> str:
+        """FAIL if any difference was found (even if the check then stopped), else SKIP if it did not
+        finish, else PASS."""
+        if self.diffs:
+            return "FAIL"
+        return "SKIP" if self.skipped else "PASS"
+
+    def report(self, max_examples: int) -> str:
+        """Print the outcome and return the status."""
+        status = self.status
+        if status == "PASS":
             print(f"PASS {self.name} ({self.compared} compared)")
-            return True
-        print(f"FAIL {self.name}: {len(self.diffs)} differences ({self.compared} compared)")
-        for d in self.diffs[:max_examples]:
-            print(f"     {d}")
-        return False
+        elif status == "SKIP":
+            print(f"SKIP {self.name}: {self.skipped}")
+        else:
+            print(f"FAIL {self.name}: {len(self.diffs)} differences ({self.compared} compared)")
+            if self.skipped:
+                print(f"     and the check stopped early: {self.skipped}")
+            for d in self.diffs[:max_examples]:
+                print(f"     {d}")
+        return status
+
+
+def verdict(statuses: Iterable[str]) -> str:
+    """PASS only if every check ran and passed; FAIL if any differed; otherwise INCOMPLETE."""
+    statuses = list(statuses)
+    if "FAIL" in statuses:
+        return "FAIL"
+    return "INCOMPLETE" if any(s != "PASS" for s in statuses) else "PASS"
+
+
+EXIT_CODES = {"PASS": 0, "FAIL": 1, "INCOMPLETE": 3}
 
 
 def _strip_ns(name: str) -> str:
@@ -499,12 +709,21 @@ def _load(path: Path) -> Any:
     return json.loads(path.read_text("utf-8"))
 
 
-def check_against_mcmeta(gen: Path, mcmeta: Path, paths: list[str]) -> Check:
+def _has_data(c: Check, gen: Path) -> bool:
+    """False (and the check skipped) when the generator output has no data/ folder."""
+    if (gen / "data").is_dir():
+        return True
+    c.skipped = f"{gen / 'data'} not found"
+    return False
+
+
+def check_against_mcmeta(c: Check, gen: Path, mcmeta: Path, paths: list[str]) -> None:
     """The generator's data files must equal the pinned mcmeta 1.21.1-data files (JSON-equal)."""
-    c = Check("generator data == mcmeta 1.21.1-data (" + ", ".join(p.rsplit("/", 1)[-1] for p in paths) + ")")
+    if not _has_data(c, gen):
+        return
     if not mcmeta.is_dir():
-        c.skipped = f"{mcmeta} not found; run `python -m hivemind.rules.fetch_sources` first"
-        return c
+        c.skipped = f"{mcmeta} not found; run `python -m hivemind.rules.fetch_sources` first, or pass --mcmeta"
+        return
     for rel in paths:
         mine, theirs = _json_files(gen / rel), _json_files(mcmeta / rel)
         for key in sorted(set(mine) ^ set(theirs)):
@@ -513,11 +732,12 @@ def check_against_mcmeta(gen: Path, mcmeta: Path, paths: list[str]) -> Check:
             c.compared += 1
             if _load(mine[key]) != _load(theirs[key]):
                 c.diffs.append(f"{rel}/{key}.json differs")
-    return c
 
 
-def check_loot_tables(gen: Path, rules: dict) -> Check:
-    c = Check("loot tables == rules (verbatim)")
+def check_loot_tables(c: Check, gen: Path, rules: dict) -> None:
+    """Every loot table in the rules equals the generator's file."""
+    if not _has_data(c, gen):
+        return
     root = gen / "data" / "minecraft" / "loot_table"
     for key, table in rules["loot_tables"].items():
         path = root / f"{key}.json"
@@ -526,7 +746,6 @@ def check_loot_tables(gen: Path, rules: dict) -> Check:
             c.diffs.append(f"{key}: no generator file")
         elif _load(path) != table:
             c.diffs.append(f"{key}: differs")
-    return c
 
 
 def _result_of(recipe: dict) -> tuple[str, int] | None:
@@ -540,8 +759,10 @@ def _result_of(recipe: dict) -> tuple[str, int] | None:
     return None
 
 
-def check_recipes(gen: Path, rules: dict) -> Check:
-    c = Check("recipes: ids, results, cooking time and experience == rules")
+def check_recipes(c: Check, gen: Path, rules: dict) -> None:
+    """Recipe ids, results, cooking time and experience equal the rules."""
+    if not _has_data(c, gen):
+        return
     files = _json_files(gen / "data" / "minecraft" / "recipe")
     ours = {r["id"]: r for r in rules["recipes"]}
     for rid in sorted(set(files) ^ set(ours)):
@@ -556,7 +777,6 @@ def check_recipes(gen: Path, rules: dict) -> Check:
         for key in ("cookingtime", "experience"):
             if key in g and r.get(key) is not None and abs(float(g[key]) - float(r[key])) > 1e-9:
                 c.diffs.append(f"{rid}: {key} {g[key]} != rules {r[key]}")
-    return c
 
 
 def _resolve_tag(root: Path, tag: str, seen: set[str] | None = None) -> set[str]:
@@ -581,8 +801,10 @@ def _resolve_tag(root: Path, tag: str, seen: set[str] | None = None) -> set[str]
     return out
 
 
-def check_tags(gen: Path, rules: dict) -> Check:
-    c = Check("block and item tags (resolved) == rules")
+def check_tags(c: Check, gen: Path, rules: dict) -> None:
+    """Every block and item tag in the rules, fully resolved, equals the generator's."""
+    if not _has_data(c, gen):
+        return
     for kind in ("block", "item"):
         base = gen / "data" / "minecraft" / "tags"
         root = base / kind if (base / kind).is_dir() else base / f"{kind}s"
@@ -595,79 +817,112 @@ def check_tags(gen: Path, rules: dict) -> Check:
                 continue
             if got != set(members):
                 c.diffs.append(f"{kind} tag {tag}: +{sorted(got - set(members))[:5]} -{sorted(set(members) - got)[:5]}")
-    return c
 
 
 def _report(gen: Path, name: str, c: Check) -> dict | None:
+    """A reports/ file as a dict, or None with the check skipped."""
     path = gen / "reports" / name
     if not path.exists():
         c.skipped = f"{path} not found (run the generator with --reports)"
         return None
     data = _load(path)
     if not isinstance(data, dict):
-        c.skipped = f"{name}: unexpected format"
+        c.skipped = f"{name}: top level is not an object; report format not recognised"
         return None
     return data
 
 
-def check_block_states(gen: Path, rules: dict) -> Check:
-    c = Check("reports/blocks.json state ids == rules (min, max, default)")
+def _state_ids(entry: Any) -> tuple[int, int, int | None] | None:
+    """(min, max, default) state id of one blocks.json entry, or None if it has no usable 'states' list."""
+    states = entry.get("states") if isinstance(entry, dict) else None
+    if not isinstance(states, list) or not states or not all(isinstance(s, dict) and "id" in s for s in states):
+        return None
+    ids = [s["id"] for s in states]
+    default = [s["id"] for s in states if s.get("default")]
+    return min(ids), max(ids), default[0] if default else None
+
+
+def check_block_states(c: Check, gen: Path, rules: dict) -> None:
+    """Each block's min, max and default state id equals the rules (format [mem])."""
     report = _report(gen, "blocks.json", c)
     if report is None:
-        return c
+        return
     names = {_strip_ns(k): v for k, v in report.items()}
+    got = {name: _state_ids(v) for name, v in names.items()}
+    if not any(got.values()):
+        c.skipped = "no entry has a 'states' list with ids; report format not recognised"
+        return
     for name in sorted(set(names) ^ set(rules["blocks"])):
         c.diffs.append(f"{name}: only in {'report' if name in names else 'rules'}")
     for name in sorted(set(names) & set(rules["blocks"])):
-        states = names[name].get("states")
-        if not isinstance(states, list) or not states:
-            c.skipped = f"{name}: no 'states' list; report format not recognised"
-            return c
-        ids = [s["id"] for s in states]
-        default = [s["id"] for s in states if s.get("default")]
-        got = (min(ids), max(ids), default[0] if default else None)
+        c.compared += 1
         b = rules["blocks"][name]
         want = (b["min_state"], b["max_state"], b["default_state"])
-        c.compared += 1
-        if got != want:
-            c.diffs.append(f"{name}: (min, max, default) {got} != rules {want}")
-    return c
+        if got[name] is None:
+            c.diffs.append(f"{name}: no 'states' list with ids in the report (rules {want})")
+        elif got[name] != want:
+            c.diffs.append(f"{name}: (min, max, default) {got[name]} != rules {want}")
 
 
-def check_items(gen: Path, rules: dict) -> Check:
-    c = Check("reports/items.json components == rules (stack size, durability, food)")
+def _components(entry: Any) -> dict | None:
+    """The components of one items.json entry as {type: value}: a map (1.21.1 [mem]) or a list of
+    {type, value} (later versions [mem]); None if neither."""
+    comps = entry.get("components", entry) if isinstance(entry, dict) else None
+    if isinstance(comps, dict):
+        return comps
+    if isinstance(comps, list) and all(isinstance(x, dict) and "type" in x for x in comps):
+        return {x["type"]: x.get("value") for x in comps}
+    return None
+
+
+def _food(value: Any) -> tuple[Any, float] | None | str:
+    """(nutrition, saturation) of a food component, None if absent, 'malformed' otherwise."""
+    if value is None:
+        return None
+    if isinstance(value, dict) and "nutrition" in value and "saturation" in value:
+        return value["nutrition"], round(float(value["saturation"]), 6)
+    return "malformed"
+
+
+def check_items(c: Check, gen: Path, rules: dict) -> None:
+    """Stack size, durability and food of every item equal the rules (format [mem])."""
     report = _report(gen, "items.json", c)
     if report is None:
-        return c
+        return
     names = {_strip_ns(k): v for k, v in report.items()}
+    comps = {name: _components(v) for name, v in names.items()}
+    if not any(comps.values()):
+        c.skipped = "no entry has components as a map or a list of {type, value}; report format not recognised"
+        return
     for name in sorted(set(names) ^ set(rules["items"])):
         c.diffs.append(f"{name}: only in {'report' if name in names else 'rules'}")
     for name in sorted(set(names) & set(rules["items"])):
-        comps = names[name].get("components", names[name])
-        it = rules["items"][name]
-        food = comps.get("minecraft:food")
-        got = (comps.get("minecraft:max_stack_size"), comps.get("minecraft:max_damage"),
-               None if food is None else (food["nutrition"], round(float(food["saturation"]), 6)))
-        want = (it["stack_size"], it["max_damage"],
-                None if it["food"] is None else (it["food"]["nutrition"], round(float(it["food"]["saturation"]), 6)))
         c.compared += 1
+        it = rules["items"][name]
+        food = it["food"]
+        want = (it["stack_size"], it["max_damage"],
+                None if food is None else (food["nutrition"], round(float(food["saturation"]), 6)))
+        mine = comps[name]
+        if mine is None:
+            c.diffs.append(f"{name}: components not recognised in the report (rules {want})")
+            continue
+        got = (mine.get("minecraft:max_stack_size"), mine.get("minecraft:max_damage"), _food(mine.get("minecraft:food")))
         if got != want:
             c.diffs.append(f"{name}: (stack, durability, food) {got} != rules {want}")
-    return c
 
 
-def check_registry_ids(gen: Path, rules: dict) -> Check:
-    c = Check("reports/registries.json protocol ids == rules ids (block, item, entity_type)")
+def check_registry_ids(c: Check, gen: Path, rules: dict) -> None:
+    """Block, item and entity-type protocol ids equal the rules ids (format [mem])."""
     report = _report(gen, "registries.json", c)
     if report is None:
-        return c
+        return
     for registry, section in (("minecraft:block", "blocks"), ("minecraft:item", "items"),
                               ("minecraft:entity_type", "entities")):
         entries = report.get(registry, {}).get("entries")
         if not isinstance(entries, dict):
             c.diffs.append(f"{registry}: no entries in report")
             continue
-        got = {_strip_ns(k): v.get("protocol_id") for k, v in entries.items()}
+        got = {_strip_ns(k): v.get("protocol_id") if isinstance(v, dict) else None for k, v in entries.items()}
         ours = rules[section]
         for name in sorted(set(got) ^ set(ours)):
             c.diffs.append(f"{registry} {name}: only in {'report' if name in got else 'rules'}")
@@ -675,7 +930,36 @@ def check_registry_ids(gen: Path, rules: dict) -> Check:
             c.compared += 1
             if got[name] != ours[name]["id"]:
                 c.diffs.append(f"{registry} {name}: protocol id {got[name]} != rules id {ours[name]['id']}")
+
+
+# Errors that mean "this input is not in the format the check expects" (the report formats are [mem]).
+_FORMAT_ERRORS = (KeyError, IndexError, TypeError, ValueError, AttributeError)
+
+
+def run_check(name: str, fn: Callable[[Check], None]) -> Check:
+    """Run one check; a format error stops it (SKIP, or FAIL if it had already found differences)."""
+    c = Check(name)
+    try:
+        fn(c)
+    except _FORMAT_ERRORS as e:
+        c.skipped = f"stopped on unexpected input ({type(e).__name__}: {e}); format not recognised"
     return c
+
+
+def generator_checks(gen: Path, rules: dict, mcmeta: Path, paths: list[str]) -> list[tuple[str, Callable[[Check], None]]]:
+    """(name, check) for every comparison of check-generator, in report order."""
+    folders = ", ".join(p.rsplit("/", 1)[-1] for p in paths)
+    return [
+        (f"generator data == mcmeta 1.21.1-data ({folders})", lambda c: check_against_mcmeta(c, gen, mcmeta, paths)),
+        ("loot tables == rules (verbatim)", lambda c: check_loot_tables(c, gen, rules)),
+        ("recipes: ids, results, cooking time and experience == rules", lambda c: check_recipes(c, gen, rules)),
+        ("block and item tags (resolved) == rules", lambda c: check_tags(c, gen, rules)),
+        ("reports/blocks.json state ids == rules (min, max, default)", lambda c: check_block_states(c, gen, rules)),
+        ("reports/items.json components == rules (stack size, durability, food)",
+         lambda c: check_items(c, gen, rules)),
+        ("reports/registries.json protocol ids == rules ids (block, item, entity_type)",
+         lambda c: check_registry_ids(c, gen, rules)),
+    ]
 
 
 def cmd_check_generator(args: argparse.Namespace) -> int:
@@ -683,21 +967,17 @@ def cmd_check_generator(args: argparse.Namespace) -> int:
     if not (gen / "data").is_dir() and not (gen / "reports").is_dir():
         raise SystemExit(f"{gen} has neither data/ nor reports/; point --generated at the generator's output folder")
     rules = _load(Path(args.rules))
-    if rules.get("version") != "1.21.1":
-        raise SystemExit(f"{args.rules} is for version {rules.get('version')}, not 1.21.1")
+    if rules.get("version") != GAME_VERSION:
+        raise SystemExit(f"{args.rules} is for version {rules.get('version')}, not {GAME_VERSION}")
     paths = _load(SOURCES)["sources"]["mcmeta-data"]["paths"]
-    checks = [
-        check_against_mcmeta(gen, Path(args.mcmeta), paths),
-        check_loot_tables(gen, rules),
-        check_recipes(gen, rules),
-        check_tags(gen, rules),
-        check_block_states(gen, rules),
-        check_items(gen, rules),
-        check_registry_ids(gen, rules),
-    ]
-    ok = [c.report(args.max_examples) for c in checks]
-    print("PASS" if all(ok) else "FAIL", f"generator cross-check against {Path(args.rules).name}")
-    return 0 if all(ok) else 1
+    statuses = []
+    for name, fn in generator_checks(gen, rules, Path(args.mcmeta), paths):
+        statuses.append(run_check(name, fn).report(args.max_examples))  # printed as soon as each finishes
+    result = verdict(statuses)
+    skipped = statuses.count("SKIP")
+    note = f" ({skipped} of {len(statuses)} checks did not run)" if result == "INCOMPLETE" else ""
+    print(f"{result} generator cross-check against {Path(args.rules).name}{note}")
+    return EXIT_CODES[result]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -708,21 +988,28 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    def instance_args(sp: argparse.ArgumentParser, with_control: bool = True) -> None:
+    def instance_args(sp: argparse.ArgumentParser, with_control: bool = True, from_sidecar: bool = False) -> None:
+        """--instance and --control; for checks they default to the instance folder's hivemind-instance.json."""
+        if from_sidecar:
+            sp.add_argument("--instance", type=int, help=f"instance number K (default: from {SIDECAR}, else 0)")
+            if with_control:
+                sp.add_argument("--control", choices=CONTROLS,
+                                help=f"DESIGN.md 10.2 control run (default: from {SIDECAR}, else none)")
+            return
         sp.add_argument("--instance", type=int, default=0, help="instance number K (ports 25565+K, 25575+K)")
         if with_control:
             sp.add_argument("--control", choices=CONTROLS, default="none", help="DESIGN.md 10.2 control run")
 
-    sp = sub.add_parser("render", help="write <dir>/server.properties for an instance")
+    sp = sub.add_parser("render", help="write <dir>/server.properties and <dir>/hivemind-instance.json")
     instance_args(sp)
     sp.add_argument("--dir", required=True, help="instance directory")
     sp.add_argument("--seed", help="level-seed for a new world (from the world pool)")
     sp.set_defaults(func=cmd_render)
 
     sp = sub.add_parser("check-properties", help="compare <dir>/server.properties with the frozen template")
-    instance_args(sp)
-    sp.add_argument("--dir", required=True)
-    sp.add_argument("--seed", help="also check level-seed")
+    instance_args(sp, from_sidecar=True)
+    sp.add_argument("--dir", required=True, help="instance directory")
+    sp.add_argument("--seed", help=f"expected level-seed (default: from {SIDECAR}; must agree with it)")
     sp.set_defaults(func=cmd_check_properties)
 
     sp = sub.add_parser("rcon", help="send commands over RCON")
@@ -732,13 +1019,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("commands", nargs="*", help="commands, e.g. 'tick query'")
     sp.set_defaults(func=cmd_rcon)
 
-    sp = sub.add_parser("check-gamerules", help="read the frozen gamerules back over RCON")
-    instance_args(sp)
-    sp.add_argument("--port", type=int, help="RCON port (overrides --instance)")
+    sp = sub.add_parser("check-gamerules", help="read every gamerule and the difficulty back over RCON")
+    instance_args(sp, from_sidecar=True)
+    sp.add_argument("--dir", help=f"instance directory: instance and control from its {SIDECAR}")
+    sp.add_argument("--port", type=int, help="RCON port (overrides the instance)")
     sp.set_defaults(func=cmd_check_gamerules)
 
-    sp = sub.add_parser("check-mods", help="hash server.jar and mods/*.jar against mods-1.21.1.json")
+    sp = sub.add_parser("check-mods", help="check Java, server.jar, the launcher and mods/*.jar against the pins")
     sp.add_argument("--dir", required=True, help="instance directory")
+    sp.add_argument("--java", default="java", help="the java executable that starts the server (default: java)")
+    sp.add_argument("--pins", default=str(MODS), help="pins file (default: bridge/server/mods-1.21.1.json)")
     sp.set_defaults(func=cmd_check_mods)
 
     sp = sub.add_parser("check-generator", help="compare data-generator output with the pinned sources and rules")

@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from hivemind.rules import Rules, load_rules
+from hivemind.rules import build_rules as B
+from hivemind.rules.fetch_sources import verify_all
 from hivemind.sim.ref import mechanics as m
 from hivemind.sim.ref.mechanics import Difficulty, HungerState, MechanicsConstants, f32
+
+REPO = Path(__file__).resolve().parents[1]
+SOURCES_JSON = REPO / "data" / "sources.json"
+SOURCES_DIR = REPO / "data" / "sources"
 
 
 @pytest.fixture(scope="module")
@@ -60,26 +68,31 @@ def test_from_rules_requires_rules_constants_and_prefers_them(rules: Rules) -> N
 # Breaking [13]
 # =============================================================================
 
-# block, held item, DESIGN.md 4.3 check value, vanilla client (float32 accumulation)
+# block, held item, DESIGN.md 4.3 check value (ceil(1/dmg) with the game's tool speeds),
+# vanilla client (float32 accumulation), unpatched Mineflayer's wait (prismarine-block digTime).
 BREAK_CHECKS = [
-    ("stone", "wooden_pickaxe", 23, 23),
+    ("stone", "wooden_pickaxe", 23, 23, 23),
     # 1/dmg is exactly 150, but 150 float32 additions of 0.0066666668 sum to 0.99999923 < 1, so
     # the vanilla client breaks on tick 151. The check value 150 is ceil(1/dmg) in exact
-    # arithmetic, which is also what Mineflayer waits (and what the server's 70% check accepts).
-    ("stone", None, 150, 151),
+    # arithmetic (the server's 70% check accepts "finished" well before either).
+    ("stone", None, 150, 151, 150),
     # Same effect: 60 additions of 0.016666668 sum to 0.9999997 in float32.
-    ("oak_log", None, 60, 61),
+    ("oak_log", None, 60, 61, 60),
     # Here the float32 sum overshoots: 30 additions of 0.033333335 give 1.0000004.
-    ("oak_log", "wooden_axe", 30, 30),
-    ("obsidian", "diamond_pickaxe", 188, 188),
+    ("oak_log", "wooden_axe", 30, 30, 30),
+    # Obsidian is tier-gated: minecraft-data's material gives a diamond pickaxe speed 1, not 8,
+    # so Mineflayer waits 1 / 50 / 30 -> 1500 ticks for what the game breaks in 188.
+    ("obsidian", "diamond_pickaxe", 188, 188, 1500),
 ]
 
 
-@pytest.mark.parametrize("block,held,design,client", BREAK_CHECKS)
-def test_break_check_values(rules: Rules, block: str, held: str | None, design: int, client: int) -> None:
+@pytest.mark.parametrize("block,held,design,client,mineflayer", BREAK_CHECKS)
+def test_break_check_values(rules: Rules, block: str, held: str | None, design: int, client: int,
+                            mineflayer: int) -> None:
     t = m.break_ticks_for(rules, block, held)
-    assert t.mineflayer_ticks == design
+    assert t.design_ticks == design
     assert t.ticks == client
+    assert t.mineflayer_ticks == mineflayer
     assert t.ticks == python_float32_sum_ticks(t.progress_per_tick)
     # The server accepts "finished" at progress * (k + 1) >= 0.7 (float32), and not one tick earlier.
     k = t.server_accept_ticks
@@ -88,10 +101,11 @@ def test_break_check_values(rules: Rules, block: str, held: str | None, design: 
 
 
 def test_mineflayer_double_rounding(rules: Rules) -> None:
-    # 2 / 3 / 30 is 1/45 exactly, but in doubles 1 / dmg is just above 45, so Mineflayer waits
-    # 46 ticks while the vanilla client's float32 sum reaches 1.0 after 45.
+    # 2 / 3 / 30 is 1/45 exactly, but in doubles 1 / dmg is just above 45, so the design formula
+    # (and Mineflayer, which agrees on coal ore) gives 46 ticks while the vanilla client's
+    # float32 sum reaches 1.0 after 45.
     t = m.break_ticks_for(rules, "coal_ore", "wooden_pickaxe")
-    assert (t.ticks, t.mineflayer_ticks) == (45, 46)
+    assert (t.ticks, t.design_ticks, t.mineflayer_ticks) == (45, 46, 46)
     assert 1.0 / (2.0 / 3.0 / 30.0) > 45.0
 
 
@@ -103,7 +117,102 @@ def test_stone_by_hand_drops_nothing(rules: Rules) -> None:
     # Wrong tier still mines at the tool's speed, but at the /100 divisor: 6 / 50 / 100.
     t = m.break_ticks_for(rules, "obsidian", "iron_pickaxe")
     assert t.progress_per_tick == f32(f32(6.0 / 50.0) / 100.0)
-    assert t.mineflayer_ticks == 834
+    assert t.design_ticks == 834
+    assert t.mineflayer_ticks == 5000  # minecraft-data's material: speed 1, 1 / 50 / 100
+
+
+# Unpatched Mineflayer's dig wait: prismarine-block 1.23.0 Block.digTime(itemId, false, inWater,
+# notOnGround, enchantments, effects) / 50, with prismarine-registry 1.12.0 and minecraft-data
+# 3.117.0 (the versions bridge/package-lock.json locks), run under Node 22 on 2026-10-16 for every
+# 1.21.1 block x 32 tools x {ground, water, air}; all 101,760 values equal mineflayer_ticks. A sample:
+# (block, held, in_water, on_ground, efficiency, haste, mining_fatigue) -> ticks
+MINEFLAYER_DIGTIME = [
+    ("iron_ore", "stone_pickaxe", False, True, 0, 0, 0, 91),  # the game: 23
+    ("iron_ore", "iron_pickaxe", False, True, 0, 0, 0, 91),
+    ("iron_ore", "wooden_pickaxe", False, True, 0, 0, 0, 150),  # wooden is the one md speed 2
+    ("iron_ore", "wooden_axe", False, True, 0, 0, 0, 150),  # the game: 300 (axe speed 1)
+    ("iron_ore", "golden_pickaxe", False, True, 0, 0, 0, 300),
+    ("iron_ore", None, False, True, 0, 0, 0, 300),
+    ("diamond_ore", "iron_pickaxe", False, True, 0, 0, 0, 91),  # the game: 15
+    ("deepslate_iron_ore", "stone_pickaxe", False, True, 0, 0, 0, 135),  # the game: 34
+    ("iron_block", "stone_pickaxe", False, True, 0, 0, 0, 150),
+    ("obsidian", "diamond_pickaxe", False, True, 0, 0, 0, 1500),
+    ("obsidian", "iron_pickaxe", False, True, 0, 0, 0, 5000),
+    ("moss_carpet", "wooden_hoe", False, True, 0, 0, 0, 3),  # md material "plant" has no hoes
+    ("coal_ore", "wooden_pickaxe", False, True, 0, 0, 0, 46),
+    ("stone", "wooden_pickaxe", True, True, 0, 0, 0, 113),
+    ("stone", "wooden_pickaxe", False, False, 0, 0, 0, 113),
+    ("stone", "wooden_pickaxe", False, True, 3, 0, 0, 4),
+    ("stone", "wooden_pickaxe", False, True, 0, 1, 0, 19),
+    ("stone", "wooden_pickaxe", False, True, 0, 0, 3, 8334),
+    ("stone", "iron_pickaxe", False, True, 0, 0, 4, 9260),
+    ("iron_ore", "stone_pickaxe", False, True, 5, 0, 0, 91),  # md speed 1: Efficiency does nothing
+    ("iron_ore", "stone_pickaxe", False, True, 0, 2, 0, 65),
+    ("obsidian", "diamond_pickaxe", False, True, 0, 2, 0, 1072),
+    ("oak_log", "iron_axe", False, True, 2, 0, 0, 6),
+    ("oak_log", "iron_axe", False, True, 0, 0, 2, 112),
+]
+
+
+@pytest.mark.parametrize("block,held,in_water,on_ground,eff,haste,fatigue,expected", MINEFLAYER_DIGTIME)
+def test_mineflayer_ticks_match_prismarine_digtime(rules: Rules, block: str, held: str | None, in_water: bool,
+                                                   on_ground: bool, eff: int, haste: int, fatigue: int,
+                                                   expected: int) -> None:
+    t = m.break_ticks_for(rules, block, held, in_water=in_water, on_ground=on_ground, efficiency=eff,
+                          haste=haste, mining_fatigue=fatigue)
+    assert t.mineflayer_ticks == expected
+
+
+def test_mineflayer_tool_speed_differs_only_on_md_quirks(rules: Rules) -> None:
+    assert m.mineflayer_tool_speed(rules, "stone_pickaxe", "iron_ore") == 1.0
+    assert rules.mining_speed("stone_pickaxe", "iron_ore") == 4.0
+    assert m.mineflayer_tool_speed(rules, "wooden_shovel", "obsidian") == 2.0
+    assert rules.mining_speed("wooden_shovel", "obsidian") == 1.0
+    assert m.mineflayer_tool_speed(rules, "iron_hoe", "moss_carpet") == 1.0
+    assert m.mineflayer_tool_speed(rules, "iron_pickaxe", "stone") == rules.mining_speed("iron_pickaxe", "stone")
+    assert m.mineflayer_tool_speed(rules, None, "iron_ore") == 1.0
+    # The exceptions are exactly the pairs the rules build tolerates in its materials check.
+    pairs = {(b, k) for b, kinds in m.MINEFLAYER_MISSING_TOOL_KINDS.items() for k in kinds}
+    assert pairs == set(B.TOLERATED_TOOL_SPEED)
+    assert m.MINEFLAYER_TIER_GATED_TAG in B.TOLERATED_MATERIAL_SUBSTITUTION
+    # The design formula with Mineflayer's speed is the primitive behind both counts.
+    assert m.break_ticks(3.0, 4.0, True, mineflayer_speed=1.0).mineflayer_ticks == \
+        m.design_break_ticks(3.0, 1.0, True) == 91
+    assert m.break_ticks(3.0, 4.0, True).mineflayer_ticks == m.break_ticks(3.0, 4.0, True).design_ticks == 23
+
+
+def test_mineflayer_refused_with_wrong_wooden_tools(rules: Rules) -> None:
+    # Iron ore with a wooden axe: Mineflayer sends "finished" after 150 ticks (50% progress); the
+    # server needs 70%, (k + 1) / 300 >= 0.7 from k = 209, so it refuses.
+    t = m.break_ticks_for(rules, "iron_ore", "wooden_axe")
+    assert (t.mineflayer_ticks, t.server_accept_ticks) == (150, 209)
+    assert t.mineflayer_refused
+    for block, held in (("iron_ore", "stone_pickaxe"), ("iron_ore", "wooden_pickaxe"), ("stone", None),
+                        ("coal_ore", "wooden_pickaxe"), ("short_grass", None), ("bedrock", "wooden_axe")):
+        assert not m.break_ticks_for(rules, block, held).mineflayer_refused, (block, held)
+
+
+def _md_cache_ok() -> bool:
+    return SOURCES_DIR.is_dir() and not verify_all(SOURCES_JSON, SOURCES_DIR)
+
+
+@pytest.mark.skipif(not _md_cache_ok(), reason="data/sources/ missing or not matching the pins")
+def test_mineflayer_tool_speed_matches_minecraft_data_everywhere(rules: Rules) -> None:
+    # prismarine-block's lookups, ported: speed = materials[block.material][itemId] or 1, and
+    # canHarvest = no harvestTools, or the held item's id is in them.
+    md = SOURCES_DIR / "minecraft-data" / "data" / "pc" / "1.21.1"
+    blocks = json.loads((md / "blocks.json").read_text())
+    materials = json.loads((md / "materials.json").read_text())
+    item_id = {i["name"]: i["id"] for i in json.loads((md / "items.json").read_text())}
+    tools = [None] + sorted(n for n, it in rules.items.items() if it.tool is not None)
+    assert {int(i) for mat in materials.values() for i in mat} <= {item_id[t] for t in tools[1:]}
+    for b in blocks:
+        speeds, harvest = materials.get(b["material"], {}), b.get("harvestTools")
+        for tool in tools:
+            md_speed = float(speeds.get(str(item_id[tool]), 1.0)) if tool else 1.0
+            assert m.mineflayer_tool_speed(rules, tool, b["name"]) == md_speed, (b["name"], tool)
+            md_harvest = not harvest or (tool is not None and str(item_id[tool]) in harvest)
+            assert rules.can_harvest(tool, b["name"]) == md_harvest, (b["name"], tool)
 
 
 def test_server_accept_example(rules: Rules) -> None:
@@ -114,14 +223,15 @@ def test_server_accept_example(rules: Rules) -> None:
 def test_instant_and_unbreakable(rules: Rules) -> None:
     grass = m.break_ticks_for(rules, "short_grass")  # hardness 0
     assert grass.instant and grass.breakable
-    assert (grass.ticks, grass.mineflayer_ticks, grass.server_accept_ticks) == (0, 0, 0)
+    assert (grass.ticks, grass.design_ticks, grass.mineflayer_ticks, grass.server_accept_ticks) == (0, 0, 0, 0)
     fast = m.break_ticks(0.5, 8.0, True)  # 8 / 0.5 / 30 = 0.53: two ticks, not instant
     assert fast.ticks == 2 and not fast.instant
     insta = m.break_ticks(0.2, 8.0, True)  # 1.33 >= 1
-    assert insta.instant and insta.mineflayer_ticks == 0
+    assert insta.instant and insta.design_ticks == insta.mineflayer_ticks == 0
     bedrock = m.break_ticks_for(rules, "bedrock", "netherite_pickaxe")
     assert not bedrock.breakable and bedrock.progress_per_tick == 0.0
-    assert (bedrock.ticks, bedrock.mineflayer_ticks, bedrock.server_accept_ticks) == (None, None, None)
+    assert (bedrock.ticks, bedrock.design_ticks, bedrock.mineflayer_ticks, bedrock.server_accept_ticks) == \
+        (None, None, None, None)
 
 
 def test_known_tool_times(rules: Rules) -> None:
@@ -140,14 +250,14 @@ def test_efficiency_applies_only_above_speed_one(rules: Rules) -> None:
 
 def test_haste_water_and_air(rules: Rules) -> None:
     assert m.destroy_speed(2.0, haste=2) == f32(2.0 * f32(1.4))
-    assert m.break_ticks_for(rules, "stone", "wooden_pickaxe", haste=2).mineflayer_ticks == 17  # 2.8/1.5/30
+    assert m.break_ticks_for(rules, "stone", "wooden_pickaxe", haste=2).design_ticks == 17  # 2.8/1.5/30
     water = m.break_ticks_for(rules, "stone", "wooden_pickaxe", in_water=True)
     air = m.break_ticks_for(rules, "stone", "wooden_pickaxe", on_ground=False)
-    assert water.mineflayer_ticks == air.mineflayer_ticks == 113  # 0.4 / 1.5 / 30 -> 112.5
+    assert water.design_ticks == air.design_ticks == 113  # 0.4 / 1.5 / 30 -> 112.5
     assert m.break_ticks_for(rules, "stone", "wooden_pickaxe", in_water=True, aqua_affinity=True) == \
         m.break_ticks_for(rules, "stone", "wooden_pickaxe")
     both = m.break_ticks_for(rules, "stone", "wooden_pickaxe", in_water=True, on_ground=False)
-    assert both.mineflayer_ticks == 563  # 0.08 / 1.5 / 30 -> 562.5
+    assert both.design_ticks == both.mineflayer_ticks == 563  # 0.08 / 1.5 / 30 -> 562.5
 
 
 def test_mining_fatigue_table_vs_design_formula() -> None:

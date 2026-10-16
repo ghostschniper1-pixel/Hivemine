@@ -278,18 +278,23 @@ def server_accept_ticks(progress: float, c: MechanicsConstants | None = None) ->
     return k
 
 
-def mineflayer_break_ticks(hardness: float, tool_speed: float, can_harvest: bool, *, efficiency: int = 0,
-                           haste: int = 0, mining_fatigue: int = 0, in_water: bool = False,
-                           aqua_affinity: bool = False, on_ground: bool = True,
-                           c: MechanicsConstants | None = None) -> int | None:
-    """Ticks Mineflayer waits before sending "finished": ceil(1 / dmg) in double precision.
+def design_break_ticks(hardness: float, tool_speed: float, can_harvest: bool, *, efficiency: int = 0,
+                       haste: int = 0, mining_fatigue: int = 0, in_water: bool = False,
+                       aqua_affinity: bool = False, on_ground: bool = True,
+                       c: MechanicsConstants | None = None) -> int | None:
+    """DESIGN.md 4.3's ``ticks = ceil(1/dmg)``, in double precision. 0 = instant; None = never.
 
-    This is DESIGN.md 4.3's ``ticks = ceil(1/dmg)``, evaluated as prismarine-block's ``digTime``
-    does (JavaScript doubles; read in prismarine-block 1.23.0 from npm [9]); Mineflayer's
-    ``bot.dig`` sends "start", waits ``digTime`` ms (ticks * 50) and sends "finished" [5].
+    The arithmetic is that of prismarine-block's ``Block.digTime`` (JavaScript doubles, same order;
+    read in prismarine-block 1.23.0 from npm [9]). What it means depends on ``tool_speed``:
+
+    - the game's tool-rule speed (``Rules.mining_speed``): the design formula and its check
+      values (``BreakTime.design_ticks``);
+    - the speed prismarine-block looks up (``mineflayer_tool_speed``): what Mineflayer waits
+      between "start" and "finished" (``BreakTime.mineflayer_ticks``). The two speeds differ on
+      tier-gated blocks (see ``mineflayer_tool_speed``).
+
     Double rounding can land just above an integer: coal ore with a wooden pickaxe is
-    2 / 3 / 30 = 1/45 exactly, but 1 / dmg evaluates to 45.000000000000007, so Mineflayer waits 46.
-    0 = instant; None = never.
+    2 / 3 / 30 = 1/45 exactly, but 1 / dmg evaluates to 45.000000000000007, so this gives 46.
     """
     c = _c(c)
     if hardness < 0:
@@ -315,44 +320,118 @@ def mineflayer_break_ticks(hardness: float, tool_speed: float, can_harvest: bool
     return math.ceil(1.0 / delta)
 
 
+# Mineflayer's ``bot.dig`` sends "start", waits ``bot.digTime(block)`` ms and sends "finished"
+# (mineflayer 4.39.0, lib/plugins/digging.js [74], read from npm [9]). ``digTime`` is
+# prismarine-block 1.23.0's ``Block.digTime``, which takes the tool speed from minecraft-data's
+# materials table, ``registry.materials[block.material][heldItemId]`` (default 1), not from the
+# game's tool rules. Both lookups below are data of the pinned minecraft-data [1] (pc/1.21.1
+# blocks.json and materials.json; the same bytes as npm minecraft-data 3.117.0, which
+# bridge/package-lock.json locks). tests/test_mechanics.py checks them against the source cache
+# for every block and tool, and against digTime outputs of the real packages.
+#
+# Every tier-gated block (exactly the members of the block tag ``incorrect_for_wooden_tool``:
+# iron, gold, diamond, redstone, lapis, copper and emerald ores, obsidian, iron block, ...) has
+# material "incorrect_for_wooden_tool", and that material lists only these four tools:
+MINEFLAYER_TIER_GATED_TAG = "incorrect_for_wooden_tool"
+MINEFLAYER_TIER_GATED_SPEEDS: dict[str, float] = {  # [1] materials.json "incorrect_for_wooden_tool"
+    "wooden_shovel": 2.0, "wooden_pickaxe": 2.0, "wooden_axe": 2.0, "wooden_hoe": 2.0}
+# Blocks whose minecraft-data material lacks a tool kind that the 1.21.1 mineable tags give them
+# (the same pairs as build_rules.TOLERATED_TOOL_SPEED): Mineflayer digs them at speed 1 with it.
+MINEFLAYER_MISSING_TOOL_KINDS: dict[str, frozenset[str]] = {  # [1] material "plant" has no hoes
+    "moss_carpet": frozenset({"hoe"}),
+    "pink_petals": frozenset({"hoe"}),
+}
+_MINEFLAYER_DEFAULT_SPEED = 1.0  # prismarine-block digTime: blockBreakingSpeed = 1 without a match [9]
+
+
+def mineflayer_tool_speed(rules: Rules, held: str | None, block: str) -> float:
+    """The tool speed Mineflayer's dig wait uses for ``block`` with ``held`` (None = empty hand).
+
+    Equal to ``rules.mining_speed`` (the game's tool rules) except where minecraft-data's
+    material disagrees with the tags (see the tables above; the rules build checks every other
+    block and tool). On tier-gated blocks every stone, iron, gold, diamond and netherite tool
+    gets 1 (the game: the tool's tier speed), and a wooden axe, shovel or hoe gets 2 (the game: 1).
+    So unpatched Mineflayer waits too long on the whole ore tech tree, by the tool's speed factor
+    (iron ore with a stone pickaxe: 91 ticks, not 23; obsidian with a diamond pickaxe: 1500, not
+    188), and with a wooden axe, shovel or hoe it sends "finished" before the server accepts it
+    (``BreakTime.mineflayer_refused``).
+    """
+    if held is None:
+        return _MINEFLAYER_DEFAULT_SPEED
+    if rules.in_tag("block", block, MINEFLAYER_TIER_GATED_TAG):
+        return MINEFLAYER_TIER_GATED_SPEEDS.get(held, _MINEFLAYER_DEFAULT_SPEED)
+    tool = rules.item(held).tool
+    if tool is not None and tool.kind in MINEFLAYER_MISSING_TOOL_KINDS.get(block, ()):
+        return _MINEFLAYER_DEFAULT_SPEED
+    return rules.mining_speed(held, block)
+
+
 @dataclass(frozen=True)
 class BreakTime:
-    """How long a block takes to break. Every count is 0 for instant and None for never."""
+    """How long a block takes to break. Every count is 0 for instant and None for never.
+
+    ``design_ticks`` is also what Mineflayer would wait if the bridge made ``bot.digTime`` use
+    the game's tool rules; ``mineflayer_ticks`` is what Mineflayer 4.39.0 waits as shipped.
+    """
 
     progress_per_tick: float  # float32 progress per tick (0 unbreakable, inf for hardness 0)
     ticks: int | None  # vanilla client: ticks of float32 accumulation until >= 1.0
-    mineflayer_ticks: int | None  # ceil(1/dmg) in doubles: Mineflayer's wait and DESIGN.md 4.3's formula
+    design_ticks: int | None  # DESIGN.md 4.3: ceil(1/dmg) in doubles with the game's tool speeds
+    mineflayer_ticks: int | None  # unpatched Mineflayer's wait: ceil(1/dmg) with minecraft-data's speeds
     server_accept_ticks: int | None  # earliest server ticks after "start" that accept "finished" (70%)
 
     @property
     def breakable(self) -> bool:
-        return self.ticks is not None or self.mineflayer_ticks is not None
+        return self.ticks is not None or self.design_ticks is not None
 
     @property
     def instant(self) -> bool:
         return self.ticks == 0
 
+    @property
+    def mineflayer_refused(self) -> bool:
+        """Unpatched Mineflayer sends "finished" before the server's 70% check passes.
 
-def break_ticks(hardness: float, tool_speed: float, can_harvest: bool, *, efficiency: int = 0,
-                haste: int = 0, mining_fatigue: int = 0, in_water: bool = False, aqua_affinity: bool = False,
-                on_ground: bool = True, c: MechanicsConstants | None = None) -> BreakTime:
-    """Break time of a block from primitive inputs [13] (see ``BreakTime`` for the three counts).
+        Compares tick counts and ignores the phase of the server tick and network jitter, so it
+        is exact only away from the boundary. The server then refuses the "finished" packet and
+        breaks the block by itself once progress reaches 100% [mem], long after Mineflayer's
+        promise resolved; DESIGN.md 5's dig check sees the block still there (``DIG_FAILED``).
+        """
+        if self.mineflayer_ticks is None or self.server_accept_ticks is None:
+            return False
+        return self.mineflayer_ticks < self.server_accept_ticks
 
-    ``ticks`` emulates the vanilla client exactly. It differs from ``mineflayer_ticks`` (and from
-    the DESIGN.md check values) when 1/dmg is an integer or nearly one, where float32 rounding can
-    add a tick (stone or logs by hand: 151 and 61 instead of 150 and 60), and on very slow breaks,
-    where the float32 sum drifts. The vanilla client then waits ``break_delay_ticks()`` before
-    progress starts on the next block.
+
+def break_ticks(hardness: float, tool_speed: float, can_harvest: bool, *, mineflayer_speed: float | None = None,
+                efficiency: int = 0, haste: int = 0, mining_fatigue: int = 0, in_water: bool = False,
+                aqua_affinity: bool = False, on_ground: bool = True,
+                c: MechanicsConstants | None = None) -> BreakTime:
+    """Break time of a block from primitive inputs [13] (see ``BreakTime`` for the four counts).
+
+    tool_speed: the game's tool-rule speed (``Rules.mining_speed``); mineflayer_speed: the speed
+    prismarine-block uses (``mineflayer_tool_speed``), None = the same as ``tool_speed``.
+
+    ``ticks`` emulates the vanilla client exactly. It differs from ``design_ticks`` (the DESIGN.md
+    check values) when 1/dmg is an integer or nearly one, where float32 rounding can add a tick
+    (stone or logs by hand: 151 and 61 instead of 150 and 60) or double rounding can (coal ore
+    with a wooden pickaxe: 45 vs 46), and on very slow breaks, where the float32 sum drifts. The
+    vanilla client then waits ``break_delay_ticks()`` before progress starts on the next block.
     """
     c = _c(c)
     effects = {"efficiency": efficiency, "haste": haste, "mining_fatigue": mining_fatigue, "in_water": in_water,
                "aqua_affinity": aqua_affinity, "on_ground": on_ground}
     speed = destroy_speed(tool_speed, c=c, **effects)
     progress = progress_per_tick(hardness, speed, can_harvest, c)
+    design = design_break_ticks(hardness, tool_speed, can_harvest, c=c, **effects)
+    if mineflayer_speed is None or mineflayer_speed == tool_speed:
+        mineflayer = design
+    else:
+        mineflayer = design_break_ticks(hardness, mineflayer_speed, can_harvest, c=c, **effects)
     return BreakTime(
         progress_per_tick=progress,
         ticks=client_break_ticks(progress),
-        mineflayer_ticks=mineflayer_break_ticks(hardness, tool_speed, can_harvest, c=c, **effects),
+        design_ticks=design,
+        mineflayer_ticks=mineflayer,
         server_accept_ticks=server_accept_ticks(progress, c),
     )
 
@@ -362,7 +441,8 @@ def break_ticks_for(rules: Rules, block: str, held: str | None = None, *, effici
                     on_ground: bool = True) -> BreakTime:
     """Break time of a vanilla block with a vanilla held item (None = empty hand)."""
     return break_ticks(rules.block(block).hardness, rules.mining_speed(held, block), rules.can_harvest(held, block),
-                       efficiency=efficiency, haste=haste, mining_fatigue=mining_fatigue, in_water=in_water,
+                       mineflayer_speed=mineflayer_tool_speed(rules, held, block), efficiency=efficiency,
+                       haste=haste, mining_fatigue=mining_fatigue, in_water=in_water,
                        aqua_affinity=aqua_affinity, on_ground=on_ground, c=constants_for(rules))
 
 

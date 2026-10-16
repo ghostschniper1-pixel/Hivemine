@@ -1,10 +1,10 @@
 {
   "game_version": "1.21.1",
-  "note": "Pins for the server side of DESIGN.md 11.2 (Fabric 1.21.1 + Lithium + Carpet + harness mod) and the pregeneration tool. Modrinth, Fabric maven and Mojang were not reachable when this file was written (2026-10-16), so every version and hash is TODO-pin. On the owner's PC: download the files, run `python bridge/server/servertool.py check-mods --dir <instance>`, which prints each jar's sha256, and copy the values here. Once pinned, check-mods fails on any missing, changed or extra jar. Changing a pinned jar is a change of the frozen config: measure again (DESIGN.md 11.2).",
+  "note": "Pins for the server side of DESIGN.md 11.2 (Fabric 1.21.1 + Lithium + Carpet + harness mod) and the pregeneration tool. Modrinth, Fabric maven and Mojang were not reachable when this file was written (2026-10-16), so every version and hash is TODO-pin. On the owner's PC (bridge/server/README.md section 4, step 4): start the instance once, run `python bridge/server/servertool.py check-mods --dir <instance>`, which prints the Java version line and the sha256 (and server.jar's sha1) of every jar, and copy the values and versions here. check-mods reports NOT FROZEN, and fails, until every TODO-pin entry below is filled in (Java, server jar, loader, launcher and every mod). Once pinned, it fails on any missing, changed or extra jar and on another Java. Changing a pinned value is a change of the frozen config: measure again (DESIGN.md 11.2).",
   "java": {
     "major": 21,
     "why": "Minecraft 1.20.5 and later need Java 21 [mem]",
-    "version": "TODO-pin (output of `java -version`)"
+    "version": "TODO-pin (the version line of `java -version`, exactly as check-mods prints it after 'java:')"
   },
   "server_jar": {
     "file": "server.jar",
@@ -16,7 +16,7 @@
     "name": "fabric-loader",
     "version": "TODO-pin",
     "installer_version": "TODO-pin",
-    "launcher_file": "TODO-pin (e.g. fabric-server-mc.1.21.1-loader.<version>-launcher.<version>.jar)",
+    "launcher_file": "TODO-pin (the jar that starts the server, in the instance folder: fabric-server-mc.1.21.1-loader.<version>-launcher.<version>.jar, or fabric-server-launch.jar from the installer)",
     "launcher_sha256": "TODO-pin",
     "source": "https://fabricmc.net/use/server/"
   },

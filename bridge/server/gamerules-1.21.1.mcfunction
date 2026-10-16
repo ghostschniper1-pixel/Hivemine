@@ -13,7 +13,9 @@
 # (players_sleeping_percentage; max_block_modifications since 25w44a) [73].
 #
 # Only rules that DESIGN.md states are active here. Everything else stays at the vanilla
-# default. Proposals are in the commented block at the end, for the owner to decide.
+# default, listed in gamerule-defaults-1.21.1.json (names checked, defaults [mem]);
+# check-gamerules reads every rule back, not only these three. Proposals are in the commented
+# block at the end, for the owner to decide.
 
 # Night skip only when 100% of players sleep. 100 is the vanilla default [73]; set explicitly
 # because the simulator models exactly this rule (DESIGN.md 4.2, 10.1, D14).

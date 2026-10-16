@@ -142,8 +142,9 @@ GAME: dict[str, Const] = {
 
 # ---------------------------------------------------------------------------
 # Armor (not in the 1.21.1 data dumps). Points per slot: head, chest, legs, feet.
-# DESIGN 4.3 quotes iron 2/6/5/2 and diamond 3/8/6/3 with toughness 2 from [17];
-# the rest is from memory and must be checked against [17].
+# DESIGN 4.3 quotes only iron 2/6/5/2 and diamond 3/8/6/3 points and diamond's toughness 2
+# from [17]; every other field is from memory and must be checked against [17]. Each field
+# carries its own label, so the rules file never presents an unquoted value as sourced.
 # ---------------------------------------------------------------------------
 
 ARMOR_SLOTS = ("head", "chest", "legs", "feet")
@@ -152,19 +153,24 @@ ARMOR_PIECES = {"helmet": "head", "chestplate": "chest", "leggings": "legs", "bo
 
 @dataclass(frozen=True)
 class ArmorMaterial:
-    points: tuple[int, int, int, int]  # head, chest, legs, feet
-    toughness: float
-    knockback_resistance: float
-    source: str
+    points: Const  # (head, chest, legs, feet)
+    toughness: Const  # per piece
+    knockback_resistance: Const  # per piece
+
+
+def _armor(points: tuple[int, int, int, int], toughness: float, knockback_resistance: float,
+           points_src: str = "[mem]", toughness_src: str = "[mem]", kb_src: str = "[mem]") -> ArmorMaterial:
+    return ArmorMaterial(Const(points, points_src), Const(toughness, toughness_src),
+                         Const(knockback_resistance, kb_src))
 
 
 ARMOR: dict[str, ArmorMaterial] = {
-    "leather": ArmorMaterial((1, 3, 2, 1), 0.0, 0.0, "[mem]"),  # [mem]
-    "chainmail": ArmorMaterial((2, 5, 4, 1), 0.0, 0.0, "[mem]"),  # [mem]
-    "golden": ArmorMaterial((2, 5, 3, 1), 0.0, 0.0, "[mem]"),  # [mem]
-    "iron": ArmorMaterial((2, 6, 5, 2), 0.0, 0.0, "[17]"),  # [17] points; toughness 0 implied
-    "diamond": ArmorMaterial((3, 8, 6, 3), 2.0, 0.0, "[17]"),  # [17] points and toughness 2
-    "netherite": ArmorMaterial((3, 8, 6, 3), 3.0, 0.1, "[mem]"),  # [mem] toughness 3, kb resistance 0.1 per piece
+    "leather": _armor((1, 3, 2, 1), 0.0, 0.0),  # [mem]
+    "chainmail": _armor((2, 5, 4, 1), 0.0, 0.0),  # [mem]
+    "golden": _armor((2, 5, 3, 1), 0.0, 0.0),  # [mem]
+    "iron": _armor((2, 6, 5, 2), 0.0, 0.0, points_src="[17]"),  # [17] points; [mem] toughness, kb resistance
+    "diamond": _armor((3, 8, 6, 3), 2.0, 0.0, points_src="[17]", toughness_src="[17]"),  # [17]; [mem] kb resistance
+    "netherite": _armor((3, 8, 6, 3), 3.0, 0.1),  # [mem] toughness 3, kb resistance 0.1 per piece
 }
 
 # Single armor items that are not part of a material set.
@@ -268,7 +274,7 @@ class MobStats:
     speed: Const
 
 
-def _m(hp: float, armor: float, dmg: float | None, speed: float, hp_src: str = "[mem]",
+def _m(hp: float, armor: float, dmg: float | None, speed: float | None, hp_src: str = "[mem]",
        armor_src: str = "[mem]", dmg_src: str = "[mem]", speed_src: str = "[mem]") -> MobStats:
     return MobStats(Const(hp, hp_src), Const(armor, armor_src), Const(dmg, dmg_src), Const(speed, speed_src))
 
@@ -287,6 +293,14 @@ MOBS: dict[str, MobStats] = {
     "enderman": _m(40.0, 0.0, 7.0, 0.3),  # [mem]
     "witch": _m(26.0, 0.0, None, 0.25),  # [mem] throws potions
     "silverfish": _m(8.0, 0.0, 1.0, 0.25),  # [mem]
+    # Overworld hostiles that v1 episodes can meet: slimes (swamps, slime chunks below y 40),
+    # phantoms (nights without sleep), bogged (swamps). Other curated hostiles (illagers,
+    # guardians, warden, breeze, zombified piglin) have no stats yet (NaN in the concepts).
+    # Slime stats depend on its size s (1, 2 or 4): health s^2, attack s (none at s = 1),
+    # speed 0.2 + 0.1 s [mem]; the class carries the big slime (s = 4).
+    "slime": _m(16.0, 0.0, 4.0, 0.6),  # [mem] big slime
+    "phantom": _m(20.0, 0.0, 6.0, None),  # [mem] attack 6 + size (0); flies, no walking speed
+    "bogged": _m(16.0, 0.0, 3.0, 0.25, dmg_src="[est]"),  # [mem]; [est] arrow damage as the skeleton's
     "cow": _m(10.0, 0.0, None, 0.2),  # [mem]
     "pig": _m(10.0, 0.0, None, 0.25),  # [mem]
     "sheep": _m(8.0, 0.0, None, 0.23),  # [mem]
@@ -299,9 +313,9 @@ def all_constants() -> dict[str, Const]:
     """Every hard-coded value as a flat name -> Const map (the rules file's ``constants``)."""
     out: dict[str, Const] = dict(GAME)
     for material, a in ARMOR.items():
-        out[f"armor:{material}"] = Const(
-            {"points": list(a.points), "toughness": a.toughness,
-             "knockback_resistance": a.knockback_resistance}, a.source)
+        out[f"armor:{material}:points"] = Const(list(a.points.value), a.points.source)
+        out[f"armor:{material}:toughness"] = a.toughness
+        out[f"armor:{material}:knockback_resistance"] = a.knockback_resistance
     for item, (slot, points, toughness, kb, src) in ARMOR_EXTRA.items():
         out[f"armor:{item}"] = Const(
             {"slot": slot, "points": points, "toughness": toughness, "knockback_resistance": kb}, src)

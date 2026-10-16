@@ -142,7 +142,42 @@ def test_out_of_range_fields_raise(rng: CounterRNG, key: DrawKey) -> None:
         rng.u64(key)
 
 
+@pytest.mark.parametrize("key", [
+    DrawKey(0, 600.5, 0), DrawKey(0, 600.0, 0), (0, 600.9, 3), DrawKey(0.0, 0, 0), DrawKey(0, 0, 1.0),
+    DrawKey(0, 0, 0, 2.0), DrawKey(0, 0, 0, 0, 1.5), DrawKey(0, True, 0), DrawKey(0, 0, 0, np.float64(3)),
+    DrawKey(0, 0, 0, np.True_), DrawKey(0, "1", 0),
+])
+def test_non_integer_fields_raise_instead_of_truncating(rng: CounterRNG, key: tuple) -> None:
+    with pytest.raises(TypeError):
+        rng.u64(key)
+
+
+def test_integer_like_fields_are_accepted(rng: CounterRNG) -> None:
+    expected = rng.u64(DrawKey(3, 1200, 7, 17, 2))
+    assert rng.u64(DrawKey(np.int32(3), np.uint64(1200), Purpose.LOOT, np.int64(17), np.uint8(2))) == expected
+
+
+def test_u64_array_rejects_non_integer_arrays(rng: CounterRNG) -> None:
+    with pytest.raises(TypeError):
+        rng.u64_array(0, 600, 3, np.array([1.7, 2.2]), 0)
+    with pytest.raises(TypeError):
+        rng.u64_array(0, 600, 3, 1, np.array([0.0, 1.0]))
+    with pytest.raises(TypeError):
+        rng.u64_array(0, 600.5, 3, 1, 0)
+    with pytest.raises(TypeError):
+        rng.u64_array(0, 600, 3.0, 1, 0)
+    with pytest.raises(TypeError):
+        rng.u64_array(0, 600, 3, np.array([True, False]), 0)
+    ok = rng.u64_array(0, 600, 3, np.array([1, 2], dtype=np.uint32), np.uint8(4))
+    assert [int(x) for x in ok] == [rng.u64(DrawKey(0, 600, 3, e, 4)) for e in (1, 2)]
+    assert rng.u64_array(0, 600, 3, np.array([], dtype=np.int64), 0).shape == (0,)
+
+
 def test_bad_seed_and_arguments_raise(rng: CounterRNG) -> None:
+    with pytest.raises(TypeError):
+        CounterRNG(1.9)
+    with pytest.raises(TypeError):
+        CounterRNG(True)
     key = DrawKey(0, 0, 0)
     with pytest.raises(ValueError):
         CounterRNG(-1)

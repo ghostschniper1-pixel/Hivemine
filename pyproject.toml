@@ -16,7 +16,7 @@ dev = ["pytest>=8"]
 include = ["hivemind*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "bridge/server"]
 addopts = "-q"
 markers = [
     "slow: long-running tests (deselect with -m 'not slow')",

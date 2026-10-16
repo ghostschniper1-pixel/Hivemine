@@ -1,0 +1,7 @@
+# Keep LF line endings in bridge/ on every OS (Git for Windows may otherwise check text out with
+# CRLF [mem]). Hashes of committed text files are recorded per session: package-lock.json in the
+# Node host's hello (PROTOCOL.md 4.1), and server.properties and the gamerule files in each
+# instance's hivemind-instance.json. servertool.py also hashes text with line endings normalized,
+# so a CRLF checkout cannot change those hashes either way.
+* text=auto eol=lf
+*.jar binary

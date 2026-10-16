@@ -10,6 +10,7 @@ Usage::
     concepts.block_class_of_state(1)               # the class of vanilla state 1 (stone)
     concepts.item_class_of("oak_log").name         # 'log'
     concepts.entity_class_of("cave_spider").phrase # ('cave', 'spider')
+    concepts.class_by_phrase("block", ("hanging", "lantern")).name  # 'other_hanging_lantern'
     concepts.hardness[concepts.block_class("stone").id]   # 1.5 (NumPy arrays for the simulator)
 
 The build reads only ``data/rules-1.21.1.json`` (no network, no raw sources) and writes
@@ -19,7 +20,8 @@ What a class is. The agent does not see 1,060 blocks and 1,333 items; it sees cl
 vanilla blocks (per state), items or entities that behave the same in v1. Each class has a
 phrase: plain English words taken from the 1.21.1 display names (the rules file's names, which
 the rules build checks against minecraft-data ``language.json``), lower-cased and split on
-spaces and punctuation, with overrides only where a class merges differently named members.
+spaces and punctuation, with overrides only where a class merges differently named members or
+splits one block by state. Phrases keep the game's number ("carrots", "stone bricks", "shears").
 
 How the build guards the classes (it fails on any violation that is not listed in
 ``EXCEPTIONS`` with a justification and the gameplay approximation it causes; an exception that
@@ -41,9 +43,12 @@ no longer matches a violation also fails, so the list stays exact):
   combination of class members (e.g. ``planks <- log`` holds for every log, because each wood
   type has its own recipe). Correlated slots fail this check: a bed needs three wool of one
   colour, which the class ``wool`` cannot express.
-- Phrases: unique among curated block classes, among v1 item classes and among entity classes
-  (the classes that can appear in commands); no block-class phrase equals an entity-class
-  phrase (they meet in ``go to the nearest {block}`` vs ``go to the nearest {entity}``).
+- Phrases: unique among the curated classes of each kind (``none``, air and buried included),
+  so ``phrase`` is invertible for everything a command can name (contracts 4.4); no block-class
+  phrase equals an entity-class phrase (they meet in ``go to the nearest {block}`` vs
+  ``go to the nearest {entity}``). Fallback phrases must be true of every member, because their
+  words are shared with curated classes and the agent learns word meanings from them; they may
+  repeat (fallbacks never appear in commands) but never equal a curated phrase.
 
 Fallbacks. Block states that are not curated fall into classes keyed by the exact break
 inputs, the collision height class, the transparent/liquid/climbable/hazard/gravity/replaceable
@@ -51,11 +56,18 @@ flags and the v1 item classes they can drop. Keying on everything would need 235
 classes next to 114 curated ones, more than a byte holds, so light, the solid flag and drop details other than
 which v1 items can drop may vary inside a fallback class; each such class is listed in
 ``exceptions`` with the value it takes (most common light, solid only if all states are full
-cubes, the most common drop table). A fallback's phrase is the words all members' names end
-with ("slab", "cobblestone wall"), else a listed hint ("infested block"), else ``block``.
-Items outside v1 fall into ``other_item_{1,16,64}`` keyed by stack size only. Entities outside
-the curated list fall into ``monster``, ``animal`` or ``object``. Fallbacks are never
-resources and never v1 items.
+cubes, the most common drop table) and, where the v1 drop counts differ by state, every
+variant (e.g. 2-5 snowballs for snow layers). A fallback's phrase is, in this order: a listed
+hint (``FALLBACK_PHRASE_HINTS``: "infested block", and state words for blocks split by state:
+"hanging lantern", "open fence gate"); the words all members' names end with (the whole name
+for a single member: "beacon"; "glazed terracotta", "carpet", "slab"), prefixed by ``other``
+if a curated class already has those words; else ``other <tool> block`` (or ``other block``).
+A member's name is never used for a class it does not describe: naming coal blocks "bell"
+would teach the agent a wrong meaning. Items outside v1 fall into ``other_item_{1,16,64}`` keyed by stack
+size only, with distinct phrases. Entities outside the curated list fall into ``monster``,
+``animal`` or ``object`` by minecraft-data's entity type and category; where the two disagree,
+``ENTITY_KIND_OVERRIDES`` decides (skeleton horse: animal, evoker fangs: object). Fallbacks
+are never resources and never v1 items.
 
 Representation choices not fixed by the contract (all additive):
 
@@ -81,7 +93,7 @@ import json
 import re
 import sys
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -89,7 +101,7 @@ from typing import Any
 
 import numpy as np
 
-from hivemind.rules.loader import GAME_VERSION, Rules, load_rules
+from hivemind.rules.loader import GAME_VERSION, Entity, Rules, load_rules
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONCEPTS_PATH = REPO_ROOT / "data" / f"concepts-{GAME_VERSION}.json"
@@ -518,20 +530,59 @@ ENTITY_SPECS: tuple[EntitySpec, ...] = (
 # Fallback entity classes by kind (names, phrases).
 ENTITY_FALLBACKS = (("monster", "hostile", ("monster",)), ("animal", "passive", ("animal",)),
                     ("object", "other", ("object",)))
-# Phrases for fallback classes whose members share no last word (or share a curated phrase),
-# chosen by the first member found here (in state-id order).
-FALLBACK_PHRASE_HINTS = {
-    "snow": "snow layers",  # snow with 2-8 layers (1 layer is the curated "snow")
-    "tnt": "unstable tnt",
-    "infested_stone": "infested block",
-    "suspicious_sand": "suspicious block",
-    "potted_oak_sapling": "potted sapling",
-    "cave_vines": "cave vines",
-    "mangrove_propagule": "small plant",  # propagule, nether wart, fungi, spore blossom, small dripleaf
+# The kind of a fallback entity comes from minecraft-data 1.20.5's entity type and category.
+# Where both say something and disagree, ENTITY_KIND_OVERRIDES must decide (the build fails
+# otherwise, and on an override that no longer settles a disagreement).
+ENTITY_TYPE_KIND: dict[str, str] = {  # "mob" and missing types say nothing
+    "hostile": "hostile", "animal": "passive", "passive": "passive", "water_creature": "passive",
+    "ambient": "passive", "player": "other", "projectile": "other", "other": "other", "living": "other",
 }
+ENTITY_CATEGORY_KIND: dict[str, str] = {  # missing categories say nothing
+    "Hostile mobs": "hostile", "Passive mobs": "passive", "Projectiles": "other", "Immobile": "other",
+    "Vehicles": "other", "UNKNOWN": "other",
+}
+ENTITY_KIND_OVERRIDES: dict[str, str] = {  # all listed under "Hostile mobs"
+    "skeleton_horse": "passive",  # [mem] type animal: passive (also when it brings skeleton riders)
+    "zombie_horse": "passive",  # [mem] type animal: passive
+    "evoker_fangs": "other",  # [mem] type other: a spell effect, not a mob
+    "hoglin": "hostile",  # [mem] type animal (it can be bred) but attacks players
+}
+
+# Phrase hints for fallback classes (see the module docstring), as (member block, fallback-key
+# values the class must have, phrase). For each member in state-id order, that block's hints are
+# tried in table order; the first match wins. The key values let a block that is split by state
+# name each part. Every hint must name some class (a stale hint fails the build).
+FALLBACK_PHRASE_HINTS: tuple[tuple[str, Mapping[str, Any], str], ...] = (
+    # blocks split by state (collision class or drops)
+    ("snow", {"collision_height": 0.5}, "snow layers"),  # 2-5 layers (1 layer is the curated "snow")
+    ("snow", {"collision_height": 1.0}, "deep snow"),  # 6-8 layers: a full step up
+    ("lantern", {"collision_height": 1.0}, "hanging lantern"),
+    ("lantern", {"collision_height": 0.5}, "lantern"),
+    ("oak_fence_gate", {"collision_height": 0.0}, "open fence gate"),
+    ("oak_fence_gate", {"collision_height": 1.5}, "fence gate"),
+    ("oak_trapdoor", {"collision_height": 0.5}, "trapdoor"),  # closed in the bottom half
+    ("oak_trapdoor", {"collision_height": 1.0}, "raised trapdoor"),  # open, or in the top half
+    ("big_dripleaf", {"collision_height": 1.0}, "big dripleaf"),
+    ("big_dripleaf", {"collision_height": 0.0}, "tilted big dripleaf"),  # fully tilted: no collision
+    ("amethyst_cluster", {"collision_height": 0.5}, "amethyst cluster"),  # clusters and buds facing up
+    ("amethyst_cluster", {"collision_height": 1.0}, "hanging amethyst cluster"),  # on walls and ceilings
+    ("cave_vines", {"v1_drops": ["glow_berries"]}, "cave vines with glow berries"),
+    # (cave vines without berries share a class with weeping and twisting vines: a generic phrase)
+    ("candle_cake", {}, "cake with candle"),  # names end "... candle", but the thing is a cake
+    ("tnt", {}, "unstable tnt"),
+    # members without a common name, or whose typical member would mislead
+    ("infested_stone", {}, "infested block"),
+    ("suspicious_sand", {}, "suspicious block"),
+    ("potted_oak_sapling", {}, "potted sapling"),
+    ("mangrove_propagule", {}, "small plant"),  # propagule, nether wart, fungi, spore blossom, small dripleaf
+    ("flower_pot", {}, "flower pot"),  # empty and potted plants without v1 drops
+    ("skeleton_skull", {}, "skull"),  # mob heads and skulls on the ground
+    ("skeleton_wall_skull", {}, "wall skull"),
+)
 FALLBACK_JUSTIFICATION = ("block ids must fit one byte (contracts 3); fallback classes key on exact break "
                           "inputs, collision class, nav and perception flags and the v1 items they can drop")
-ITEM_FALLBACK_PHRASES = {1: ("other", "unstackable", "item"), 16: ("other", "item"), 64: ("other", "item")}
+ITEM_FALLBACK_PHRASES = {1: ("other", "unstackable", "item"), 16: ("other", "small", "stack", "item"),
+                         64: ("other", "item")}
 
 
 # ---------------------------------------------------------------------------
@@ -548,11 +599,13 @@ class Exception_:
     approximation: str
     drop_state: Mapping[str, str] | None = None  # for "drops": property values the class drops as
     keep_recipe: bool = False  # for "recipe": keep the family in the class-level book anyway
+    two_cell: bool = False  # for "drops": a two-cell object (location checks on the other half hold)
 
 
 TWO_CELL = ("two-cell object: one half drops nothing and breaking either half removes both",
             ("the class drops once per object (as the half named in drop_state); the simulator must "
-             "break both cells together"))
+             "break both cells together, so a loot condition that tests the other half (tall grass, "
+             "large fern) is taken as true"))
 CROP_AGE = ("crop age is not tracked by the class (voxels hold class ids only); crops do not grow in v1",
             "a crop drops as a fully grown one (drop_state); in the real game unripe crops give only seeds")
 
@@ -565,11 +618,14 @@ EXCEPTIONS: tuple[Exception_, ...] = (
                "wood and stripped-wood recipes turn four logs of one wood type into three logs of the "
                "same class",
                "these recipes are left out of the class-level recipe book (they only lose material)"),
-    Exception_("drops", "bed", "state-dependent drops", *TWO_CELL, drop_state={"part": "head"}),
-    Exception_("drops", "door", "state-dependent drops", *TWO_CELL, drop_state={"half": "lower"}),
-    Exception_("drops", "tall_grass", "state-dependent drops", *TWO_CELL, drop_state={"half": "lower"}),
-    Exception_("drops", "large_fern", "state-dependent drops", *TWO_CELL, drop_state={"half": "lower"}),
-    Exception_("drops", "tall_flower", "state-dependent drops", *TWO_CELL, drop_state={"half": "lower"}),
+    Exception_("drops", "bed", "state-dependent drops", *TWO_CELL, drop_state={"part": "head"}, two_cell=True),
+    Exception_("drops", "door", "state-dependent drops", *TWO_CELL, drop_state={"half": "lower"}, two_cell=True),
+    Exception_("drops", "tall_grass", "state-dependent drops", *TWO_CELL, drop_state={"half": "lower"},
+               two_cell=True),
+    Exception_("drops", "large_fern", "state-dependent drops", *TWO_CELL, drop_state={"half": "lower"},
+               two_cell=True),
+    Exception_("drops", "tall_flower", "state-dependent drops", *TWO_CELL, drop_state={"half": "lower"},
+               two_cell=True),
     Exception_("drops", "wheat", "state-dependent drops", *CROP_AGE, drop_state={"age": "7"}),
     Exception_("drops", "carrots", "state-dependent drops", *CROP_AGE, drop_state={"age": "7"}),
     Exception_("drops", "potatoes", "state-dependent drops", *CROP_AGE, drop_state={"age": "7"}),
@@ -630,6 +686,20 @@ def is_full_cube(boxes: Sequence[Sequence[float]]) -> bool:
     return len(boxes) == 1 and tuple(boxes[0]) == (0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
 
 
+def fallback_entity_kind(e: Entity) -> tuple[str, str | None]:
+    """(kind, problem) of an entity outside the curated list: kind is "hostile", "passive" or
+    "other", from minecraft-data's type and category or ENTITY_KIND_OVERRIDES; problem is a
+    message when the type and category disagree and no override decides."""
+    by_type = ENTITY_TYPE_KIND.get(e.type or "")
+    by_category = ENTITY_CATEGORY_KIND.get(e.category or "")
+    if e.name in ENTITY_KIND_OVERRIDES:
+        return ENTITY_KIND_OVERRIDES[e.name], None
+    if by_type and by_category and by_type != by_category:
+        return by_type, (f"type {e.type!r} says {by_type}, category {e.category!r} says {by_category}; "
+                         "add it to ENTITY_KIND_OVERRIDES")
+    return by_type or by_category or "other", None
+
+
 def _ranges(ids: Iterable[int]) -> list[list[int]]:
     """Sorted ints -> inclusive [lo, hi] runs."""
     out: list[list[int]] = []
@@ -674,17 +744,33 @@ def _is_enchantment_predicate(pred: Any) -> bool:
         "minecraft:enchantments"}
 
 
-def simplify_condition(cond: Mapping[str, Any], block: str, state: Mapping[str, str]) -> bool | dict:
+def _tests_other_half(cond: Mapping[str, Any], block: str) -> bool:
+    """A location_check that tests this same block one cell above or below: the other half of
+    a two-cell object."""
+    pred = cond.get("predicate")
+    if not isinstance(pred, dict) or set(pred) != {"block"} or not isinstance(pred["block"], dict):
+        return False
+    blocks = pred["block"].get("blocks")
+    return (isinstance(blocks, str) and _ns(blocks) == block and cond.get("offsetY") in (1, -1)
+            and not cond.get("offsetX") and not cond.get("offsetZ"))
+
+
+def simplify_condition(cond: Mapping[str, Any], block: str, state: Mapping[str, str],
+                       two_cell: bool = False) -> bool | dict:
     """A loot condition specialised to a v1 player break of this block state: True, False, or the
     (partly simplified) condition when it still depends on the tool, chance or surroundings.
 
     v1 player breaks: no enchantments (DESIGN.md 4.2: no Fortune or Silk Touch), no explosion,
-    and the breaking entity exists.
+    and the breaking entity exists. ``two_cell``: the block is one half of a two-cell object
+    that the simulator breaks as a whole (``TWO_CELL``), so a check that the other half is there
+    holds.
     """
     kind = cond.get("condition")
     if kind == "minecraft:block_state_property" and _ns(cond.get("block", "")) == block:
         v = _state_matches(cond.get("properties", {}), state)
         return dict(cond) if v is None else v
+    if kind == "minecraft:location_check" and two_cell and _tests_other_half(cond, block):
+        return True
     if kind == "minecraft:survives_explosion":
         return True  # no explosion: always survives
     if kind == "minecraft:entity_properties" and cond.get("predicate") == {}:
@@ -692,13 +778,13 @@ def simplify_condition(cond: Mapping[str, Any], block: str, state: Mapping[str, 
     if kind == "minecraft:match_tool" and _is_enchantment_predicate(cond.get("predicate")):
         return False  # no enchanted tools in v1
     if kind == "minecraft:inverted":
-        inner = simplify_condition(cond["term"], block, state)
+        inner = simplify_condition(cond["term"], block, state, two_cell)
         return (not inner) if isinstance(inner, bool) else {"condition": kind, "term": inner}
     if kind in ("minecraft:any_of", "minecraft:all_of"):
         decisive = kind == "minecraft:any_of"  # the value that decides the whole condition
         terms = []
         for t in cond["terms"]:
-            v = simplify_condition(t, block, state)
+            v = simplify_condition(t, block, state, two_cell)
             if v is decisive:
                 return decisive
             if not isinstance(v, bool):
@@ -709,14 +795,14 @@ def simplify_condition(cond: Mapping[str, Any], block: str, state: Mapping[str, 
     return dict(cond)
 
 
-def _resolve_conditions(node: dict, block: str, state: Mapping[str, str]) -> bool:
+def _resolve_conditions(node: dict, block: str, state: Mapping[str, str], two_cell: bool = False) -> bool:
     """Simplify ``node['conditions']`` in place; False when the node can never apply."""
     conds = node.get("conditions")
     if not conds:
         return True
     kept = []
     for c in conds:
-        v = simplify_condition(c, block, state)
+        v = simplify_condition(c, block, state, two_cell)
         if v is False:
             return False
         if v is not True:
@@ -743,13 +829,15 @@ def _is_identity_function(fn: Mapping[str, Any]) -> bool:
             and fn.get("formula") in _FORTUNE_IDENTITY_FORMULAS)
 
 
-def specialise_loot(table: Any, block: str, state: Mapping[str, str]) -> Any:
+def specialise_loot(table: Any, block: str, state: Mapping[str, str], two_cell: bool = False) -> Any:
     """A copy of a loot table specialised to a v1 player break of this block state.
 
     Resolves ``block_state_property`` conditions for the state; removes what cannot matter in
     v1 (Silk Touch branches, explosion survival and decay, copied block-entity names, Fortune
     bonuses that are identities at level 0); turns Fortune ``table_bonus`` into its level-0
-    ``random_chance``. Item tests (shears), random chances and location checks are kept.
+    ``random_chance``. Item tests (shears), random chances and location checks are kept,
+    except that with ``two_cell`` a location check for the object's other half (the same block
+    one cell above or below) holds, because the simulator breaks both cells together.
     """
 
     def walk(node: Any) -> Any:
@@ -763,7 +851,7 @@ def specialise_loot(table: Any, block: str, state: Mapping[str, str]) -> Any:
                         x = {"chance": x["chances"][0], "condition": "minecraft:random_chance"}
                     if "conditions" in x and ("type" in x or "function" in x or "rolls" in x):
                         x = dict(x)
-                        if not _resolve_conditions(x, block, state):
+                        if not _resolve_conditions(x, block, state, two_cell):
                             continue
                 out.append(walk(x))
             return out
@@ -874,6 +962,62 @@ def loot_items(table: Any) -> set[str]:
     return out
 
 
+def _count_text(count: Any) -> str:
+    """A set_count number provider as short text: ``2``, ``1-3``, ``B(3, 0.533)``."""
+    if isinstance(count, (int, float)):
+        return f"{count:g}"
+    kind = _ns(count.get("type", "")) if isinstance(count, dict) else ""
+    try:
+        if kind == "uniform":
+            return f"{count['min']:g}-{count['max']:g}"
+        if kind == "binomial":
+            return f"B({count['n']:g}, {count['p']:.3g})"
+    except (KeyError, TypeError, ValueError):  # nested number providers
+        pass
+    return canonical_json(count)
+
+
+def _condition_text(cond: Mapping[str, Any]) -> str:
+    kind = _ns(cond.get("condition", ""))
+    if kind == "random_chance":
+        return f"p {cond['chance']:.3g}"
+    if kind == "match_tool":
+        return "with " + "/".join(cond.get("predicate", {}).get("items", ["tool"]))
+    return kind
+
+
+def v1_drop_terms(table: Any, is_v1: Callable[[str], bool]) -> list[str]:
+    """How a normalised table produces v1 item classes: one short term per item entry, such as
+    ``snowball x3``, ``melon_seeds xB(3, 0.533)`` or ``wheat_seeds p 0.125``, with the
+    conditions of the entry and its enclosing entries and pool. For reports only."""
+    out: list[str] = []
+
+    def walk(node: Any, conds: list[Mapping[str, Any]]) -> None:
+        if isinstance(node, list):
+            for x in node:
+                walk(x, conds)
+            return
+        if not isinstance(node, dict):
+            return
+        here = [*conds, *node.get("conditions", ())] if ("rolls" in node or "type" in node) else conds
+        if node.get("type") == "minecraft:item" and is_v1(node.get("name", "")):
+            parts = [node["name"]]
+            for fn in node.get("functions", ()):
+                if fn.get("function") == "minecraft:set_count":
+                    parts.append(("+" if fn.get("add") else "x") + _count_text(fn["count"]))
+                else:
+                    parts.append(_ns(fn.get("function", "")))
+                parts += [f"({_condition_text(c)})" for c in fn.get("conditions", ())]
+            parts += [_condition_text(c) for c in here]
+            out.append(" ".join(parts))
+        for k, v in node.items():
+            if k != "conditions":
+                walk(v, here)
+
+    walk(table, [])
+    return sorted(out)
+
+
 def loot_state_properties(table: Any, block: str) -> set[str]:
     """Properties of this block that the table's conditions test."""
     out: set[str] = set()
@@ -899,6 +1043,26 @@ class Violation:
     cls: str
     check: str
     detail: str
+
+
+@dataclass
+class _Fallback:
+    """A fallback block class while it is being named: its key (``fallback_key``), its state ids
+    and its member blocks in state-id order."""
+
+    key: dict
+    states: list[int]
+    members: list[str]
+
+
+def _common_tail(phrases: Sequence[tuple[str, ...]]) -> tuple[str, ...]:
+    """The words all phrases end with (empty if their last words differ)."""
+    tail: list[str] = []
+    for i in range(1, min(len(p) for p in phrases) + 1):
+        if len({p[-i] for p in phrases}) != 1:
+            break
+        tail.insert(0, phrases[0][-i])
+    return tuple(tail)
 
 
 @dataclass
@@ -933,7 +1097,7 @@ class _Builder:
         self._block_props: dict[str, dict] = {}
         self._loot_props: dict[str, tuple[str, ...]] = {}
         self._drop_info_cache: dict[int, tuple[str, list[str], Any]] = {}  # keeps the table alive
-        self._drops_cache: dict[tuple[str, tuple[str, ...]], Any] = {}
+        self._drops_cache: dict[tuple[str, tuple[str, ...], bool], Any] = {}
 
     def fail(self, kind: str, cls: str, check: str, detail: str) -> None:
         self.violations.append(Violation(kind, cls, check, detail))
@@ -1010,7 +1174,8 @@ class _Builder:
         self._block_props[name] = props
         return props
 
-    def state_props(self, name: str, state: int, drop_state: Mapping[str, str] | None = None) -> dict:
+    def state_props(self, name: str, state: int, drop_state: Mapping[str, str] | None = None,
+                    two_cell: bool = False) -> dict:
         """State-level properties: collision class, solid, replaceable and specialised drops."""
         b = self.r.blocks[name]
         boxes = b.collision_boxes(state)
@@ -1022,9 +1187,9 @@ class _Builder:
         if drop_state:
             values = {**values, **{k: v for k, v in drop_state.items() if k in values}}
         return {"collision_height": height, "solid": is_full_cube(boxes),
-                "replaceable": replaceable, "drops": self._drops(name, values)}
+                "replaceable": replaceable, "drops": self._drops(name, values, two_cell)}
 
-    def _drops(self, name: str, values: Mapping[str, str]) -> Any:
+    def _drops(self, name: str, values: Mapping[str, str], two_cell: bool = False) -> Any:
         """Specialised, normalised drops (cached by the state properties the table tests)."""
         b = self.r.blocks[name]
         if b.loot_table is None:
@@ -1032,11 +1197,18 @@ class _Builder:
         table = self.r.loot_table(b.loot_table)
         if name not in self._loot_props:
             self._loot_props[name] = tuple(sorted(loot_state_properties(table, name)))
-        key = (name, tuple(values.get(p, "") for p in self._loot_props[name]))
+        key = (name, tuple(values.get(p, "") for p in self._loot_props[name]), two_cell)
         if key not in self._drops_cache:
-            self._drops_cache[key] = normalise_loot(specialise_loot(table, name, values), name, self.item_class,
-                                                    self.r.raw["tags"]["item"])
+            self._drops_cache[key] = normalise_loot(specialise_loot(table, name, values, two_cell), name,
+                                                    self.item_class, self.r.raw["tags"]["item"])
         return self._drops_cache[key]
+
+    def _state_label(self, state: int) -> str:
+        """``block[prop=value,...]`` with the properties the block's loot table tests."""
+        b = self.r.block_of_state(state)
+        values = b.state_values(state)
+        inner = ",".join(f"{p}={values[p]}" for p in self._loot_props.get(b.name, ()) if p in values)
+        return f"{b.name}[{inner}]" if inner else b.name
 
     def fallback_key(self, name: str, state: int) -> dict:
         """What a fallback class keys on: exact break inputs, collision class, nav and perception
@@ -1093,22 +1265,23 @@ class _Builder:
             for s in range(b.min_state, b.max_state + 1):
                 if s not in self.state_class:
                     groups[canonical_json(self.fallback_key(name, s))].append(s)
+        fallbacks = [_Fallback(json.loads(key), states, sorted({r.block_of_state(s).name for s in states},
+                                                               key=lambda n: r.blocks[n].min_state))
+                     for key, states in groups.items()]
+        fallbacks.sort(key=lambda f: (-len(f.states), min(f.states)))  # larger classes pick names first
         curated_phrases = {self.block_phrase_of(n) for n in self.block_order}
-        named: list[tuple[tuple[str, ...], int, str]] = []
-        for key, states in groups.items():
-            members = sorted({r.block_of_state(s).name for s in states}, key=lambda n: r.blocks[n].min_state)
-            named.append((self._fallback_phrase(members, curated_phrases), min(states), key))
-        named.sort()
+        named = sorted(zip(self._fallback_phrases(fallbacks, curated_phrases), fallbacks),
+                       key=lambda pf: (pf[0], min(pf[1].states)))
         used: dict[str, int] = defaultdict(int)
         self.fallback_phrase: dict[str, tuple[str, ...]] = {}
-        for phrase, _, key in named:
-            base = "other_" + "_".join(phrase) if phrase[0] != "other" else "_".join(phrase)
-            used[base] += 1
+        for phrase, fb in named:
+            base = "other_" + "_".join(phrase)
+            used[base] += 1  # fallback phrases may repeat; the suffix keeps the class names apart
             cname = base if used[base] == 1 else f"{base}_{used[base]}"
             self.block_order.append(cname)
             self.block_spec[cname] = None
             self.fallback_phrase[cname] = phrase
-            for s in groups[key]:
+            for s in fb.states:
                 self.state_class[s] = cname
                 self.block_states[cname].append(s)
         if len(self.block_order) > MAX_BLOCK_CLASS_ID + 1:
@@ -1126,22 +1299,38 @@ class _Builder:
             return self._single_phrase("block", cls, [self.r.blocks[m].display_name for m in spec.members])
         return self.fallback_phrase[cls]
 
-    def _fallback_phrase(self, members: Sequence[str], curated: set[tuple[str, ...]]) -> tuple[str, ...]:
-        """The words all members' names end with ("slab", "cobblestone wall") unless that is a
-        curated phrase; else the hint of a member (FALLBACK_PHRASE_HINTS); else ``other`` plus the
-        common words; else ``block``."""
-        phrases = [words(self.r.blocks[m].display_name) for m in members]
-        tail: list[str] = []
-        for i in range(1, min(len(p) for p in phrases) + 1):
-            if len({p[-i] for p in phrases}) != 1:
-                break
-            tail.insert(0, phrases[0][-i])
-        if tail and tuple(tail) not in curated:
-            return tuple(tail)
-        for m in members:
-            if m in FALLBACK_PHRASE_HINTS:
-                return tuple(FALLBACK_PHRASE_HINTS[m].split())
-        return ("other", *tail) if tail else ("block",)
+    def _fallback_phrases(self, fallbacks: Sequence[_Fallback],
+                          curated: set[tuple[str, ...]]) -> list[tuple[str, ...]]:
+        """One phrase per fallback class, in the order given (see the module docstring): a hint,
+        else the words every member's name ends with (``other`` first if a curated class has
+        them), else ``other <tool> block``. Every phrase is true of every member; phrases may
+        repeat across fallback classes."""
+        names = {m: words(self.r.blocks[m].display_name) for f in fallbacks for m in f.members}
+        used_hints: set[int] = set()
+        out: list[tuple[str, ...]] = []
+        for f in fallbacks:
+            phrase = self._fallback_hint(f, used_hints)
+            if phrase is None:
+                tail = _common_tail([names[m] for m in f.members])
+                if tail:
+                    phrase = ("other", *tail) if tail in curated else tail
+                else:
+                    tools = f.key.get("mineable") or []
+                    phrase = ("other", tools[0], "block") if len(tools) == 1 else ("other", "block")
+            out.append(phrase)
+        for i, (hint_block, want, _p) in enumerate(FALLBACK_PHRASE_HINTS):
+            if i not in used_hints:
+                self.fail("block", hint_block, "stale phrase hint", f"{want}: matches no fallback class; remove it")
+        return out
+
+    def _fallback_hint(self, f: _Fallback, used: set[int]) -> tuple[str, ...] | None:
+        """The phrase of the first FALLBACK_PHRASE_HINTS entry that matches this class."""
+        for m in f.members:
+            for i, (block, want, phrase) in enumerate(FALLBACK_PHRASE_HINTS):
+                if block == m and all(f.key.get(k) == v for k, v in want.items()):
+                    used.add(i)
+                    return tuple(phrase.split())
+        return None
 
     # -- block homogeneity --------------------------------------------------------
 
@@ -1165,11 +1354,12 @@ class _Builder:
                 self._report_diff("block", cls, bprops)
             e = exc.get(cls)
             drop_state = e.drop_state if e else None
+            two_cell = bool(e and e.two_cell)
             sprops: dict[str, list[int]] = defaultdict(list)
             changed = False
             for s in states:
                 name = r.block_of_state(s).name
-                p = self.state_props(name, s, drop_state)
+                p = self.state_props(name, s, drop_state, two_cell)
                 sprops[canonical_json(p)].append(s)
                 if drop_state and not changed and canonical_json(self.state_props(name, s)) != canonical_json(p):
                     changed = True
@@ -1186,7 +1376,7 @@ class _Builder:
             if drop_state:
                 rep_state = next((s for s in own if all(b.state_values(s).get(k, v) == v
                                                         for k, v in drop_state.items())), rep_state)
-            sp = self.state_props(rep_block, rep_state, drop_state)
+            sp = self.state_props(rep_block, rep_state, drop_state, two_cell)
             self.block_cls_props[cls] = {"rep_block": rep_block, "rep_state": rep_state,
                                          "block": self.block_props(rep_block), "solid": sp["solid"],
                                          "collision_height": sp["collision_height"],
@@ -1215,7 +1405,7 @@ class _Builder:
         if len({sps[s]["solid"] for s in states}) > 1:
             varies.append(f"solid mixed -> {solid}")
         if len(drops) > 1:
-            varies.append(f"drops: {len(drops)} tables (same v1 items) -> those of {rep_block}")
+            varies.append(self._drops_variation(drops, first, sps, rep_state))
         if varies:
             self.fallback_approx[cls] = varies
         self.block_cls_props[cls] = {"rep_block": rep_block, "rep_state": rep_state,
@@ -1223,6 +1413,19 @@ class _Builder:
                                      "collision_height": sps[rep_state]["collision_height"],
                                      "replaceable": sps[rep_state]["replaceable"], "drops": sps[rep_state]["drops"],
                                      "light": light}
+
+    def _drops_variation(self, drops: Mapping[str, int], first: Mapping[str, int], sps: Mapping[int, dict],
+                         rep_state: int) -> str:
+        """Report text for a fallback class whose states have several drop tables: the table the
+        class uses and, where the tables differ in how v1 items drop (snow layers, stems), every
+        variant, so the loot and equivalence tests know the exact error."""
+        terms = {d: v1_drop_terms(sps[first[d]]["drops"], lambda c: self.item_v1.get(c, False)) for d in drops}
+        head = f"drops: {len(drops)} tables -> those of {self._state_label(rep_state)}"
+        if len({tuple(t) for t in terms.values()}) == 1:
+            return f"{head} (v1 drops the same in all)"
+        parts = [f"{self._state_label(first[d])}: {', '.join(terms[d]) or 'no v1 items'}"
+                 for d in sorted(drops, key=lambda d: first[d])]
+        return f"{head}; v1 drops differ by state: " + " | ".join(parts)
 
     def _report_diff(self, kind: str, cls: str, by_member: Mapping[str, dict]) -> None:
         """Record one violation per differing field."""
@@ -1386,39 +1589,46 @@ class _Builder:
         for name in sorted(r.entities):
             if name in self.entity_class:
                 continue
-            e = r.entities[name]
-            kind = "hostile" if e.type == "hostile" or e.category == "Hostile mobs" else (
-                "passive" if e.category == "Passive mobs" else "other")
+            kind, problem = fallback_entity_kind(r.entities[name])
+            if problem:
+                self.fail("entity", name, "kind", problem)
             cname = by_kind[kind]
             self.entity_class[name] = cname
             self.entity_members[cname].append(name)
+        for name in ENTITY_KIND_OVERRIDES:
+            e = r.entities.get(name)
+            votes = set() if e is None else {ENTITY_TYPE_KIND.get(e.type or ""),
+                                             ENTITY_CATEGORY_KIND.get(e.category or "")}
+            if self.entity_class.get(name) not in by_kind.values() or len(votes - {None}) < 2:
+                self.fail("entity", name, "stale kind override", "not a fallback entity whose type and category "
+                                                                 "disagree; remove it from ENTITY_KIND_OVERRIDES")
         self.entity_id = {n: i for i, n in enumerate(self.entity_order)}
 
     # -- phrases ---------------------------------------------------------------------------
 
     def check_phrases(self) -> None:
-        def unique(kind: str, phrases: Mapping[str, tuple[str, ...]]) -> None:
-            seen: dict[tuple[str, ...], str] = {}
-            for cls, p in phrases.items():
-                if not p:
-                    self.fail(kind, cls, "phrase", "empty phrase")
-                if p in seen:
-                    self.fail(kind, cls, "phrase", f"phrase {' '.join(p)!r} also used by {seen[p]}")
-                seen[p] = cls
+        """Contracts 3: phrases are lower-case words, unique among the curated classes of each
+        kind; a fallback phrase may repeat but never equals a curated phrase of its kind; air =
+        ``air`` and buried = ``buried``."""
 
-        curated = {c: self.block_phrase[c] for c in self.block_order[:self.curated_count]}
-        unique("block", curated)
-        if self.block_phrase["air"] != ("air",):
-            self.fail("block", "air", "phrase", "air must be 'air'")
-        for c in self.block_order[self.curated_count:]:
-            if self.block_phrase[c] in curated.values():
-                self.fail("block", c, "phrase", "fallback phrase equals a curated phrase")
-        unique("item", {c: p for c, p in self.item_phrase.items() if self.item_v1[c]})
-        v1_phrases = {p for c, p in self.item_phrase.items() if self.item_v1[c]}
-        for c, p in self.item_phrase.items():
-            if not self.item_v1[c] and p in v1_phrases:
-                self.fail("item", c, "phrase", "fallback phrase equals a v1 item phrase")
-        unique("entity", self.entity_phrase)
+        def unique(kind: str, phrases: Mapping[str, tuple[str, ...]], fallback: Callable[[str], bool]) -> None:
+            curated: dict[tuple[str, ...], str] = {}
+            for cls, p in phrases.items():
+                if not p or not all(re.fullmatch(r"[a-z0-9]+", w) for w in p):
+                    self.fail(kind, cls, "phrase", f"phrase {p!r} is not a sequence of lower-case words")
+                if not fallback(cls):
+                    if p in curated:
+                        self.fail(kind, cls, "phrase", f"phrase {' '.join(p)!r} also used by {curated[p]}")
+                    curated[p] = cls
+            for cls, p in phrases.items():
+                if fallback(cls) and p in curated:
+                    self.fail(kind, cls, "phrase", f"fallback phrase {' '.join(p)!r} equals curated class {curated[p]}")
+
+        unique("block", self.block_phrase, lambda c: c in self.fallback_phrase)
+        if self.block_phrase["air"] != ("air",) or self.block_phrase["buried"] != ("buried",):
+            self.fail("block", "air", "phrase", "air must be 'air' and buried 'buried'")
+        unique("item", self.item_phrase, lambda c: c.startswith("other_item_"))
+        unique("entity", self.entity_phrase, lambda c: False)
         entity_phrases = {p: c for c, p in self.entity_phrase.items()}
         for c, p in self.block_phrase.items():
             if p in entity_phrases:
@@ -1753,7 +1963,8 @@ class Concepts:
     ``max_damage``, ``fuel_ticks``, ``nutrition`` (int32, 0 = none), ``saturation``,
     ``attack_damage``, ``attack_speed`` (float32 modifiers, 0 = none), ``armor_points`` (int32),
     ``v1`` (bool). Entity arrays by entity-class id: ``max_health``, ``entity_armor``,
-    ``entity_attack_damage`` (float32, NaN = unknown).
+    ``entity_attack_damage`` (float32, NaN = unknown). ``class_by_phrase(kind, words)`` inverts
+    ``phrase`` (phrases are unique within each kind).
     """
 
     def __init__(self, raw: dict, path: Path | None = None):
@@ -1774,6 +1985,13 @@ class Concepts:
         self._entities = {**{c.name: c for c in self.entity_classes}, **{c.id: c for c in self.entity_classes}}
         self._item_of = {m: c for c in self.item_classes for m in c.members}
         self._entity_of = {m: c for c in self.entity_classes for m in c.members}
+        self._by_phrase: dict[str, dict[tuple[str, ...], Any]] = {}
+        for kind, classes in (("block", self.block_classes), ("item", self.item_classes),
+                              ("entity", self.entity_classes)):
+            counts = Counter(c.phrase for c in classes)
+            if any(counts[c.phrase] > 1 for c in classes if not c.fallback):
+                raise ValueError(f"concepts file has repeated curated {kind} phrases (rebuild it)")
+            self._by_phrase[kind] = {c.phrase: c for c in classes if counts[c.phrase] == 1}
         self._build_arrays()
 
     def __repr__(self) -> str:
@@ -1817,9 +2035,14 @@ class Concepts:
         except KeyError:
             raise KeyError(f"unknown entity {vanilla_entity!r}") from None
 
-    def block_classes_with_phrase(self, phrase: Sequence[str]) -> tuple[BlockClass, ...]:
-        p = tuple(phrase)
-        return tuple(c for c in self.block_classes if c.phrase == p)
+    def class_by_phrase(self, kind: str, phrase: Sequence[str]) -> BlockClass | ItemClass | EntityClass:
+        """The class of a kind ("block", "item" or "entity") with this phrase (the inverse of
+        ``phrase``). Defined for every curated class; a phrase shared by several fallback
+        classes names none of them and raises KeyError."""
+        try:
+            return self._by_phrase[kind][tuple(phrase)]
+        except KeyError:
+            raise KeyError(f"no single {kind} class with phrase {' '.join(phrase)!r}") from None
 
     # -- arrays ------------------------------------------------------------------------
 

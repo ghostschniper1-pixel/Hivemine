@@ -13,3 +13,7 @@ data/sources/
 runs/
 worlds/
 node_modules/
+
+# Server instances and vanilla data-generator output (rendered server.properties hold the RCON password)
+servers/
+generated/

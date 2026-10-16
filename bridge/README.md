@@ -22,7 +22,7 @@ How a decision flows: the policy writes `mine 4 iron ore.` word by word under th
 
 ## Memory in the real game
 
-Each agent remembers where things were, who is an enemy and what is in its chests through its **notebook** (DESIGN.md 6.3, contracts 6.1), and the same notebook code runs in the simulator and here. In the real game it is filled only from what the bot's own client received: blocks the bot can see (perception runs in Python on a mirror of the nearby chunks), players with their team colour, chat, damage with its source, deaths, pickups, chest lids and the chest contents the bot saw when it stored or took items. PROTOCOL.md section 9 maps every notebook table to the messages that feed it. Nothing comes from RCON or from searches over all loaded blocks, so the real-game agent knows no more than the simulated one.
+Each agent remembers where things were, who is an enemy and what is in its chests through its **notebook** (DESIGN.md 6.3, contracts 6.1), and the same notebook code runs in the simulator and here. In the real game it is filled only from what the bot's own client received: blocks the bot can see (perception runs in Python on a mirror of the nearby chunks), players with their team colour, chat, damage with its source, deaths, pickups, chest lids and the chest contents the bot saw when it stored or took items. The client is told more than the agent may use (entities behind walls, chest lids within about 64 blocks [mem] with a viewer count but no name), so the conductor runs the simulator's perception before the notebook names anyone, exactly as in the simulator. PROTOCOL.md section 9 maps every notebook table to the messages that feed it. Nothing comes from RCON or from searches over all loaded blocks, so the real-game agent knows no more than the simulated one.
 
 ## Files
 
@@ -30,7 +30,8 @@ Each agent remembers where things were, who is an enemy and what is in its chest
 |---|---|---|
 | `PROTOCOL.md` | The conductor ↔ Node protocol, version 1: framing, handshake and versioning, `act`/`cancel`/`result`, state stream, events, timing | Specification; provisional parts marked |
 | `package.json`, `package-lock.json` | Node dependencies, pinned exactly (below) | Done |
-| `server/` | Frozen `server.properties`, gamerules, team setup, mod pins, `servertool.py`, Windows setup guide | Done, except the TODO-pin versions and hashes (see `server/README.md`) |
+| `server/` | Frozen `server.properties`, gamerules and the vanilla defaults of the others, team setup, mod pins, `servertool.py` with its offline tests (`test_servertool.py`), Windows setup guide | Done, except the TODO-pin versions and hashes (see `server/README.md`) |
+| `.gitattributes` | LF line endings in `bridge/` on every OS, so recorded file hashes match on Windows | Done |
 | conductor, Node hosts, wrappers, lag shim | | **Not built** (M2, M7) |
 | harness mod | | **Not built** (M2) |
 

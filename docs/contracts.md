@@ -4,7 +4,8 @@ This file fixes the interfaces between modules so they can be built in parallel.
 
 Owner requests folded in (2026-10-16):
 - **Natural language in all actions.** Every action, and every symbol the agent sees (blocks, items, entities, results, chat), is expressed in plain English words from one shared vocabulary, so the network can learn what the words mean.
-- **LLM ports.** Spare, inert layers and slots reserved in the network so an LLM can be coupled in later (DESIGN.md 6.4). They do not affect anything built here.
+- **LLM ports.** Spare, inert layers and slots reserved in the network so an LLM can be coupled in later (DESIGN.md 6.5). They do not affect anything built here.
+- **Explicit memory** (DESIGN.md 6.3) and a **goal section** shared by the agent and a later LLM (DESIGN.md 6.6). Goals stay off until M11; their words and slots are reserved now.
 
 ## 0. Conventions
 
@@ -61,7 +62,9 @@ Built by `python -m hivemind.rules.build_rules` from the pinned sources. Committ
 - Armor values and fuel times are not in the 1.21.1 data dumps. Hard-code them with labels.
 - The build cross-checks overlapping sources and **fails** on disagreement (recipes in both sources; stack sizes, durability and food in items/foods vs item components; harvest tools vs tool rules plus `needs_*_tool` tags; tool speeds in materials vs tool rules). Known representation differences are listed explicitly in the build script, each with a reason.
 
-API: `hivemind.rules.load_rules(path=None) -> Rules` (cached; a thin typed wrapper over the JSON with helpers such as `block(name)`, `item(name)`, `recipes_for(item)`, `tag(kind, name)`).
+API: `hivemind.rules.load_rules(path=None) -> Rules` (cached; a thin typed wrapper over the JSON with helpers such as `block(name)`, `item(name)`, `recipes_for(item)`, `tag(kind, name)`, `block_of_state(state)`, `mining_speed(tool, block)`, `can_harvest(tool, block)`, `constant(name)`).
+
+As built, the file also has these additive fields, documented in `hivemind/rules/build_rules.py`: `collision` = `{shapes, by_state}` (`by_state` null when every state uses `shapes[0]`); `tool.damage_per_block`; `food.eat_seconds`, `can_always_eat`, `converts_to`, `effects`; `recipes[].special`. Wall-mounted blocks take the standing variant's loot table. Tool tiers are `wood`, `stone`, `iron`, `gold`, `diamond`, `netherite`. Hard-coded tables keep their labels in `constants` under `armor:<material>`, `fuel:<item or #tag>` and `mob:<entity>:<stat>`. `python -m hivemind.rules.build_rules --check` confirms the committed file is current.
 
 ## 3. Concepts (`data/concepts-1.21.1.json`, `data/block_classes-1.21.1.csv`, `hivemind.rules.classes`)
 
@@ -90,10 +93,12 @@ Rules:
 - **Homogeneity.** All members of a class share every property the simulator uses: hardness, mineable tool kinds, harvest requirement, collision, transparency, light, hazard, and drops after mapping items to item classes; for items: stack size, durability, food, tool, armor, fuel and recipe roles. The build checks this and fails, except for explicitly listed and justified exceptions. Consequence: `iron ore` and `deepslate iron ore` are different classes (hardness 3 vs 4.5), while all eight log types form one class `log` (identical in v1).
 - Block-class ids fit in one byte. About 100–140 curated classes for natural overworld terrain and early-game placed blocks. Rare or out-of-scope blocks fall back to generic classes keyed by their physical signature (so break times stay exact); fallback classes are never resources.
 - Item classes: curated for the v1 tech tree and common overworld drops (about 150–200), with `v1: true`. Everything else falls back to non-v1 classes keyed by stack size.
-- Phrases come from English display names (minecraft-data `language.json`), lower-cased and split on spaces and punctuation, with explicit overrides where a class merges members (e.g. `log`, `planks`, `wool`, `bed`). Phrases are unique within each kind. Reserved: air = `air`, buried = `buried`.
-- Known v1 approximation: class merging hides some real-game details (a bed needs three wool of one colour). List each such case in the class builder.
+- Phrases come from English display names (minecraft-data `language.json`), lower-cased and split on spaces and punctuation, with explicit overrides where a class merges members (e.g. `log`, `planks`, `wool`, `bed`). Reserved: air = `air`, buried = `buried`.
+- **Curated phrases are unique** within each kind (curated block classes, v1 item classes, entity classes), so everything a command can name has an invertible phrase. No block phrase equals an entity phrase.
+- **Fallback phrases must be true of every member**, because their words are shared with curated classes and the agent learns word meanings from them. A fallback is named by the words all its members' names end with (`carpet`, `slab`), prefixed by `other` if a curated class already has those words, or else generically (`other pickaxe block`). Fallback phrases may repeat (fallbacks never appear in commands), but never equal a curated phrase. Never name a class after one member that does not describe the rest (coal blocks must not be called `bell`).
+- Known v1 approximation: class merging hides some real-game details (a bed needs three wool of one colour). Each case is listed in the concepts file's `exceptions`.
 
-API: `hivemind.rules.classes.load_concepts(path=None) -> Concepts` with `block_class(name|id)`, `item_class(name|id)`, `entity_class(name|id)`, `block_class_of_state(state_id)`, `item_class_of(vanilla_item)`, and arrays for the simulator (`hardness[class_id]`, flag arrays, etc.).
+API: `hivemind.rules.classes.load_concepts(path=None) -> Concepts` with `block_class(name|id)`, `item_class(name|id)`, `entity_class(name|id)`, `block_class_of_state(state_id)`, `item_class_of(vanilla_item)`, `entity_class_of(vanilla_entity)`, `class_by_phrase(kind, words)` (defined for every curated class; a phrase shared by several fallbacks raises `KeyError`), and arrays for the simulator (`hardness[class_id]`, flag arrays, etc.). Additive fields (`state_ranges`, `tool_speeds`, `harvest_tools`, `drops`, `fallback`, `exceptions`, class-level `recipes`) are documented in `hivemind/rules/classes.py`.
 
 ## 4. Language (`hivemind.lang`, `data/vocab-1.21.1.json`)
 
@@ -105,15 +110,21 @@ One controlled English vocabulary serves actions, observations, chat and human i
 - Reserved ids: `<pad>` = 0, `<unk>` = 1, `<bos>` = 2 (decoder start), `.` = 3.
 - Word list order is stable and saved in `data/vocab-1.21.1.json` with a hash. Changing the vocabulary changes the network's input and output layers, so it is versioned.
 - Eight **nonce words** for teaching new meanings in chat (DESIGN.md 9): `dax wug blicket fep toma zib kiki bouba`. They are valid only in chat item slots; their meaning is drawn per episode.
-- Canonical text uses the singular display-name form (`mine 4 iron ore.`, `craft 4 stick.`). The human tokenizer accepts plurals.
+- Canonical text uses each class's display-name form unchanged, whatever the count (`mine 4 iron ore.`, `craft 4 stick.`, `craft 4 planks.`). Some display names are plural (`planks`, `leaves`); that is fine. The human tokenizer maps plural and singular forms to whichever form the vocabulary has.
+- Counts that are not number tokens (in event sentences, or typed by a human) are written as the nearest number token (ties round down; above 64 is `64`).
 
 ### 4.2 Phrases
 
-Every concept the agent can name has a phrase (a tuple of words): block classes, item classes, entity classes, players, verbs, directions, place patterns, equipment slots, result codes, interrupt causes, chat intents, numbers. Players are named `red 0`–`red 19`, `blue 0`–`blue 19` and `human` (team words are configurable). The single agent of M1–M5 is `red 0`.
+Every concept the agent can name has a phrase (a tuple of words): block classes, item classes, entity classes, players, verbs, directions, place patterns, equipment slots, result codes, interrupt causes, chat intents, goals, numbers. Players are named `red 0`–`red 19`, `blue 0`–`blue 19` and `human` (team words are configurable); a coupled LLM writes goals as `llm`. The single agent of M1–M5 is `red 0`.
+
+The vocabulary must also hold, from the start, the words that appear only in observations (DESIGN.md 6.2), because adding a word later changes the network's input and output layers:
+- relation words: `teammate`, `enemy`, `human` (players); `hostile`, `passive` (mobs); `object` (dropped items, arrows, experience orbs, primed TNT);
+- the notebook's place kinds: `resource`, `station`, `danger`, `home`;
+- the words of event sentences (below) and of goals (DESIGN.md 6.6), and the goal setters `me` and `llm`.
 
 ### 4.3 Command grammar
 
-The design's 17 verbs keep their ids, and two container verbs are added (19); each has one or more English templates. Slots are in braces; everything else is a literal word. Every command ends with `.`.
+The design's 17 verbs keep their ids; two container verbs and a goal verb are added, making 20 verb ids. Each has one or more English templates. Slots are in braces; everything else is a literal word. Every command ends with `.`.
 
 | Verb id | Templates | Notes |
 |---|---|---|
@@ -136,8 +147,23 @@ The design's 17 verbs keep their ids, and two container verbs are added (19); ea
 | `wait` | `wait {wait_seconds} seconds` | wait_seconds: 1, 5, 20 (20, 100, 400 ticks) |
 | `store` | `store {item_count} {item} in my chest {chest}` | **off by default** (feature flag `containers`); chest: 1–8 |
 | `take` | `take {item_count} {item} from my chest {chest}` | **off by default**; item: what the agent's memory says is in that chest |
+| `plan` | `plan to {goal}` | **off by default** (feature flag `goals`, on in M11); writes the agent's own goal slot; ≤1 per 40 ticks |
 
-`goto` gains `go to my chest {chest}` and `go to my bed` (both masked unless known). The store and take verbs and their words are in the vocabulary from the start, so enabling them later (team stage, M9) does not change the network's input and output layers. That makes 19 verb ids.
+`goto` also has `go to my chest {chest}` and `go to my bed` (both masked unless known). The words of `store`, `take` and `plan` are in the vocabulary from the start, so enabling them later (M9, M11) does not change the network's input and output layers.
+
+Goals (DESIGN.md 6.6), used by `plan` and by goals that the owner, an LLM or the curriculum set:
+
+| Goal | Template | Met when [est where not obvious] |
+|---|---|---|
+| `get` | `get {item_count} {item}` | the inventory holds the count |
+| `kill` | `kill {mine_count} {entity}` | that many of the entity class killed by the agent since the goal was set |
+| `home` | `go home` | within 3 blocks of home |
+| `to_player` | `go to {player}` | within 3 blocks of the player |
+| `to_block` | `go to the nearest {block}` | within reach of a block of that class |
+| `explore` | `explore {dir8}` | 64 blocks moved in that direction since the goal was set |
+| `survive` | `survive until morning` | alive at the next dawn (tick 0 of the day) |
+| `help` | `help {player}` | within 16 blocks of the player for 1,200 ticks |
+| `protect` | `protect {player}` | the player takes no damage from others while the agent is within 16 blocks, for 1,200 ticks |
 
 - `ordinal` is `nearest`, `second`, `third`, … `sixteenth`: the rank by distance among visible entities with the same phrase.
 - Entity phrases: the entity class phrase (`zombie`, `cave spider`, `cow`), or `dropped {item}` for an item lying on the ground.
@@ -155,26 +181,29 @@ Chat sentences (the 14 intents of DESIGN.md 9):
 
 Example: `tell everyone i need 3 iron ingot.` In chat item slots the nonce words are also allowed.
 
-**Results** (shown to the agent after each action, and logged): `done`, `no target`, `no path`, `path too slow`, `stuck`, `dig failed`, `missing ingredient`, `no {station} nearby` (station: crafting table, furnace, bed), `inventory full`, `target lost`, `danger ahead`, `interrupted by {cause}` (cause: `damage`, `message`, or the entity phrase of the hostile that appeared), `died`, `too slow`. These map one-to-one to the failure codes of DESIGN.md 5 (`OK`, `NO_TARGET`, …).
+**Results** (shown to the agent after each action, and logged; the table in DESIGN.md 5 is authoritative): `done`, `no target`, `no path`, `path too slow`, `stuck`, `dig failed`, `missing ingredient`, `no {station} nearby` (station: crafting table, furnace, bed), `{container} full` (container: `inventory`, or `chest` when `store` finds the chest full), `target lost`, `danger ahead`, `interrupted by {cause}` (cause: `damage`, `message`, or the entity phrase of the hostile that appeared), `died`, `too slow`. These map one-to-one to the failure codes of DESIGN.md 5 (`OK`, `NO_TARGET`, …). Of the interruptions in DESIGN.md 4.5, a vanished target ends the action with `target lost` and a full inventory with `inventory full`.
 
-**Event sentences** (written into the memory's event log, section 6.1; same vocabulary):
-`{player} attacked me` · `{entity} attacked me` · `i attacked {player}` · `{player} killed me` · `{entity} killed me` · `i killed {player}` · `i killed {entity}` · `{player} gave me {n} {item}` · `i gave {n} {item} to {player}` · `i died` · `{player} took {n} {item} from my chest {chest}` (seen only when the agent next opens the chest and the count dropped: `{n} {item} missing from my chest {chest}`) · `i found {block}` (first sighting of a resource class this episode).
+**Event sentences** (written into the notebook's event log, section 6.1; same vocabulary; when each is written is fixed in DESIGN.md 6.3):
+`{player} attacked me` · `{entity} attacked me` · `i attacked {player}` · `{player} killed me` · `{entity} killed me` · `i killed {player}` · `i killed {entity}` · `i died` · `{player} gave me {n} {item}` · `i gave {n} {item} to {player}` · `{player} opened my chest {chest}` (only when exactly one other visible player is near the chest; otherwise `someone opened my chest {chest}`) · `{n} {item} missing from my chest {chest}` (when the agent next opens the chest and a count dropped; no event names a thief) · `i found {block}` (first sighting of a resource class this episode).
 
 **Unambiguity.** The grammar must be prefix-safe: `parse(render(c)) == c` for every command over the v1 concept sets. Any phrase collision that breaks this (for example a block phrase equal to an entity phrase after `go to the nearest`) is fixed by a phrase override, and a test enumerates commands to check it.
 
 ### 4.4 Python API
 
 ```python
-from hivemind.lang import Language, Command, Sentence, EntityRef, ParseError
+from hivemind.lang import Language, Command, Sentence, Goal, EntityRef, ParseError
 
 lang = Language.load()                    # data/vocab-1.21.1.json; Language.build(concepts) makes it
 lang.words                                # list[str]; lang.word_id(w) -> int; lang.word(i) -> str
 lang.phrase(kind, name) -> tuple[str, ...]           # kind: "block" | "item" | "entity" | ...
 lang.concept(kind, words) -> str                     # inverse of phrase
 
-Command(verb="mine", args=(("block", "iron_ore"), ("count", 4)))     # frozen; args sorted by slot name
-Command(verb="chat", args=(("sentence", Sentence("need", count=3, item="iron_ingot")), ("to", "everyone")))
+# Command.args keys are exactly the slot names of section 4.5; frozen; args sorted by slot name
+Command(verb="mine", args=(("block", "iron_ore"), ("mine_count", 4)))
+Command(verb="chat", args=(("addressee", "everyone"), ("sentence", Sentence("need", item_count=3, item="iron_ingot"))))
+Command(verb="plan", args=(("goal", Goal("get", item_count=3, item="iron_ingot")),))
 EntityRef(ordinal=2, entity="zombie")      # entity: entity-class name, or ("dropped", item-class name)
+# Sentence(intent, **slots) and Goal(kind, **slots) use the same slot names as commands
 
 lang.render(cmd) -> str                   # "mine 4 iron ore."
 lang.to_words(cmd) -> list[str]           # ["mine", "4", "iron", "ore", "."]
@@ -208,7 +237,7 @@ while not dec.done:
 cmd = dec.command()
 ```
 
-Slot names used by `options`: `block`, `item`, `entity` (returns `EntityRef`s), `player`, `furnace`, `chest`, `dir8`, `dir4`, `explore_dist`, `strip_dist`, `y_band`, `mine_count`, `item_count`, `pattern`, `wait_seconds`, `addressee`, `intent`, plus `template` (which template of a verb; values are template ids). Values are concept names or ints exactly as they appear in `Command.args`.
+Slot names used by `options`: `block`, `item`, `entity` (returns `EntityRef`s), `player`, `furnace`, `chest`, `dir8`, `dir4`, `explore_dist`, `strip_dist`, `y_band`, `mine_count`, `item_count`, `pattern`, `wait_seconds`, `addressee`, `intent` (which chat sentence), `goal` (which goal template), plus `template` (which template of a verb; values are template ids). Values are concept names or ints exactly as they appear in `Command.args`. A chat sentence or goal is expanded inline: after `intent` or `goal` is chosen, its own slots are asked for with the same names, and they become the fields of the `Sentence` or `Goal`.
 
 The network side (built in M5) ties output scores to the same word embeddings that read the observation, sums log-probabilities over the non-forced words, and uses the sum of per-step entropies along the sampled command (an unbiased estimate of the joint entropy).
 
@@ -219,7 +248,7 @@ Readable Python, the oracle for the C++ core. Works at the class level (section 
 | Module | Provides |
 |---|---|
 | `rng.py` | `CounterRNG(seed)`: counter-based (SplitMix64-style) draws keyed by `(episode, tick, purpose, entity, draw)`; `u64`, `uniform`, `randint`, `choice`, `poisson`. `Purpose` enum of draw purposes |
-| `mechanics.py` | Pure functions and small state classes for section 4.3 of DESIGN.md: `break_ticks(...)` (exact float32 accumulation as vanilla), `can_harvest`, `HungerState` (exhaustion, saturation, regeneration, starvation by difficulty), eating, clock helpers, attack cooldown and damage multiplier, critical hits, armor reduction, fall damage, smelting time, fuel |
+| `mechanics.py` | Pure functions and small state classes for section 4.3 of DESIGN.md: `break_ticks(...)` returning `BreakTime` (the vanilla client's float32 count `ticks`, Mineflayer's `mineflayer_ticks`, and `server_accept_ticks`; the simulator uses the count of whoever plays: Mineflayer for the bridge), `can_harvest`, `HungerState` (exhaustion, saturation, regeneration, starvation by difficulty), eating, clock helpers, attack cooldown and damage multiplier, critical hits, armor reduction, fall damage, smelting time, fuel |
 | `inventory.py` | `Inventory` over item classes: 36 main slots, armor, off hand, held slot; stack-limited slot accounting; tool durability |
 | `crafting.py` | Class-level recipe book: `craftable(inv, near_table)`, `craft(inv, item_class, up_to)`, smelting recipes |
 | `loot.py` | Vanilla loot-table sampler (the subset used by v1 blocks and mobs; no Fortune, no Silk Touch), returning item-class counts |
@@ -228,14 +257,15 @@ Readable Python, the oracle for the C++ core. Works at the class level (section 
 | `perception.py` | Exposed faces, the 15×15×7 voxel window with `buried`, line-of-sight resource memory within 24 blocks, the X-ray ablation |
 | `nav.py` | Nav grid and A* with the pathfinder rules of DESIGN.md 4.5; `T_goto` duration model with placeholder coefficients [est] |
 | `mobs.py` | Spawning (placeholder rates [est] until M3 measures them), chase, attacks, creeper fuse, sunlight burning, despawn, animals |
-| `actions.py` | The 17 verbs as interruptible macros with durations, masks (`SlotProvider`) and failure codes |
+| `actions.py` | The 20 verb ids as interruptible macros with durations, masks (`SlotProvider`) and failure codes; `store`/`take` behind `containers`, `plan` behind `goals` |
+| `goals.py` | The goal slots and the success tests of section 4.3 (needed only when `goals` is on; the slots exist, empty, otherwise) |
 | `rewards.py` | Achievements (own production only), potential-based shaping, night bonus, death |
 | `env.py` | `RefEnv`: reset, `act(agent, command or text)`, `step()` returning ready agents, results, rewards |
 | `viewer.py` | Text and top-down ASCII views |
 
 ## 6. Observations (`hivemind.features`)
 
-One observation builder, shared by the simulator and the bridge (DESIGN.md 6). Every symbolic field is given as words (token ids from section 4) plus numbers; see DESIGN.md 6.2 for the field list.
+One observation builder, shared by the simulator and the bridge (DESIGN.md 6). Every symbolic field is given as words (token ids from section 4) plus numbers; see DESIGN.md 6.2 for the field list. It includes the three goal slots (own, given, team: DESIGN.md 6.6), which are always present and masked while `goals` is off.
 
 ### 6.1 Memory (`hivemind/features/memory.py`)
 
@@ -249,12 +279,14 @@ Weights do not change during play, and a GRU is poor at exact recall over a 24,0
 | Table | Capacity | Entry |
 |---|---|---|
 | Places | 48 | kind (`resource`, `station`, `danger`, `home`), phrase (`iron ore`, `my furnace 2`, `my chest 1`, `my bed`, `lava`), position, count seen, first and last seen tick. Eviction: the entry with the lowest value of a fixed score (resource tier, distance, age) [est] |
-| Players | 40 | name (`blue 7`), relation from the visible team colour (`teammate`, `enemy`, `human`), last seen position and tick, last message words, counters: damage dealt to me, damage I dealt, kills each way, items given each way, items taken from my chests |
+| Players | 40 | name (`blue 7`), relation from the visible team colour (`teammate`, `enemy`, `human`), last seen position and tick, last message words, counters: damage dealt to me, damage I dealt, kills each way, items given each way, times seen opening my chests |
 | Containers | 8 own + 8 seen | phrase (`my chest 1`), position, contents (item class → count) as of the last time the agent looked, tick of that look; the agent's own store and take actions update it exactly |
 | Events | 16, ring buffer | an event sentence (section 4.3) and its tick |
+
+Events involving other players are attributed by the fixed, perception-only rules of DESIGN.md 6.3 ("What counts as seen"); the simulator knows the true actor but never writes it. `notebook.entries()` yields one token per place, player and event, and one per (chest, item class) held, up to 32 [est]: about 136 tokens.
 
 API sketch: `Notebook(lang, config)`, `notebook.observe(perception_result, tick)`, `notebook.on_event(event)`, `notebook.on_container_view(chest, contents, tick)`, `notebook.entries() -> list[MemoryToken]` (words, numbers), `notebook.reset()`. The simulator's `goto`, `mine`, `store` and `take` masks read the notebook, not the true world.
 
 ## 7. Bridge protocol (`bridge/`)
 
-As DESIGN.md 11.1, with the command in words: the conductor sends `act{agent, req, command: "mine 4 iron ore.", deadline_ticks, deadline_ms}`; Node replies `result{agent, req, code, result: "no path", tick0, tick1, wall_ms, n_roundtrips, inv_delta, raw_state}`. The Node side never parses English itself; the conductor sends the parsed command alongside the text (`parsed: {verb, args}`), so both sides share one parser.
+As DESIGN.md 11.1, with the command in words: the conductor sends `act{agent, req, command: "mine 4 iron ore.", deadline_ticks, deadline_ms}`; Node replies `result{agent, req, code, result: "no path", tick0, tick1, wall_ms, n_roundtrips, inv_delta, raw_state}`. The Node side never parses English itself; the conductor sends the parsed command alongside the text, so both sides share one parser. The full protocol, including the hello handshake (protocol version, rules and vocabulary hashes), the state stream, the extra event kinds (`entity_dead`, `pickup`, `lid`, `respawn`) and the per-verb `plan` the conductor resolves for Node, is `bridge/PROTOCOL.md`.

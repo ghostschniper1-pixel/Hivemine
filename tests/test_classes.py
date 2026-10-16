@@ -148,6 +148,39 @@ def test_planted_violations_are_detected(rules) -> None:
     assert not result.ok
 
 
+def test_planted_phrase_and_kind_violations_are_detected(rules, monkeypatch: pytest.MonkeyPatch) -> None:
+    hints = list(C.FALLBACK_PHRASE_HINTS)
+    hints.insert(0, ("oak_slab", {}, "planks"))  # a fallback named like a curated class
+    hints.append(("stone", {}, "rock"))  # stone is curated: the hint matches nothing
+    monkeypatch.setattr(C, "FALLBACK_PHRASE_HINTS", tuple(hints))
+    monkeypatch.setattr(C, "ITEM_FALLBACK_PHRASES", {**C.ITEM_FALLBACK_PHRASES, 16: ("stick",)})
+    overrides = {k: v for k, v in C.ENTITY_KIND_OVERRIDES.items() if k != "hoglin"}  # type and category disagree
+    monkeypatch.setattr(C, "ENTITY_KIND_OVERRIDES", {**overrides, "camel": "passive"})  # camel: no disagreement
+    result = C.build(rules)
+    found = {(v.kind, v.cls, v.check) for v in result.violations}
+    assert ("block", "other_planks", "phrase") in found  # a fallback phrase may repeat, but not a curated one
+    assert ("block", "stone", "stale phrase hint") in found
+    assert ("item", "other_item_16", "phrase") in found
+    assert ("entity", "hoglin", "kind") in found
+    assert ("entity", "camel", "stale kind override") in found
+    assert not result.ok
+
+
+def test_fallback_entity_kinds() -> None:
+    from hivemind.rules.loader import Entity
+
+    def kind(name: str, type_: str | None, category: str | None) -> tuple[str, str | None]:
+        return C.fallback_entity_kind(Entity(name, 1, name, 1.0, 1.0, category, type_, None, None, None, None))
+
+    assert kind("skeleton_horse", "animal", "Hostile mobs") == ("passive", None)  # override
+    assert kind("evoker_fangs", "other", "Hostile mobs") == ("other", None)  # override
+    assert kind("ghast", "mob", "Hostile mobs") == ("hostile", None)  # type "mob" says nothing
+    assert kind("boat", "other", "Vehicles") == ("other", None)
+    assert kind("new_mob", None, None) == ("other", None)
+    k, problem = kind("new_beast", "animal", "Hostile mobs")
+    assert problem and "ENTITY_KIND_OVERRIDES" in problem
+
+
 def test_curated_block_classes_are_exact_for_breaking(concepts: Concepts, rules) -> None:
     """Hardness, tool speeds and harvest rules of every block equal its class's, for every v1 tool."""
     tools = [c for c in concepts.item_classes if c.v1 and c.tool] + [concepts.item_class(0)]
@@ -248,22 +281,63 @@ def test_word_reuse_for_iron(concepts: Concepts) -> None:
         assert "iron" in c.phrase
 
 
-def test_phrases_are_unique_where_commands_use_them(concepts: Concepts) -> None:
-    def assert_unique(phrases: list[tuple[str, ...]]) -> None:
-        assert len(phrases) == len(set(phrases)), [p for p in phrases if phrases.count(p) > 1]
+def test_curated_phrases_are_unique_and_invertible(concepts: Concepts) -> None:
+    """Contracts 3: curated classes (everything a command can name) have their own phrase, so
+    the phrase is invertible (contracts 4.4); a fallback phrase never equals a curated one."""
+    for kind, classes in (("block", concepts.block_classes), ("item", concepts.item_classes),
+                          ("entity", concepts.entity_classes)):
+        curated = [c.phrase for c in classes if not c.fallback]
+        assert len(curated) == len(set(curated)), [p for p in curated if curated.count(p) > 1]
+        for c in classes:
+            assert c.phrase and all(re.fullmatch(r"[a-z0-9]+", w) for w in c.phrase), c.name
+            if not c.fallback:
+                assert concepts.class_by_phrase(kind, c.phrase) is c
+            else:
+                assert c.phrase not in set(curated), c.name
+    with pytest.raises(KeyError):
+        concepts.class_by_phrase("block", ("block",))
+    with pytest.raises(KeyError):  # shared by several fallback classes: names none of them
+        concepts.class_by_phrase("block", ("other", "pickaxe", "block"))
 
-    curated_blocks = [c.phrase for c in concepts.block_classes if not c.fallback]
-    assert_unique(curated_blocks)
-    assert_unique([c.phrase for c in concepts.block_classes if c.resource])
-    assert_unique([c.phrase for c in concepts.item_classes if c.v1])
-    assert_unique([c.phrase for c in concepts.entity_classes])
+
+def test_fallback_phrases_are_true_of_every_member(concepts: Concepts, rules) -> None:
+    """Blocks split by state get state words, and no fallback borrows a member's name for blocks
+    it does not describe (coal blocks must not be called "bell": the agent learns from words)."""
+
+    def phrase_of(block: str, **state: str) -> str:
+        b = rules.block(block)
+        s = next(s for s in range(b.min_state, b.max_state + 1)
+                 if all(b.state_values(s)[k] == v for k, v in state.items()))
+        return " ".join(concepts.block_class_of_state(s).phrase)
+
+    assert phrase_of("lantern", hanging="true") == "hanging lantern"
+    assert phrase_of("lantern", hanging="false") == "lantern"
+    assert phrase_of("oak_fence_gate", open="true") == "open fence gate"
+    assert phrase_of("birch_fence_gate", open="false") == "fence gate"
+    assert phrase_of("oak_trapdoor", open="false", half="bottom") == "trapdoor"
+    assert phrase_of("oak_trapdoor", open="true", half="bottom") == "raised trapdoor"
+    assert phrase_of("snow", layers="1") == "snow"
+    assert phrase_of("snow", layers="3") == "snow layers"
+    assert phrase_of("snow", layers="7") == "deep snow"
+    assert phrase_of("cave_vines", berries="true", age="0") == "cave vines with glow berries"
+    # without berries, cave vines share a class with "weeping vines plant" etc.: no common tail
+    assert phrase_of("cave_vines", berries="false", age="0") == "other axe block"
+    assert phrase_of("oak_slab", type="bottom", waterlogged="false") == "slab"
+    assert phrase_of("stone_slab", type="bottom", waterlogged="false") == "slab"
+    for block in ("coal_block", "diamond_block", "netherite_block", "bricks", "polished_granite"):
+        assert phrase_of(block) == "other pickaxe block", block
+    hints = {tuple(p.split()) for _b, _w, p in C.FALLBACK_PHRASE_HINTS}
     for c in concepts.block_classes:
-        if c.fallback:
-            assert c.phrase not in curated_blocks
-    v1_phrases = {c.phrase for c in concepts.item_classes if c.v1}
-    assert not any(c.phrase in v1_phrases for c in concepts.item_classes if not c.v1)
-    for c in (*concepts.block_classes, *concepts.item_classes, *concepts.entity_classes):
-        assert c.phrase and all(re.fullmatch(r"[a-z0-9]+", w) for w in c.phrase), c.name
+        if not c.fallback:
+            continue
+        assert re.fullmatch("other_" + "_".join(c.phrase) + r"(_\d+)?", c.name), c.name
+        if c.phrase in hints or c.phrase in {("other", "block")} | {("other", t, "block") for t in c.mineable}:
+            continue
+        tail = c.phrase[1:] if c.phrase[0] == "other" else c.phrase  # "other" marks a curated name
+        for m in c.members:
+            assert C.words(rules.block(m).display_name)[-len(tail):] == tail, (c.name, m)
+    assert {c.phrase for c in concepts.item_classes if c.fallback} == {
+        ("other", "unstackable", "item"), ("other", "small", "stack", "item"), ("other", "item")}
 
 
 def test_block_and_entity_phrases_are_disjoint(concepts: Concepts) -> None:
@@ -283,6 +357,10 @@ def test_fallbacks(concepts: Concepts, rules) -> None:
     assert concepts.item_class_of("oak_slab").name == "other_item_64"
     assert concepts.entity_class_of("blaze").name == "monster"
     assert concepts.entity_class_of("boat").name == "object"
+    assert concepts.entity_class_of("hoglin").name == "monster"
+    assert concepts.entity_class_of("skeleton_horse").name == "animal"  # minecraft-data: "Hostile mobs"
+    assert concepts.entity_class_of("zombie_horse").name == "animal"
+    assert concepts.entity_class_of("evoker_fangs").name == "object"
     assert concepts.block_class_of_state(rules.block("oak_slab").default_state).fallback
 
 
@@ -325,6 +403,8 @@ def test_entity_classes(concepts: Concepts) -> None:
     assert np.isnan(concepts.max_health[e("monster").id])
     assert {"zombie", "creeper", "skeleton", "spider", "enderman", "witch"} <= {
         c.name for c in concepts.entity_classes if c.kind == "hostile"}
+    assert (e("slime").max_health, e("phantom").max_health, e("bogged").max_health) == (16.0, 20.0, 16.0)
+    assert not np.isnan(concepts.entity_attack_damage[e("phantom").id])
 
 
 # -- recipes and drops -------------------------------------------------------------------------
@@ -379,3 +459,24 @@ def test_specialise_loot(rules) -> None:
     leaves = C.specialise_loot(rules.loot_table("blocks/oak_leaves"), "oak_leaves", {})
     assert '"chance": 0.05' in json.dumps(leaves) and "table_bonus" not in json.dumps(leaves)
     assert C.specialise_loot(rules.loot_table("blocks/glass"), "glass", {}) is None
+    tall = rules.loot_table("blocks/tall_grass")
+    assert "location_check" in json.dumps(C.specialise_loot(tall, "tall_grass", {"half": "lower"}))
+    paired = C.specialise_loot(tall, "tall_grass", {"half": "lower"}, two_cell=True)
+    assert "location_check" not in json.dumps(paired) and len(paired["pools"]) == 1  # the upper pool is gone
+
+
+def test_class_drops_need_no_world_state(concepts: Concepts) -> None:
+    """Voxels hold class ids only, so no class-level table may test block states or neighbours."""
+    for c in concepts.block_classes:
+        if c.drops:
+            text = json.dumps(c.drops["table"])
+            assert "location_check" not in text and "block_state_property" not in text, c.name
+
+
+def test_fallback_drop_count_errors_are_listed(concepts: Concepts) -> None:
+    approx = {e["class"]: e["approximation"] for e in concepts.exceptions if e["check"] == "fallback"}
+    snow = approx["other_snow_layers"]
+    assert "snow[layers=2]" in snow and all(f"snowball x{n}" in snow for n in (2, 3, 4, 5))
+    assert "melon_seeds xB(3, 0.0667)" in approx["other_melon_stem"]
+    assert concepts.block_class("other_snow_layers").drops["table"]["pools"][0]["entries"][0]["functions"][0][
+        "count"] == 2.0  # the class uses the first table: the listed error is what the loot tests must allow

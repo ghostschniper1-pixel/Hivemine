@@ -29,7 +29,8 @@ integers, wrapping mod 2^64):
 
 That is two nested SplitMix64 streams: the seed's stream indexed by (episode, tick) gives a state,
 and that state's stream indexed by (purpose, entity, draw) gives the number. Fields out of range
-raise ``ValueError`` rather than wrap, so two keys can never alias.
+raise ``ValueError`` rather than wrap, and fields that are not integers (floats, bools, float
+arrays) raise ``TypeError`` rather than truncate, so two keys can never alias.
 
 Derived draws (each uses exactly the draws stated, so a stream's draw index stays predictable):
 
@@ -49,6 +50,7 @@ reproducible in C++ as long as the compiler does not contract a*b+c into FMA
 from __future__ import annotations
 
 import math
+import operator
 from collections.abc import Sequence
 from enum import IntEnum
 from typing import NamedTuple, TypeVar
@@ -121,10 +123,30 @@ def mix64(z: int) -> int:
 
 
 def _check(name: str, value: int, bits: int) -> int:
-    v = int(value)
+    """``value`` as a Python int in [0, 2^bits).
+
+    Only true integers pass (int, NumPy integers, IntEnum): a float or bool raises ``TypeError``
+    rather than being truncated, so tick 600.9 can never reuse tick 600's numbers.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{name} must be an integer, got {value!r}")
+    try:
+        v = operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name} must be an integer, got {value!r}") from None
     if not 0 <= v < (1 << bits):
         raise ValueError(f"{name}={value} is outside [0, 2^{bits})")
     return v
+
+
+def _int_array(name: str, value: np.ndarray | int, bits: int) -> np.ndarray:
+    """``value`` as a uint64 array with every element in [0, 2^bits); integer dtypes only."""
+    arr = np.asarray(value)
+    if arr.size and not np.issubdtype(arr.dtype, np.integer):
+        raise TypeError(f"{name} must be an integer array, got dtype {arr.dtype}")
+    if arr.size and (arr.min() < 0 or arr.max() >= 1 << bits):
+        raise ValueError(f"{name} outside [0, 2^{bits})")
+    return arr.astype(np.uint64)
 
 
 def pack_key(key: KeyLike) -> tuple[int, int]:
@@ -198,16 +220,12 @@ class CounterRNG:
 
         Equal element by element to ``u64(DrawKey(episode, tick, purpose, e, d))``.
         """
-        ent = np.asarray(entity, dtype=np.int64)
-        drw = np.asarray(draw, dtype=np.int64)
-        if ent.size and (ent.min() < 0 or ent.max() >= 1 << ENTITY_BITS):
-            raise ValueError("entity outside [0, 2^24)")
-        if drw.size and (drw.min() < 0 or drw.max() >= 1 << DRAW_BITS):
-            raise ValueError("draw outside [0, 2^32)")
+        ent = _int_array("entity", entity, ENTITY_BITS)
+        drw = _int_array("draw", draw, DRAW_BITS)
         w0, _ = pack_key(DrawKey(episode, tick, purpose))
         tick_state = mix64((self._seed_state + (w0 + 1) * GAMMA) & MASK64)
-        w1 = (np.uint64(int(purpose) << (ENTITY_BITS + DRAW_BITS))
-              | (ent.astype(np.uint64) << np.uint64(DRAW_BITS)) | drw.astype(np.uint64))
+        w1 = (np.uint64(_check("purpose", purpose, PURPOSE_BITS) << (ENTITY_BITS + DRAW_BITS))
+              | (ent << np.uint64(DRAW_BITS)) | drw)
         with np.errstate(over="ignore"):
             z = np.uint64(tick_state) + (w1 + np.uint64(1)) * np.uint64(GAMMA)
             z = (z ^ (z >> np.uint64(30))) * np.uint64(MIX_M1)

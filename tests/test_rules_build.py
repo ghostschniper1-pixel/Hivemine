@@ -1,6 +1,9 @@
 """Tests for the rules build (docs/contracts.md sections 1 and 2): the committed file's
-invariants, spot checks against known 1.21.1 values, the build helpers, and a rebuild from
-the source cache that must reproduce the committed file byte for byte."""
+invariants, spot checks against known 1.21.1 values, the build helpers, every cross-check on
+small planted data, and a rebuild from the source cache that must reproduce the committed
+file byte for byte. The rebuild tests need data/sources/ (git-ignored; fetched by
+``python -m hivemind.rules.fetch_sources``) and are skipped without it; the planted-data
+tests run everywhere."""
 
 from __future__ import annotations
 
@@ -311,7 +314,15 @@ def test_fuel_and_armor(rules: dict) -> None:
     assert items["iron_helmet"]["equip_slot"] == "head"
     k = rules["constants"]
     assert k["fuel:coal"] == {"value": 1600, "source": "[20]"}
-    assert k["armor:iron"]["source"] == "[17]" and k["armor:iron"]["value"]["points"] == [2, 6, 5, 2]
+    # each armor field has its own label: DESIGN 4.3 quotes [17] only for iron and diamond
+    # points and diamond's toughness
+    assert k["armor:iron:points"] == {"value": [2, 6, 5, 2], "source": "[17]"}
+    assert k["armor:diamond:points"] == {"value": [3, 8, 6, 3], "source": "[17]"}
+    assert k["armor:diamond:toughness"] == {"value": 2.0, "source": "[17]"}
+    for name in ("armor:iron:toughness", "armor:iron:knockback_resistance", "armor:diamond:knockback_resistance",
+                 "armor:leather:points", "armor:netherite:toughness"):
+        assert k[name]["source"] == "[mem]", name
+    assert not any(n.startswith("armor:") and n.count(":") == 1 and n != "armor:turtle_helmet" for n in k)
 
 
 def test_zombie(rules: dict) -> None:
@@ -370,6 +381,138 @@ def test_hash_ignores_build_field() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cross-checks on small planted data (no sources needed): each check passes on agreeing
+# sources and reports a planted disagreement
+# ---------------------------------------------------------------------------
+
+
+def _src(md: dict | None = None, **parts) -> B.Sources:
+    base = {"items": [], "foods": [], "blocks": [], "materials": {}, "recipes": {}, "entities": [], "language": {},
+            "block_loot": [], "entity_loot": []}
+    return B.Sources(pins={}, md={**base, **(md or {})}, tags=parts.get("tags", {"block": {}, "item": {}}),
+                     recipes=parts.get("recipes", {}), loot=parts.get("loot", {}),
+                     components=parts.get("components", {}), summary_blocks=parts.get("summary_blocks", {}),
+                     entity_registry=parts.get("entity_registry", []))
+
+
+def test_check_items_detects_planted_mismatches() -> None:
+    def checks(md_stack: int, md_durability: int | None, md_food: int) -> dict[str, list[str]]:
+        md = {"items": [{"name": "bread", "stackSize": 64}, {"name": "iron_pickaxe", "stackSize": 1,
+                                                               "maxDurability": md_durability}],
+              "foods": [{"name": "bread", "foodPoints": md_food, "saturation": 6.0}]}
+        md["items"][0]["stackSize"] = md_stack
+        comps = {"bread": {"minecraft:max_stack_size": 64, "minecraft:food": {"nutrition": 5, "saturation": 6.0}},
+                 "iron_pickaxe": {"minecraft:max_stack_size": 1, "minecraft:max_damage": 250}}
+        return {c.name: c.mismatches for c in B.check_items(_src(md, components=comps))}
+
+    assert all(not m for m in checks(64, 250, 5).values())
+    bad = checks(16, 251, 4)
+    assert bad["stack sizes"] and bad["durability"] and bad["food values"]
+
+
+def test_check_block_states_detects_a_wrong_default() -> None:
+    states = [{"name": "face", "type": "enum", "values": ["floor", "wall", "ceiling"]},
+              {"name": "powered", "type": "bool", "values": ["true", "false"]}]
+    summary = {"lever": [{"face": ["floor", "wall", "ceiling"], "powered": ["true", "false"]},
+                         {"face": "wall", "powered": "false"}]}
+    for default, ok in ((13, True), (12, False)):  # wall = 1, false = 1: offset 1 * 2 + 1 = 3
+        blocks = {"lever": {"states": states, "min_state": 10, "default_state": default}}
+        assert (not B.check_block_states(_src(summary_blocks=summary), blocks).mismatches) is ok
+
+
+def _pickaxe(tier_tag: str, speed: float) -> dict:
+    rules = [B.normalize_tool_rule({"blocks": f"#minecraft:{tier_tag}", "correct_for_drops": False}),
+             B.normalize_tool_rule({"blocks": "#minecraft:mineable/pickaxe", "correct_for_drops": True,
+                                    "speed": speed})]
+    return {"tool": {"kind": "pickaxe", "rules": rules}}
+
+
+def test_check_harvest_tools_detects_planted_mismatch() -> None:
+    items = {"wooden_pickaxe": _pickaxe("incorrect_for_wooden_tool", 2.0),
+             "stone_pickaxe": _pickaxe("incorrect_for_stone_tool", 4.0)}
+    tags = {"incorrect_for_wooden_tool": ["iron_ore"], "incorrect_for_stone_tool": [], "mineable/pickaxe": ["iron_ore"]}
+    for harvest, ok in ((["stone_pickaxe"], True), (["stone_pickaxe", "wooden_pickaxe"], False)):
+        blocks = {"iron_ore": {"requires_tool": True, "harvest_tools": harvest, "needs_tier": "stone",
+                               "mineable": ["pickaxe"]}}
+        assert (not B.check_harvest_tools(blocks, items, tags).mismatches) is ok
+
+
+def test_check_tool_speeds_detects_planted_mismatch() -> None:
+    items = {"wooden_pickaxe": _pickaxe("incorrect_for_wooden_tool", 2.0)}
+    tags = {"incorrect_for_wooden_tool": [], "mineable/pickaxe": ["stone"]}
+    for md_speed, ok in ((2.0, True), (4.0, False)):
+        md = {"blocks": [{"name": "stone", "material": "mineable/pickaxe"}],
+              "items": [{"id": 1, "name": "wooden_pickaxe"}], "materials": {"mineable/pickaxe": {"1": md_speed}}}
+        chk = B.check_tool_speeds(_src(md), items, tags, {"stone": {"mineable": ["pickaxe"]}})
+        assert chk.compared == 1 and (not chk.mismatches) is ok
+
+
+def test_check_recipes_detects_planted_mismatches() -> None:
+    md_items = [{"id": 1, "name": "stick"}, {"id": 2, "name": "oak_planks"}, {"id": 3, "name": "birch_planks"},
+                {"id": 4, "name": "flint_and_steel"}, {"id": 5, "name": "iron_ingot"}, {"id": 6, "name": "flint"},
+                {"id": 7, "name": "bone"}]
+    recipes = [{"id": "stick", "type": "crafting_shaped", "pattern": ["#", "#"],
+                "key": {"#": ["birch_planks", "oak_planks"]}, "ingredients": None,
+                "result": {"item": "stick", "count": 4}},
+               {"id": "flint_and_steel", "type": "crafting_shapeless", "pattern": None, "key": None,
+                "ingredients": [["iron_ingot"], ["bone", "flint"]], "result": {"item": "flint_and_steel", "count": 1}}]
+    raw = {"flint_and_steel": {"ingredients": [{"item": "minecraft:iron_ingot"},
+                                               [{"item": "minecraft:flint"}, {"item": "minecraft:bone"}]]}}
+
+    def check(sticks: list[list[list[int]]], fs_count: int) -> B.CrossCheck:
+        md_recipes = {"1": [{"result": {"id": 1, "count": 4}, "inShape": shape} for shape in sticks],
+                      "4": [{"result": {"id": 4, "count": fs_count}, "ingredients": [5, 6]}]}
+        return B.check_recipes(_src({"items": md_items, "recipes": md_recipes}, recipes=raw), recipes)
+
+    good = check([[[2], [2]], [[3], [3]]], 1)
+    assert not good.mismatches
+    assert any("1 non-first ingredient alternatives in 1 recipes are NOT compared" in t for t in good.tolerated)
+    assert any("lacks ['birch_planks']" in m for m in check([[[2], [2]]], 1).mismatches)  # a tag member missing
+    assert any("shapeless" in m for m in check([[[2], [2]], [[3], [3]]], 2).mismatches)  # result count
+
+
+def test_check_entities_detects_a_planted_name() -> None:
+    for name, ok in (("Zombie", True), ("Zombi", False)):
+        src = _src({"entities": [{"name": "zombie", "displayName": name}],
+                    "language": {"entity.minecraft.zombie": "Zombie"}}, entity_registry=["zombie"])
+        assert (not B.check_entities(src).mismatches) is ok
+
+
+def test_check_display_names_detects_a_planted_name() -> None:
+    for name, ok in (("Stone", True), ("Rock", False)):
+        src = _src({"blocks": [{"name": "stone", "displayName": name}], "language": {"block.minecraft.stone": "Stone"}})
+        assert (not B.check_display_names(src).mismatches) is ok
+
+
+def test_check_derived_loot_detects_planted_mismatch() -> None:
+    blocks = {"torch": {"loot_table": "blocks/torch"}, "wall_torch": {"loot_table": "blocks/torch"}}
+    for wall_drops, ok in (([10], True), ([11], False)):
+        src = _src({"blocks": [{"name": "torch", "drops": [10]}, {"name": "wall_torch", "drops": wall_drops}]})
+        assert (not B.check_derived_loot(src, blocks).mismatches) is ok
+
+
+def test_entity_loot_check_follows_table_references() -> None:
+    loot = {"entities/sheep": {"pools": [{"entries": [{"type": "minecraft:item", "name": "minecraft:mutton"}]}]},
+            "entities/sheep/white": {"pools": [{"entries": [{"type": "minecraft:item", "name": "minecraft:white_wool"},
+                                                            {"type": "minecraft:loot_table",
+                                                             "value": "minecraft:entities/sheep"}]}]}}
+    src = _src({"entity_loot": [{"entity": "sheep", "drops": [{"item": "mutton"}, {"item": "white_wool"}]}]},
+               loot=loot, entity_registry=["sheep"])
+    chk = B.check_stale_entity_loot(src)
+    assert chk.compared == 1 and not chk.mismatches and not chk.fatal
+
+
+def test_fatal_mismatches_raise() -> None:
+    ok, info, bad = B.CrossCheck("a"), B.CrossCheck("b", fatal=False), B.CrossCheck("c")
+    info.mismatches.append("stale, info only")
+    assert B.fatal_failures([ok, info]) == []
+    bad.mismatches.append("x: 1 vs 2")
+    assert B.fatal_failures([ok, info, bad]) == [bad]
+    err = B.CrossCheckError([ok, info, bad])
+    assert isinstance(err, B.BuildError) and err.checks == [ok, info, bad] and "x: 1 vs 2" in str(err)
+
+
+# ---------------------------------------------------------------------------
 # Rebuild from the source cache: cross-checks pass and the file is reproduced exactly
 # ---------------------------------------------------------------------------
 
@@ -378,8 +521,12 @@ def _sources_available() -> bool:
     return SOURCES_DIR.is_dir() and not verify_all(SOURCES_JSON, SOURCES_DIR)
 
 
-@pytest.mark.skipif(not _sources_available(),
-                    reason="data/sources/ missing or not matching the pins; run python -m hivemind.rules.fetch_sources")
+needs_sources = pytest.mark.skipif(
+    not _sources_available(),
+    reason="data/sources/ missing or not matching the pins; run python -m hivemind.rules.fetch_sources")
+
+
+@needs_sources
 def test_rebuild_from_cache_reproduces_committed_file(raw_bytes: bytes) -> None:
     rules, checks, _notes = B.build(SOURCES_DIR, SOURCES_JSON, verify=False)  # verified by the skipif
     for chk in checks:
@@ -392,3 +539,14 @@ def test_rebuild_from_cache_reproduces_committed_file(raw_bytes: bytes) -> None:
         assert expected in names
     assert rules["build"]["hash"] == json.loads(raw_bytes)["build"]["hash"]
     assert B.render(rules) == raw_bytes
+
+
+@needs_sources
+def test_build_fails_on_a_real_disagreement(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without its tolerance entry, minecraft-data's map-extending recipe is a recipe mismatch."""
+    monkeypatch.setattr(B, "TOLERATED_RECIPES_ONLY_IN_MD", {})
+    with pytest.raises(B.CrossCheckError) as exc:
+        B.build(SOURCES_DIR, SOURCES_JSON, verify=False)
+    assert [c.name for c in B.fatal_failures(exc.value.checks)] == ["recipes: minecraft-data vs mcmeta (crafting)"]
+    _rules, checks, _notes = B.build(SOURCES_DIR, SOURCES_JSON, verify=False, strict=False)  # main's mode
+    assert B.fatal_failures(checks)

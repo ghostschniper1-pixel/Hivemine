@@ -125,6 +125,16 @@ def test_mining_and_harvest(rules: Rules) -> None:
     assert not rules.can_harvest("golden_pickaxe", "iron_ore")  # gold is wood tier for drops
     assert not rules.can_harvest("iron_pickaxe", "obsidian") and rules.can_harvest("diamond_pickaxe", "obsidian")
     assert rules.can_harvest(None, "oak_log") and rules.can_harvest(None, "dirt")
+    assert rules.mining_speed("iron_pickaxe", "minecraft:stone") == 6.0
+
+
+def test_unknown_names_raise(rules: Rules) -> None:
+    """A typo must not silently mine at bare-hand speed."""
+    for call in (rules.mining_speed, rules.can_harvest):
+        with pytest.raises(KeyError, match="stone_brick"):
+            call("iron_pickaxe", "stone_brick")
+        with pytest.raises(KeyError, match="iron_pick"):
+            call("iron_pick", "stone")
 
 
 def test_design_break_time_check_values(rules: Rules) -> None:
