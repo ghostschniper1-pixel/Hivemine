@@ -13,9 +13,9 @@ more than 2 * 24 + 2 bits), so this emulation is exact.
 
 **Sources.** Constants come from the rules file (``data/rules-1.21.1.json``, built from
 ``hivemind/rules/constants.py``) through ``MechanicsConstants``; each keeps the label recorded
-there ([13]-[20] are minecraft.wiki pages quoted by DESIGN.md). The evaluation order of the game
-code and the few values not yet in the rules file are from memory of the 1.21.1 code ([mem])
-unless a comment cites a data file. Data files from the pinned mcmeta ``1.21.1-data`` [3] confirm
+there ([13]-[20] are minecraft.wiki pages quoted by DESIGN.md; [mem] values are from memory of
+the 1.21.1 code). The evaluation order of the game code is from memory too ([mem]) unless a
+comment cites a data file. Data files from the pinned mcmeta ``1.21.1-data`` [3] confirm
 some of it: ``enchantment/efficiency.json`` (mining_efficiency += level^2 + 1),
 ``enchantment/aqua_affinity.json`` (submerged_mining_speed x5 from its 0.2 base),
 ``damage_type/*.json`` (exhaustion 0.1 for mob and player attacks, 0 for starve and fall;
@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
-from dataclasses import MISSING, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from enum import IntEnum
 from functools import lru_cache
 from typing import TYPE_CHECKING
@@ -53,8 +53,8 @@ def f32(x: float) -> float:
 class MechanicsConstants:
     """The constants the formulas use, named as in ``rules.constants``.
 
-    Fields without a default must exist in the rules file. Fields with a default are not in the
-    rules file yet (all [mem]); ``from_rules`` takes the rules value as soon as one exists.
+    No field has a default: every one must exist in the rules file, so a missing constant fails
+    loudly in ``from_rules`` instead of silently using a value written here.
     """
 
     # Breaking [13]
@@ -62,8 +62,9 @@ class MechanicsConstants:
     break_damage_divisor_not_harvestable: int
     break_delay_ticks: int
     break_haste_per_level: float
-    break_mining_fatigue_base: float
-    break_mining_fatigue_max_level: int
+    break_mining_fatigue_table: tuple[float, ...]  # [mem] levels I-IV (a list in the rules file)
+    break_mining_fatigue_base: float  # [13] draft-0.3 formula only (design_formula=True)
+    break_mining_fatigue_max_level: int  # [13] draft-0.3 formula only
     break_underwater_multiplier: float
     break_airborne_multiplier: float
     break_server_accept_fraction: float
@@ -80,6 +81,7 @@ class MechanicsConstants:
     exhaustion_attack: float
     exhaustion_damage: float
     exhaustion_threshold: float
+    exhaustion_cap: float
     regen_saturated_interval_ticks: int
     regen_saturated_max_saturation: float
     regen_interval_ticks: int
@@ -101,6 +103,8 @@ class MechanicsConstants:
     bed_use_start_tick: int
     bed_use_end_tick: int
     hostile_spawn_max_sky_light: int
+    max_sky_light: int
+    sky_darken_night_min: int
     # Combat [18]
     player_base_attack_damage: float
     player_base_attack_speed: float
@@ -111,6 +115,7 @@ class MechanicsConstants:
     critical_multiplier: float
     critical_min_charge: float
     invulnerability_ticks: int
+    invulnerability_reset_ticks: int
     fall_damage_safe_blocks: float
     # Armor [17]
     armor_cap: float
@@ -120,24 +125,17 @@ class MechanicsConstants:
     armor_divisor: float
     # Smelting [20]
     smelt_ticks: int
-    # --- Not in the rules file yet (requested); from memory of the 1.21.1 code -------------
-    exhaustion_cap: float = 40.0  # [mem] FoodData.addExhaustion: min(exhaustion + x, 40)
-    # [mem] Player.getDestroySpeed: Mining Fatigue I-IV multiply by 0.3, 0.09, 0.0027, 0.00081
-    # (a switch on the amplifier, not 0.3^n). prismarine-block 1.23.0 (npm [9]) has the same table.
-    break_mining_fatigue_table: tuple[float, ...] = (0.3, 0.09, 0.0027, 0.00081)
-    invulnerability_reset_ticks: int = 20  # [mem] a hit sets invulnerableTime = 20; blocks while > 10
-    max_sky_light: int = 15  # [mem]
-    sky_darken_night_min: int = 4  # [mem] Level.isDay() is skyDarken < 4; beds work only when not isDay
 
     @classmethod
     def from_rules(cls, rules: Rules) -> MechanicsConstants:
+        """Read every field from ``rules.constants``; raises ``KeyError`` naming any that is missing."""
+        missing = [f.name for f in fields(cls) if f.name not in rules.constants]
+        if missing:
+            raise KeyError(f"rules file has no constant(s) {missing}")
         values = {}
         for f in fields(cls):
-            if f.name in rules.constants:
-                v = rules.constant(f.name)
-                values[f.name] = tuple(v) if isinstance(v, list) else v
-            elif f.default is MISSING:
-                raise KeyError(f"rules file has no constant {f.name!r}")
+            v = rules.constant(f.name)
+            values[f.name] = tuple(v) if isinstance(v, list) else v
         return cls(**values)
 
 

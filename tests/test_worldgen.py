@@ -1,0 +1,301 @@
+"""Tests for the test-world generator (hivemind.sim.ref.worldgen) and its ore table (ore_table)."""
+
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from hivemind.rules import load_concepts
+from hivemind.rules.fetch_sources import verify_all
+from hivemind.sim.ref import ore_table as ot
+from hivemind.sim.ref import worldgen as wg
+from hivemind.sim.ref.rng import CounterRNG
+from hivemind.sim.ref.world import MIN_Y
+
+REPO = Path(__file__).resolve().parents[1]
+SOURCES_JSON = REPO / "data" / "sources.json"
+SOURCES_DIR = REPO / "data" / "sources"
+C = load_concepts()
+ID = {c.name: c.id for c in C.block_classes}
+FAMILIES = {f: (ID[f"{f}_ore"], ID[f"deepslate_{f}_ore"])
+            for f in ("coal", "iron", "copper", "gold", "redstone", "lapis", "diamond")}
+
+
+@pytest.fixture(scope="module")
+def flat_worlds():
+    """Two flat worlds without stone blobs or caves: every ore block comes from an ore row."""
+    cfg = wg.preset("flat", stone_blobs=False)
+    return [wg.generate(seed, cfg) for seed in (11, 12)]
+
+
+@pytest.fixture(scope="module")
+def default_world():
+    return wg.generate(3, "default")
+
+
+@pytest.fixture(scope="module")
+def forest():
+    return wg.generate(5, "forest")
+
+
+# -- the ore table ------------------------------------------------------------------------
+
+
+def _sources_ok() -> bool:
+    return SOURCES_DIR.is_dir() and not verify_all(SOURCES_JSON, SOURCES_DIR)
+
+
+@pytest.mark.skipif(not _sources_ok(), reason="data/sources/ missing or not matching the pins")
+def test_ore_table_regenerates_from_pinned_sources():
+    assert ot.generate_table() == ot.ORE_TABLE
+    assert ot.render_rows(ot.ORE_TABLE) in Path(ot.__file__).read_text(encoding="utf-8")
+
+
+def test_ore_table_contents():
+    rows = {r.name: r for r in ot.ORE_TABLE}
+    iron = rows["ore_iron_middle"]
+    assert (iron.count_min, iron.height, iron.min_y, iron.max_y, iron.size) == (10, "trapezoid", -24, 56, 9)
+    assert iron.targets[0].place == "iron_ore" and iron.targets[1].place == "deepslate_iron_ore"
+    assert set(iron.targets[1].replaces) == {"deepslate", "tuff"}
+    assert set(iron.targets[0].replaces) == {"stone", "granite", "diorite", "andesite"}
+    assert rows["ore_diamond_buried"].discard_on_air == 1.0
+    assert rows["ore_diamond_large"].rarity == 9
+    assert (rows["ore_gold_lower"].count_min, rows["ore_gold_lower"].count_max) == (0, 1)
+    assert rows["ore_emerald"].in_biome("windswept_hills") and not rows["ore_emerald"].in_biome("plains")
+    assert rows["ore_copper"].in_biome("plains") and not rows["ore_copper"].in_biome("dripstone_caves")
+    plains = {r.name for r in ot.ore_table("plains")}
+    assert "ore_emerald" not in plains and "ore_coal_lower" in plains and len(plains) == 25
+    for r in ot.ORE_TABLE:  # every placed class is a real class with an honest phrase
+        for t in r.targets:
+            assert C.block_class(t.place).name == t.place
+
+
+@pytest.mark.parametrize("name", ["ore_iron_middle", "ore_redstone", "ore_diamond", "ore_coal_lower"])
+def test_height_pmf_is_a_distribution(name):
+    row = {r.name: r for r in ot.ORE_TABLE}[name]
+    pmf = ot.height_pmf(row)
+    assert math.isclose(sum(pmf.values()), 1.0)
+    assert min(pmf) == row.min_y and max(pmf) == row.max_y
+    if row.height == "trapezoid":
+        mid = (row.min_y + row.max_y) // 2
+        assert pmf[mid] > pmf[row.min_y] * 10  # a triangle peaked in the middle
+
+
+@pytest.mark.parametrize("name", ["ore_iron_middle", "ore_redstone", "ore_diamond", "ore_gold_lower",
+                                  "ore_diorite_upper"])
+def test_attempts_follow_the_table(name):
+    """Counts, rarity and origin heights of the generator's attempts match the table."""
+    rows = ot.ORE_TABLE
+    fi = next(i for i, r in enumerate(rows) if r.name == name)
+    row = rows[fi]
+    rng = CounterRNG(99)
+    chunks = [(cx, cz) for cx in range(40) for cz in range(40)]
+    origins = []
+    for chunk in chunks:
+        attempts = wg.ore_attempts(rng, row, fi, chunk)
+        for x, _, z in attempts:
+            assert chunk[0] * 16 <= x < chunk[0] * 16 + 16 and chunk[1] * 16 <= z < chunk[1] * 16 + 16
+        origins += [y for _, y, _ in attempts]
+    n_expected = row.expected_attempts() * len(chunks)
+    sd = math.sqrt(len(chunks) * (row.count_max - row.count_min + 1) ** 2 / 4 + n_expected) + 1
+    assert abs(len(origins) - n_expected) < 4 * sd
+    ys = np.asarray(origins)
+    assert ys.min() >= row.min_y and ys.max() <= row.max_y
+    pmf = ot.height_pmf(row)
+    support = np.arange(row.min_y, row.max_y + 1)
+    cdf = np.cumsum([pmf.get(int(y), 0.0) for y in support])
+    emp = np.searchsorted(np.sort(ys), support, side="right") / len(ys)
+    assert np.abs(emp - cdf).max() < 1.63 / math.sqrt(len(ys)) * 1.5  # Kolmogorov-Smirnov, ~1% level, slack
+
+
+def test_ore_density_knob_scales_attempts():
+    row = next(r for r in ot.ORE_TABLE if r.name == "ore_iron_middle")
+    rng = CounterRNG(5)
+    chunks = [(cx, cz) for cx in range(20) for cz in range(20)]
+    for density in (0.25, 0.5, 2.0):
+        n = sum(len(wg.ore_attempts(rng, row, 12, c, density)) for c in chunks)
+        assert abs(n / (10 * density * len(chunks)) - 1.0) < 0.05
+    blob = next(r for r in ot.ORE_TABLE if r.name == "ore_granite_lower")
+    assert not blob.is_ore
+    assert sum(len(wg.ore_attempts(rng, blob, 3, c, 0.25)) for c in chunks) == 2 * len(chunks)  # not scaled
+
+
+# -- determinism ------------------------------------------------------------------------------
+
+
+def test_same_seed_same_world_different_seed_differs(forest):
+    again = wg.generate(5, "forest")
+    assert np.array_equal(forest.blocks, again.blocks)
+    other = wg.generate(6, "forest")
+    assert (forest.blocks != other.blocks).mean() > 0.01
+    assert forest.meta["spawn"] == again.meta["spawn"]
+
+
+# -- terrain ----------------------------------------------------------------------------------
+
+
+def test_bedrock_and_deepslate_strata(flat_worlds):
+    w = flat_worlds[0]
+    b = w.blocks
+    assert (b[:, 0, :] == ID["bedrock"]).all()  # y -64
+    bedrock_y = np.nonzero(b == ID["bedrock"])[1] + MIN_Y
+    assert bedrock_y.max() <= -60
+    frac = [(b[:, y - MIN_Y, :] == ID["bedrock"]).mean() for y in (-63, -62, -61, -60)]
+    assert frac[0] > frac[1] > frac[2] > frac[3] > 0  # the rough layer thins out upwards
+    rock = lambda y: b[:, y - MIN_Y, :]  # noqa: E731
+    assert (rock(-30) == ID["deepslate"]).mean() > 0.9
+    assert not (rock(20) == ID["deepslate"]).any()
+    band = [(rock(y) == ID["deepslate"]).mean() for y in range(0, 9)]
+    assert band[0] > 0.9 and band[-1] < 0.1 and band[2] > band[6]
+
+
+def test_flat_surface_soil(flat_worlds):
+    w = flat_worlds[0]
+    assert (w.heightmap == 64).all()
+    assert (w.blocks[:, 64 - MIN_Y, :] == ID["grass_block"]).all()
+    assert (w.blocks[:, 63 - MIN_Y, :] == ID["dirt"]).all() and (w.blocks[:, 61 - MIN_Y, :] == ID["dirt"]).all()
+    assert (w.blocks[:, 65 - MIN_Y:, :] == 0).all()
+    four_deep = (w.blocks[:, 60 - MIN_Y, :] == ID["dirt"]).mean()  # 3 or 4 dirt layers [est]
+    assert 0.3 < four_deep < 0.7 and not (w.blocks[:, 59 - MIN_Y, :] == ID["dirt"]).any()
+
+
+def test_rolling_surface_range(default_world):
+    h = default_world.meta["surface"]
+    assert 55 <= h.min() and h.max() <= 90  # [est] mostly 64-80
+    assert 64 <= np.median(h) <= 80
+
+
+def test_water_sand_trees_caves_lava(default_world):
+    w = default_world
+    b = w.blocks
+    y = np.arange(MIN_Y, 192)[None, :, None]
+    water = b == ID["water"]
+    assert water.any()
+    assert (b == ID["sand"]).any()  # beaches and pond floors
+    lava_y = np.nonzero(b == ID["lava"])[1] + MIN_Y
+    assert lava_y.size == 0 or lava_y.max() <= wg.LAVA_LEVEL
+    under = y < w.meta["surface"][:, None, :] - 2
+    cave = (b == 0) & under
+    assert 0.002 < cave.sum() / under.sum() < 0.1  # [est]
+    assert w.meta["trees"] > 20
+
+
+def test_caves_expose_some_ore(default_world):
+    w = default_world
+    ores = np.isin(w.blocks, [i for pair in FAMILIES.values() for i in pair])
+    air = wg._air_neighbour(w.blocks, 0, MIN_Y, 0, w.blocks.shape)
+    exposed = (ores & air).sum() / ores.sum()
+    assert 0.002 < exposed < 0.2  # [est] until M3 measures exposure on real chunks
+
+
+def test_trees_have_trunks_4_to_6_and_honest_leaves(forest):
+    b = forest.blocks
+    log, oak, birch = ID["log"], ID["oak_leaves"], ID["leaves"]
+    assert (b == oak).sum() > (b == birch).sum() > 0
+    xs, ys, zs = np.nonzero(b == log)
+    columns = {(x, z) for x, z in zip(xs.tolist(), zs.tolist())}
+    assert len(columns) == forest.meta["trees"]
+    for x, z in columns:
+        heights = np.nonzero(b[x, :, z] == log)[0]
+        assert 4 <= len(heights) <= 6 and np.all(np.diff(heights) == 1)
+        top = heights[-1]
+        assert b[x, top + 1, z] in (oak, birch)  # the canopy sits on the trunk
+        assert b[x, heights[0] - 1, z] == ID["dirt"]
+
+
+def test_every_voxel_is_a_world_class(default_world):
+    assert C.block_defined[default_world.blocks].all()
+    assert not (default_world.blocks == 255).any()
+
+
+# -- ores -------------------------------------------------------------------------------------
+
+
+def test_deepslate_variants_replace_deepslate(flat_worlds):
+    for w in flat_worlds:
+        for stone_ore, deep_ore in FAMILIES.values():
+            ys_stone = np.nonzero(w.blocks == stone_ore)[1] + MIN_Y
+            ys_deep = np.nonzero(w.blocks == deep_ore)[1] + MIN_Y
+            if ys_deep.size:
+                assert ys_deep.max() <= 8  # deepslate exists only up to y 8
+            if ys_stone.size:
+                assert ys_stone.min() >= 0  # no granite blobs here: stone only from y 0
+
+
+def test_ore_counts_per_y_band_match_the_table(flat_worlds):
+    """Ore blocks per Y band agree with count x P(band) x mean vein size from the table."""
+    stats = {}
+    rows = ot.ore_table("plains")
+    for r in rows:
+        if r.size not in stats:
+            stats[r.size] = wg.vein_size_stats(r.size, n=300)
+    chunks = sum(w.chunks_x * w.chunks_z for w in flat_worlds)
+    bands = [(-58, -30), (-29, -1), (0, 30), (31, 55)]  # inside the stone of a flat world (bedrock < -59, dirt > 60)
+    checked = 0
+    total_exp = total_act = 0.0
+    for family, ids in FAMILIES.items():
+        family_rows = [r for r in rows if r.targets[0].place == f"{family}_ore"]
+        ys = np.concatenate([np.nonzero(np.isin(w.blocks, ids))[1] + MIN_Y for w in flat_worlds])
+        for lo, hi in bands:
+            exp = var = 0.0
+            for r in family_rows:
+                n = chunks * r.expected_attempts() * ot.band_probability(r, lo, hi)
+                exp += n * stats[r.size][0]
+                var += n * stats[r.size][1]  # sum of n Bernoulli-thinned vein sizes (an upper bound)
+            act = int(((ys >= lo) & (ys <= hi)).sum())
+            total_exp += exp
+            total_act += act
+            if exp < 50:
+                assert act < 50 + 4 * math.sqrt(var + 1)
+                continue
+            checked += 1
+            assert abs(act - exp) < 4 * math.sqrt(var), (family, lo, hi, act, exp)
+    assert checked >= 14
+    assert abs(total_act / total_exp - 1) < 0.1
+
+
+def test_ore_density_knob_scales_blocks():
+    base = wg.preset("flat", size_x=32, size_z=32, stone_blobs=False)
+    one = wg.generate(4, base)
+    two = wg.generate(4, wg.preset("flat", size_x=32, size_z=32, stone_blobs=False, ore_density=2.0))
+    quarter = wg.generate(4, wg.preset("flat", size_x=32, size_z=32, stone_blobs=False, ore_density=0.25))
+    ores = np.array([i for pair in FAMILIES.values() for i in pair])
+    n = [int(np.isin(w.blocks, ores).sum()) for w in (quarter, one, two)]
+    assert 0.15 < n[0] / n[1] < 0.35 and 1.7 < n[2] / n[1] < 2.3
+
+
+def test_buried_diamonds_avoid_air():
+    """discard_chance_on_air_exposure 1.0 never places next to air; 0.0 ignores air."""
+    rng = CounterRNG(1)
+    stone, ore = ID["stone"], ID["diamond_ore"]
+    targets = wg.OreTargets((np.isin(np.arange(256), [stone]),), (ore,))
+    for discard, may_touch in ((1.0, False), (0.0, True)):
+        touching = 0
+        for i in range(40):
+            blocks = np.full((24, 256, 24), stone, np.uint8)
+            blocks[:, 0 - MIN_Y:, :] = 0  # air from y 0 up
+            wg.place_vein(blocks, (12, 0, 12), 8, discard, targets, rng, wg.vein_key(0, i, (0, 0)))
+            ys = np.nonzero(blocks == ore)[1] + MIN_Y
+            touching += int((ys == -1).sum())
+        assert (touching > 0) == may_touch
+
+
+# -- spawn ---------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("which", ["flat", "forest", "default"])
+def test_spawn_on_surface(which, flat_worlds, forest, default_world):
+    w = {"flat": flat_worlds[0], "forest": forest, "default": default_world}[which]
+    x, y, z = w.meta["spawn"]
+    assert x % 1 == 0.5 and z % 1 == 0.5 and y == int(y)
+    xi, yi, zi = int(x), int(y), int(z)
+    assert yi == w.heightmap[xi, zi] + 1
+    ground = w.get(xi, yi - 1, zi)
+    assert C.solid[ground] and not C.hazard[ground] and not C.liquid[ground]
+    for dy in (0, 1):
+        cell = w.get(xi, yi + dy, zi)
+        assert C.collision_height[cell] == 0 and not C.liquid[cell]
+    assert wg.spawn_point(w) == (x, y, z)

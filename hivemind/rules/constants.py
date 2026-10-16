@@ -42,10 +42,14 @@ GAME: dict[str, Const] = {
     "break_damage_divisor_not_harvestable": Const(100, "[13]"),  # [13] dmg = speed/hardness/100
     "break_delay_ticks": Const(6, "[13]"),  # [13] ticks before the next block can be started
     "break_haste_per_level": Const(0.2, "[13]"),  # [13] speed *= 1 + 0.2*haste
-    # [13] speed *= 0.3^min(fatigue, 4). [mem] suspicion: the game code uses 0.3, 0.09, 0.0027,
-    # 0.00081 for levels 1-4, which differs from 0.3^n at levels 3-4. Irrelevant in v1.
-    "break_mining_fatigue_base": Const(0.3, "[13]"),  # [13]
-    "break_mining_fatigue_max_level": Const(4, "[13]"),  # [13]
+    # Mining Fatigue I-IV multiply the speed by this table (Player.getDestroySpeed switches on the
+    # amplifier; prismarine-block 1.23.0 has the same table). DESIGN 4.3. Irrelevant in v1.
+    "break_mining_fatigue_table": Const((0.3, 0.09, 0.0027, 0.00081), "[mem]"),  # [mem]
+    # Draft 0.3's formula only, speed *= 0.3^min(fatigue, 4) as quoted from [13] (DESIGN 4.3). Not
+    # the game's rule: it is 10x too large at levels 3-4. Kept for comparison
+    # (mechanics.mining_fatigue_multiplier(design_formula=True)); the simulator uses the table above.
+    "break_mining_fatigue_base": Const(0.3, "[13]"),  # [13] draft-0.3 formula only
+    "break_mining_fatigue_max_level": Const(4, "[13]"),  # [13] draft-0.3 formula only
     "break_underwater_multiplier": Const(0.2, "[13]"),  # [13] without Aqua Affinity
     "break_airborne_multiplier": Const(0.2, "[13]"),  # [13] not on the ground: /5
     "break_server_accept_fraction": Const(0.7, "[mem]"),  # [mem] server accepts "finished" at 70%
@@ -62,6 +66,7 @@ GAME: dict[str, Const] = {
     "exhaustion_attack": Const(0.1, "[14]"),  # [14]
     "exhaustion_damage": Const(0.1, "[14]"),  # [14] per damage event
     "exhaustion_threshold": Const(4.0, "[14]"),  # [14] at 4: subtract 4, lose 1 saturation or food
+    "exhaustion_cap": Const(40.0, "[mem]"),  # [mem] FoodData.addExhaustion: min(exhaustion + x, 40); DESIGN 4.3
     "regen_saturated_interval_ticks": Const(10, "[14]"),  # [14] food 20 and saturation > 0
     "regen_saturated_max_saturation": Const(6.0, "[14]"),  # [14] heal min(sat,6)/6 HP for min(sat,6) exhaustion
     "regen_interval_ticks": Const(80, "[14]"),  # [14] food >= 18: 1 HP per 80 ticks
@@ -89,6 +94,10 @@ GAME: dict[str, Const] = {
     "players_sleeping_percentage": Const(100, "[73]"),  # [73] gamerule default
     "bed_monster_check_horizontal": Const(8.0, "[mem]"),  # [mem] no sleep with a monster within 8 blocks
     "bed_monster_check_vertical": Const(5.0, "[mem]"),  # [mem] ... and 5 blocks up or down
+    "max_sky_light": Const(15, "[mem]"),  # [mem] sky light under open sky at noon; surface light = 15 - skyDarken
+    # [mem] Level.isDay() is skyDarken < 4, so beds work only at skyDarken >= 4 (with [15]'s
+    # 12542..23459 in clear weather, checked by tests/test_mechanics.py)
+    "sky_darken_night_min": Const(4, "[mem]"),  # [mem]
     # Combat [18] (DESIGN 4.3)
     "player_base_attack_damage": Const(1.0, "[18]"),  # [18] fist
     "player_base_attack_speed": Const(4.0, "[mem]"),  # [mem] attacks per second without an item
@@ -99,6 +108,9 @@ GAME: dict[str, Const] = {
     "critical_multiplier": Const(1.5, "[18]"),  # [18]
     "critical_min_charge": Const(0.9, "[mem]"),  # [mem] attack charge (not damage multiplier) above 0.9
     "invulnerability_ticks": Const(10, "[18]"),  # [18] after a hit
+    # [mem] LivingEntity.hurt sets invulnerableTime = 20 on a hit that lands; a new hit is reduced
+    # while invulnerableTime > 20 - 10, which gives [18]'s 10 ticks
+    "invulnerability_reset_ticks": Const(20, "[mem]"),  # [mem]
     "fall_damage_safe_blocks": Const(3.0, "[mem]"),  # [mem] damage = blocks fallen - 3
     # Armor formula [17] (DESIGN 4.3): dmg *= 1 - min(cap, max(A/floor_div, A - k*dmg/(T+t0)))/divisor
     "armor_cap": Const(20.0, "[17]"),  # [17]

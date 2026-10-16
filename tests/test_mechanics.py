@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
+from dataclasses import MISSING, fields
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,18 +51,38 @@ def test_constants_come_from_the_rules_file(rules: Rules, c: MechanicsConstants)
     assert c is m.default_constants()
     assert c.break_delay_ticks == rules.constant("break_delay_ticks") == 6
     assert c.smelt_ticks == rules.constant("smelt_ticks") == 200
-    assert c.exhaustion_cap == 40.0  # [mem] default: not in the rules file yet
+    # The five [mem] values that used to be code defaults now come from the rules file.
+    assert c.exhaustion_cap == rules.constant("exhaustion_cap") == 40.0
+    assert c.break_mining_fatigue_table == tuple(rules.constant("break_mining_fatigue_table")) == \
+        (0.3, 0.09, 0.0027, 0.00081)
+    assert c.invulnerability_reset_ticks == rules.constant("invulnerability_reset_ticks") == 20
+    assert c.max_sky_light == rules.constant("max_sky_light") == 15
+    assert c.sky_darken_night_min == rules.constant("sky_darken_night_min") == 4
 
 
-def test_from_rules_requires_rules_constants_and_prefers_them(rules: Rules) -> None:
+def test_mechanics_constants_have_no_code_defaults() -> None:
+    assert all(f.default is MISSING and f.default_factory is MISSING for f in fields(MechanicsConstants))
+
+
+def _stub_rules(rules: Rules) -> tuple[dict, SimpleNamespace]:
     consts = dict(rules.constants)
+    return consts, SimpleNamespace(constants=consts, constant=lambda name: consts[name].value)
+
+
+def test_from_rules_takes_rules_values(rules: Rules) -> None:
+    consts, stub = _stub_rules(rules)
     consts["exhaustion_cap"] = SimpleNamespace(value=12.5, source="[est]")
     consts["break_mining_fatigue_table"] = SimpleNamespace(value=[0.5, 0.25], source="[est]")
-    stub = SimpleNamespace(constants=consts, constant=lambda name: consts[name].value)
     c2 = MechanicsConstants.from_rules(stub)
     assert c2.exhaustion_cap == 12.5 and c2.break_mining_fatigue_table == (0.5, 0.25)
-    del consts["smelt_ticks"]
-    with pytest.raises(KeyError):
+
+
+@pytest.mark.parametrize("name", ["smelt_ticks", "exhaustion_cap", "break_mining_fatigue_table",
+                                  "invulnerability_reset_ticks", "max_sky_light", "sky_darken_night_min"])
+def test_from_rules_fails_loudly_on_a_missing_constant(rules: Rules, name: str) -> None:
+    consts, stub = _stub_rules(rules)
+    del consts[name]
+    with pytest.raises(KeyError, match=name):
         MechanicsConstants.from_rules(stub)
 
 
@@ -213,6 +235,24 @@ def test_mineflayer_tool_speed_matches_minecraft_data_everywhere(rules: Rules) -
             assert m.mineflayer_tool_speed(rules, tool, b["name"]) == md_speed, (b["name"], tool)
             md_harvest = not harvest or (tool is not None and str(item_id[tool]) in harvest)
             assert rules.can_harvest(tool, b["name"]) == md_harvest, (b["name"], tool)
+
+
+DIG_FIXTURE_SCRIPT = REPO / "bridge" / "node" / "make_dig_fixture.py"
+
+
+def test_bridge_dig_fixture_is_current(rules: Rules) -> None:
+    # bridge/node/test/patches.test.js checks patched Mineflayer against this fixture, so it must
+    # follow the mechanics; regenerate with .venv/bin/python bridge/node/make_dig_fixture.py
+    spec = importlib.util.spec_from_file_location("make_dig_fixture", DIG_FIXTURE_SCRIPT)
+    gen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen)
+    fixture = gen.build_fixture(rules)
+    assert gen.render(fixture) == gen.FIXTURE_PATH.read_text(encoding="utf-8"), "rerun make_dig_fixture.py"
+    held, obsidian = fixture["held"], fixture["blocks"]["obsidian"]
+    assert len(fixture["tier_gated"]) == 101 and held[0] is None
+    assert obsidian["design"]["ground"][held.index("diamond_pickaxe")] == 188
+    assert obsidian["unpatched"]["ground"][held.index("diamond_pickaxe")] == 1500
+    assert {(e["block"], e["held"].endswith("_hoe")) for e in fixture["exceptions"]} == {("moss_carpet", True)}
 
 
 def test_server_accept_example(rules: Rules) -> None:
