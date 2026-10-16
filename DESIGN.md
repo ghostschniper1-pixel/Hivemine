@@ -22,7 +22,7 @@ The owner's design ideas:
 - Give each agent an explicit memory: where things were, who is an enemy, how much is in a chest (6.3).
 - Later, wire an LLM to the trained agent so the two work as one AI: the LLM a slow "prefrontal cortex" for long-term strategy, the hivemind the fast "lizard brain" that acts and understands the world. They share a goal section that both can read and write (6.6). This is the last milestone (M11), so that training starts as soon as possible.
 - See only what the agent's eyes could see from where it stands: surface blocks, no X-ray (6.1).
-- A bigger network for the new PC (two RTX 3090s, 32 cores, 64 GB), with a low-resolution image of the landscape in which each block is a slightly different colour, and a wider block window (6.2, 6.4, 13).
+- A bigger network for the new PC (two RTX 3090s, 32 cores, 64 GB), with a low-resolution image of the landscape in which each block is a slightly different color, and a wider block window (6.2, 6.4, 13).
 - The debug screen (F3) as inputs: coordinates, facing, the block looked at, time of day and time passed (6.2).
 
 In the owner's words:
@@ -467,7 +467,7 @@ Perception is defined once and runs in the C++ core; the reference version is `h
 - **Resource sightings:** a resource block enters memory when it is seen, either as a seen cell of the window or as the block of a panorama pixel, up to 64 blocks away [est]. Both are computed with every observation. During a macro, the window's seen cells are recomputed every 20 ticks [est] while the eye moves, so resources passed on a walk are noted; the panorama is cast once per decision, because its cost rules out casting it every few ticks (section 13). Nothing is recomputed while the eye stays still and no block in range changes. In preset S the panorama is still cast for the notebook but is not a network input [design], so both presets remember the same things. Sightings are written into the notebook's places table (6.3), which replaces draft 0.3's separate resource memory.
 - **Events** the client is told about: chat, damage with its source, death messages, chest lids opening and closing (with a viewer count, not a name), and who picked up which item entity. The notebook turns these into event sentences by fixed rules (6.3); the simulator produces the same inputs.
 - **Honesty tests** change cells the agent cannot see and check that the observation and the notebook stay the same, from the surface and from inside caves.
-- **X-ray condition** (ablation only, always labelled): the window shows every cell's class, and memory is filled from every resource block within 64 blocks, which is what `findBlocks` gives. It measures what honest vision costs. Its results are reported separately and never count toward the exit criteria, and X-ray is never used for an agent that is evaluated (in the simulator or the real game) or deployed.
+- **X-ray condition** (ablation only, always labeled): the window shows every cell's class, and memory is filled from every resource block within 64 blocks, which is what `findBlocks` gives. It measures what honest vision costs. Its results are reported separately and never count toward the exit criteria, and X-ray is never used for an agent that is evaluated (in the simulator or the real game) or deployed.
 
 ### 6.2 Observation
 
@@ -489,7 +489,7 @@ Every symbolic field is given as words from the shared vocabulary (contracts sec
 | Lag | 1 | — | ping/500 ms (Mineflayer reports ping [6]) |
 | Identity | 1 | own name (`red 7`): the number is the agent slot; the team word matters only in the shared-network variant | — |
 
-**The panorama's pixels.** A pixel whose ray hits an entity's box first holds that entity and no block; a pixel whose ray hits nothing within 64 blocks holds `air` at distance 1, with the light of the cell where the ray ends. The face is the side of the block or box the ray enters: a ray travelling south hits a `north` face [mem]. The network reads the block and entity of each pixel through their word vectors (6.4), so each block is "a slightly different colour", and the colour is what the agent has learned the block's name means.
+**The panorama's pixels.** A pixel whose ray hits an entity's box first holds that entity and no block; a pixel whose ray hits nothing within 64 blocks holds `air` at distance 1, with the light of the cell where the ray ends. The face is the side of the block or box the ray enters: a ray travelling south hits a `north` face [mem]. The network reads the block and entity of each pixel through their word vectors (6.4), so each block is "a slightly different color", and the color is what the agent has learned the block's name means.
 
 **The F3 group** (draft 0.5, owner request, section 1) gives what the vanilla debug screen (F3) shows [mem], in both presets. Nothing in it is hidden information: a player reads all of it on screen.
 - **Position:** x and z relative to home (the agent's spawn point; from M9, its team's base, where `go home` leads); y absolute, because ore heights depend on it. Absolute x and z are deliberately not given: evaluation areas sit hundreds of blocks apart (11.3), so x = 1532 is noise.
@@ -1074,7 +1074,7 @@ MineLand measured 6.3 GB for 64 agents and 9.0 GB for 128, without vision [34].
 **CPU cost of vision [est].** The fast core builds each observation inside the ≤800 µs of CPU per decision of 4.6.
 - **Panorama:** 2,304 rays of up to 64 blocks, cast once per decision (6.1). Rays below the horizon stop on the ground within a few blocks; rays above it can cross 64 blocks of air. On open ground that is about 85,000 cell steps, about 0.1–0.2 ms in C++ at 1–2 ns per step [est].
 - **Window (M):** about 2,600 short rays at the surface (one per see-through cell, up to three per exposed opaque cell), about 0.05 ms [est]. During a macro it is recast every 20 ticks while the eye moves (6.1), so a 100-tick walk adds about 0.25 ms [est].
-- Together about 0.15–0.25 ms per decision plus the walk's window casts: a fifth to a half of the 800 µs budget, leaving the rest for world ticks. M4 measures it. If it does not fit, the in-macro window casts are thinned first (every 40 ticks), then the core gets more threads at the cost of the actors' share [est].
+- Together about 0.15–0.25 ms per decision, plus the window casts of any walk: from a fifth of the 800 µs budget for an agent standing still to over half on a 100-tick walk, leaving the rest for world ticks. M4 measures it. If it does not fit, the in-macro window casts are thinned first (every 40 ticks), then the core gets more threads at the cost of the actors' share [est].
 
 **Using two GPUs:**
 1. **One run per GPU**: two seeds or two experiments in parallel. This is the default for single-agent work and for grid seeds.
@@ -1121,7 +1121,7 @@ For comparison:
 | Sim-to-real gap (movement, combat, mobs) | Calibration from M2 on; pathfinder rules ported into the nav grid; models fitted to telemetry; lag and failure noise |
 | Mineflayer hangs or reports success early (dig resolves locally; window waits have no timeout) [74][75] | Deadlines with cleanup; re-read after RT + 2 ticks; server-side logs |
 | Agents exploit simulator bugs [57] | Invariants, speed bounds, real-game checks of surprising strategies |
-| Hidden X-ray (`findBlocks`, or cells shown behind a wall) inflates competence | One visible-only perception function on both sides (6.1); honesty tests that change unseen cells; X-ray only as a labelled ablation, never used for an agent that is evaluated or deployed |
+| Hidden X-ray (`findBlocks`, or cells shown behind a wall) inflates competence | One visible-only perception function on both sides (6.1); honesty tests that change unseen cells; X-ray only as a labeled ablation, never used for an agent that is evaluated or deployed |
 | Visible-only vision makes the task harder than draft 0.4's (no cave seen through a wall) | The X-ray ablation measures the cost; the panorama sees 64 blocks and the notebook keeps what was seen; `descend` and `strip_mine` open ore up |
 | A bigger network slows every experiment (M costs about 2.9 times S per decision, 13) | bf16 autocast; S and M trained for the same wall-clock hours at M5, the better kept (D24); fall back to S for the team grid if M does not pay |
 | The panorama and the visibility rays overrun the core's CPU budget | Cast the panorama once per decision; cost measured in M4 against the 800 µs budget (13); thin the in-macro window casts first |
@@ -1136,7 +1136,7 @@ For comparison:
 | Word-by-word commands learn slower than flat action heads | Ablations against opaque ids with untied heads and against phrase-level scoring (section 5); if words lose, keep the English text as the interchange format and use the faster decoder |
 | The notebook leaks hidden information | Honesty rule (6.3): written only from perception, own actions and chat; gifts and chest openings attributed by fixed rules on perceived inputs, with no thief ever named; tests that change hidden world state and check that the notebook does not change; sim-versus-real event parity in M7; masks read the notebook, not the world |
 | LLM ports change behavior before any LLM is coupled | Port tokens masked; adapters zero-initialized and frozen; an identity test (outputs equal with and without the ports) |
-| Class merging hides real-game rules (a bed needs three wool of one color) | Homogeneity checks in the class build; every approximation listed (4.4); each checked in the real game in M7 |
+| Class merging hides real-game rules (a bed needs three wool of one color; members of a class share stacks only in the simulator) | Homogeneity checks in the class build; every approximation listed (4.2, 4.4); each checked in the real game in M7; the bridge builds each craft's recipe from the items actually held |
 | Scope: this is several projects | Each milestone stands alone; stopping after M5 or M8 still gives results |
 | Version churn | Rules regenerate by script; gamerule names keyed to the version; recalibrate on version bumps |
 
@@ -1158,7 +1158,7 @@ For comparison:
 | D12 | Team networks | Two independent populations; a shared network as a variant |
 | D13 | Server config | View and simulation distance 10, frozen at M0 |
 | D14 | Night skip | `playersSleepingPercentage` 100 (vanilla), simulated |
-| D15 | Perception (owner request in draft 0.5) | Visible-only: a cell is seen only when a straight segment from the eye reaches it through see-through cells; all other window cells show `unseen`; resource sightings from seen cells and panorama pixels, up to 64 blocks (6.1). X-ray only as a labelled ablation that measures what honesty costs, never used for an agent that is evaluated or deployed |
+| D15 | Perception (owner request in draft 0.5) | Visible-only: a cell is seen only when a straight segment from the eye reaches it through see-through cells; all other window cells show `unseen`; resource sightings from seen cells and panorama pixels, up to 64 blocks (6.1). X-ray only as a labeled ablation that measures what honesty costs, never used for an agent that is evaluated or deployed |
 | D16 | Evaluation | Profiles A–C; 250 episodes per profile for full checks |
 | D17 | Emergent language (9.1) | Run it as its own arm next to the grounded chat; team-only channel first, global as a variant |
 | D18 | Natural language everywhere (owner request) | Yes: every action is an English command, written word by word under a grammar mask with tied word embeddings; every observed symbol is named in the same words (5, 6.2) |
@@ -1168,7 +1168,7 @@ For comparison:
 | D22 | Goal section (owner request) | Reserve the three goal slots, the goal words and the `plan` verb now, all off; goal-following training, hindsight relabelling and the feasibility query come in M11, which stays last so that training starts sooner (6.6). Self-set goals never pay |
 | D23 | One AI from the agent and an LLM (owner request) | Two clocks joined by trained adapters and the shared goal slots (6.6); initializing the agent's words from an LLM only inside M11, never in M1–M10 |
 | D24 | Network size (owner request) | Two presets: S (about 5M parameters, draft 0.4) and M (about 25M with the critic: panorama, 21 × 21 × 9 window, GRU 1024; 6.4), trained with bf16 autocast. M is the default; settled at M5 by training both for the same wall-clock hours and keeping the better |
-| D25 | Semantic panorama (owner request) | Yes, in M: a world-aligned 360° image, 96 × 24 pixels, ray-cast up to 64 blocks; blocks and entities read through their word vectors, not as colours (6.1, 6.2, 6.4); also cast in S, for the notebook only |
+| D25 | Semantic panorama (owner request) | Yes, in M: a world-aligned 360° image, 96 × 24 pixels, ray-cast up to 64 blocks; blocks and entities read through their word vectors, not as colors (6.1, 6.2, 6.4); also cast in S, for the notebook only |
 | D26 | F3 debug inputs (owner request) | Yes, in both presets: x and z relative to home, y absolute (absolute x and z would be noise across evaluation areas); facing, targeted block, fluid and entity, time of day and its word, day number, episode ticks, biome and light as F3 shows them (6.2) |
 
 **Open questions:**
