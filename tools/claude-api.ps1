@@ -57,10 +57,17 @@ if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
 
 if ($Reset -or -not (Test-Path $keyFile)) {
     $secure = Read-Host 'Paste your Anthropic API key (input is hidden)' -AsSecureString
-    $plain = [System.Net.NetworkCredential]::new('', $secure).Password
-    if (-not $plain.StartsWith('sk-ant-')) {
-        throw 'That does not look like an Anthropic API key (they start with "sk-ant-"). Nothing was saved.'
+    $plain = [System.Net.NetworkCredential]::new('', $secure).Password.Trim()
+    if ($plain.StartsWith('sk-ant-admin')) {
+        throw 'That is an Admin API key: it manages an organization but cannot run Claude. Create a regular key under API Keys in the Anthropic Console (it starts with "sk-ant-api"). Nothing was saved.'
     }
+    if ($plain.StartsWith('sk-ant-oat')) {
+        throw 'That is an OAuth token, not an API key. Create a regular key under API Keys in the Anthropic Console (it starts with "sk-ant-api"). Nothing was saved.'
+    }
+    if (-not $plain.StartsWith('sk-ant-api')) {
+        throw 'That does not look like an Anthropic API key (regular keys start with "sk-ant-api"). Nothing was saved.'
+    }
+    $secure = ConvertTo-SecureString $plain -AsPlainText -Force
     New-Item -ItemType Directory -Force -Path $keyDir | Out-Null
     # Without -Key, ConvertFrom-SecureString encrypts with DPAPI: only this Windows account on this PC can read it.
     $secure | ConvertFrom-SecureString | Set-Content -Path $keyFile -Encoding ASCII
