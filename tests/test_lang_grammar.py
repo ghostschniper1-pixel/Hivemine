@@ -30,7 +30,8 @@ def _keep(c: Command) -> bool:
     if c.verb == "chat":
         s = c["sentence"]
         return c["addressee"] == "blue_19" or (s.get("item") in (None, "iron_ingot", "dax")
-                                               and s.get("item_count") in (None, 3))
+                                               and s.get("item_count") in (None, 3)
+                                               and s.get("block") in (None, "iron_ore", "log"))
     return True
 
 
@@ -74,6 +75,15 @@ EXAMPLES = [
     ("tell everyone i need 3 iron ingot.",
      Command("chat", (("addressee", "everyone"), ("sentence", Sentence("need", item_count=3, item="iron_ingot"))))),
     ("tell team where is dax.", Command("chat", (("addressee", "team"), ("sentence", Sentence("where", item="dax"))))),
+    # draft 0.5: where has an item form and a block form, told apart by the slot name
+    ("tell everyone where is iron ore.",
+     Command("chat", (("addressee", "everyone"), ("sentence", Sentence("where", block="iron_ore"))))),
+    ("tell red 1 where is iron ingot.",
+     Command("chat", (("addressee", "red_1"), ("sentence", Sentence("where", item="iron_ingot"))))),
+    ("tell team where is log.", Command("chat", (("addressee", "team"), ("sentence", Sentence("where", block="log"))))),
+    ("tell team where is coal.", Command("chat", (("addressee", "team"), ("sentence", Sentence("where", item="coal"))))),
+    ("tell team where is coal ore.",
+     Command("chat", (("addressee", "team"), ("sentence", Sentence("where", block="coal_ore"))))),
     ("tell human thanks.", Command("chat", (("addressee", "human"), ("sentence", Sentence("thanks"))))),
     ("wait 20 seconds.", Command("wait", (("wait_seconds", 20),))),
     ("store 64 cobblestone in my chest 1.",
@@ -120,20 +130,23 @@ def test_round_trip_over_a_dense_sample(lang: Language, sample: list[Command]) -
 
 
 def test_every_verb_slot_value_appears_in_the_sample(lang: Language, sample: list[Command]) -> None:
-    """The sample covers every value of every slot of every verb (and of nested sentences and goals)."""
-    seen: dict[tuple[str, str], set] = {}
+    """The sample covers every value of every slot of every verb (and of nested sentences and
+    goals, per intent or goal kind: chat's item is chat_item in "i need", where_item in "where is")."""
+    seen: dict[tuple[str, str | None, str], set] = {}
     for c in sample:
         for k, v in c.args:
             if isinstance(v, (Sentence, Goal)):
                 for k2, v2 in v.args:
-                    seen.setdefault((c.verb, k2), set()).add(v2)
+                    seen.setdefault((c.verb, v._head, k2), set()).add(v2)
             else:
-                seen.setdefault((c.verb, k), set()).add(v)
-    from hivemind.lang.decoder import VERB_SLOT_DOMAINS
+                seen.setdefault((c.verb, None, k), set()).add(v)
+    from hivemind.lang.decoder import SLOT_DOMAIN_TABLE
 
-    for verb, slots in VERB_SLOT_DOMAINS.items():
-        for slot, dom in slots.items():
-            assert seen[(verb, slot)] == set(lang.domains[dom]), (verb, slot)
+    for key, dom in SLOT_DOMAIN_TABLE.items():
+        assert seen[key] == set(lang.domains[dom]), key
+    assert SLOT_DOMAIN_TABLE[("chat", "where", "item")] == "where_item"
+    assert SLOT_DOMAIN_TABLE[("chat", "where", "block")] == "block"
+    assert SLOT_DOMAIN_TABLE[("chat", "need", "item")] == "chat_item"
 
 
 def run_slow(request: pytest.FixtureRequest) -> None:
@@ -149,16 +162,22 @@ def test_round_trip_over_every_command(lang: Language, request: pytest.FixtureRe
     for c in lang.enumerate_commands(lang.full_provider(), Flags.all()):
         assert lang.parse(lang.render(c)) == c
         n += 1
-    assert n == 331_407  # recompute if the class tables change
+    # recompute if the class tables change: 332,525 with the draft 0.5 tables (331,407 before
+    # "where is {block}": 43 addressees x (43 resource blocks - 17 items named like one))
+    assert n == 332_525
 
 
 def test_command_space_size(lang: Language) -> None:
     n_items, n_ents, n_players = len(lang.domains["item"]), len(lang.domains["entity_class"]), 41
+    n_chat_items, n_where = len(lang.domains["chat_item"]), len(lang.domains["where_item"])
+    n_blocks, n_addressees = len(lang.domains["block"]), len(lang.domains["addressee"])
     expected = {
         "give": len(G.ITEM_COUNTS) * n_items * n_players,
         "attack": 16 * (n_ents + n_items) + n_players,
         "store": len(G.ITEM_COUNTS) * n_items * 8,
         "equip": 3 * n_items,
+        # need, have, give me (count and item); where is {item} and {block}; 10 sentences without slots
+        "chat": n_addressees * (3 * len(G.ITEM_COUNTS) * n_chat_items + n_where + n_blocks + 10),
     }
     counts = Counter(c.verb for c in lang.enumerate_commands(lang.full_provider(), Flags.all(),
                                                              verbs=expected))
@@ -220,6 +239,13 @@ def test_render_rejects_invalid_commands(lang: Language) -> None:
         Command("attack", (("entity", EntityRef(1, ("dropped", "other_item_1"))), ("template", "entity"))),
         Command("chat", (("addressee", "everyone"), ("sentence", Goal("home")))),
         Command("chat", (("addressee", "red_0"), ("sentence", Sentence("need", item_count=3)))),
+        # where: the item form leaves out items named like a resource block (log, stone, ...)
+        Command("chat", (("addressee", "red_0"), ("sentence", Sentence("where", item="log")))),
+        Command("chat", (("addressee", "red_0"), ("sentence", Sentence("where", item="stone")))),
+        Command("chat", (("addressee", "red_0"), ("sentence", Sentence("where", block="cobblestone")))),
+        Command("chat", (("addressee", "red_0"), ("sentence", Sentence("where", block="dax")))),
+        Command("chat", (("addressee", "red_0"), ("sentence", Sentence("where")))),
+        Command("chat", (("addressee", "red_0"), ("sentence", Sentence("where", block="log", item="stick")))),
         Command("dance"),
     ]
     for c in bad:
@@ -301,15 +327,23 @@ def test_flags_do_not_limit_the_parser(lang: Language) -> None:
 
 def test_sentences_and_goals(lang: Language) -> None:
     assert len(G.INTENTS) == 14 and len(G.GOAL_KINDS) == 9 and len(G.VERBS) == 20
+    assert sum(len(forms) for forms in G.SENTENCE_ELEMENTS.values()) == 15  # contracts 4.3: 15 sentences
     s = Sentence("need", item_count=3, item="iron_ingot")
     assert lang.to_words(s) == ["i", "need", "3", "iron", "ingot"]
     assert lang.parse_sentence("i need 3 iron ingot") == s
     assert lang.chat_text("everyone", s) == "everyone, i need 3 iron ingot."
     assert lang.chat_text("red_0", Sentence("follow")) == "red 0, follow me."
-    for intent in G.INTENTS:
-        slots = {k: v for k, v in (("item_count", 2), ("item", "wug")) if k in G.slot_names(G.SENTENCE_ELEMENTS[intent])}
-        x = Sentence(intent, **slots)
-        assert lang.parse_sentence(lang.to_words(x)) == x
+    values = {"item_count": 2, "item": "wug", "block": "iron_ore"}
+    for intent, forms in G.SENTENCE_ELEMENTS.items():
+        for els in forms:
+            x = Sentence(intent, **{k: values[k] for k in G.slot_names(els)})
+            assert lang.parse_sentence(lang.to_words(x)) == x
+    # the two forms of where (draft 0.5)
+    assert lang.parse_sentence("where is iron ore") == Sentence("where", block="iron_ore")
+    assert lang.parse_sentence("where is iron ingot") == Sentence("where", item="iron_ingot")
+    assert lang.parse_sentence("where is stone") == Sentence("where", block="stone")  # the block: the place
+    assert lang.render(Sentence("where", block="sand")) == "where is sand"
+    assert lang.chat_text("team", Sentence("where", block="log")) == "team, where is log."
     g = Goal("explore", dir8="south")
     assert lang.render(g) == "explore south" and lang.parse_goal("explore south") == g
     assert lang.parse_goal("go to the nearest iron ore") == Goal("to_block", block="iron_ore")
@@ -334,6 +368,7 @@ RESULT_CASES = [
     ("NO_STATION", {"station": "bed"}, "no bed nearby"),
     ("INV_FULL", {}, "inventory full"),
     ("INV_FULL", {"container": "chest"}, "chest full"),
+    ("INV_FULL", {"container": "furnace"}, "furnace full"),  # draft 0.5: the furnace's slots block smelt_start
     ("TARGET_LOST", {}, "target lost"),
     ("HAZARD", {}, "danger ahead"),
     ("INTERRUPTED", {"cause": "damage"}, "interrupted by damage"),
@@ -434,5 +469,24 @@ def test_static_grammar() -> None:
     assert G.first_words()["hold"] == "equip" and G.first_words()["wear"] == "equip"
     assert G.compile_template("go to the {ordinal} {entity}")[-1] == G.Slot("entity", "entity_ref")
     assert G.domain_of("item", "sentence") == "chat_item" and G.domain_of("entity", "goal") == "entity_class"
+    assert G.domain_of("item", "sentence", "where") == "where_item" and G.domain_of("item", "sentence", "need") == "chat_item"
+    assert G.domain_of("block", "sentence", "where") == "block"
     with pytest.raises(ValueError):
         G.compile_template("go to the {ordinal}")
+
+
+def test_sentence_forms() -> None:
+    """An intent's forms are told apart by their slot names (contracts 4.3, 4.5)."""
+    assert G.SENTENCES["where"] == ("where is {item}", "where is {block}")
+    item_form, block_form = G.SENTENCE_ELEMENTS["where"]
+    assert G.frame_form("sentence", "where", {"item"}) == item_form
+    assert G.frame_form("sentence", "where", ["block"]) == block_form
+    assert item_form[-1] == G.Slot("item", "where_item") and block_form[-1] == G.Slot("block", "block")
+    assert G.frame_form("sentence", "need", {"bogus"}) == G.SENTENCE_ELEMENTS["need"][0]  # one form: the renderer reports
+    for slots in ((), ("item", "block"), ("item_count", "item")):
+        with pytest.raises(ValueError, match="where"):
+            G.frame_form("sentence", "where", slots)
+    with pytest.raises(ValueError, match="unknown"):
+        G.frame_form("sentence", "teleport", ())
+    assert G.CONTAINERS == ("inventory", "chest", "furnace")
+    assert G.literal_words()["chat sentences"].count("where") == 1
