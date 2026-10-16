@@ -1,0 +1,5 @@
+# Keep LF line endings on every OS. Git for Windows otherwise checks text out with CRLF, and the
+# generated data files (data/*.json, data/*.csv) are checked byte for byte against a fresh build
+# and hashed, so a CRLF checkout would make those checks fail on Windows.
+* text=auto eol=lf
+*.jar binary
