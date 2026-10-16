@@ -1671,7 +1671,7 @@ class _Builder:
                                                 f"{entity_phrases[p]}")
         # A biome phrase is read in the debug-screen inputs, next to block phrases (the targeted
         # block) and entity phrases (the targeted entity): it must not name a curated class too.
-        others = {}
+        others: dict[tuple[str, ...], str] = {}
         for kind, phrases, fallback in (("block", self.block_phrase, lambda c: c in self.fallback_phrase),
                                         ("item", self.item_phrase, lambda c: not self.item_v1[c]),
                                         ("entity", self.entity_phrase, lambda c: False)):

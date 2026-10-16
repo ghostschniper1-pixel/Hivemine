@@ -40,7 +40,7 @@ def _run(tmp_path: Path, *args: str, env_slow: str | None = None) -> str:
     if env_slow is not None:
         env[SLOW_ENV] = env_slow
     out = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-rs", *args],
-                         cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
+                         cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120, check=False)
     return out.stdout
 
 
