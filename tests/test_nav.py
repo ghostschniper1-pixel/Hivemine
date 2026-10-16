@@ -62,8 +62,11 @@ def passable_path(w: World, path: N.Path) -> bool:
     """Every cell of the path holds a body without digging (after the path's own digs)."""
     grid = N.NavGrid(w)
     dug = {d.pos for d in path.digs}
-    return all((grid.passable(*c) or c in dug) and (grid.passable(c[0], c[1] + 1, c[2]) or (c[0], c[1] + 1, c[2]) in dug)
-               for c in path.cells[1:])
+
+    def free(c: tuple[int, int, int]) -> bool:
+        return grid.passable(*c) or c in dug
+
+    return all(free(c) and free((c[0], c[1] + 1, c[2])) for c in path.cells[1:])
 
 
 # -- the pathfinder's view of blocks ------------------------------------------------------------

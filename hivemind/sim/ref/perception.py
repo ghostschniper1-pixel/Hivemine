@@ -32,19 +32,20 @@ Definitions (DESIGN.md 6.1):
   cells are walked with a 3-D DDA (Amanatides and Woo); when the ray crosses two cell planes at
   once (an edge or a corner), it steps x before y before z, a fixed rule both sides share. A cube
   has at most 3 faces facing a point outside it, so a block costs at most 3 rays.
-- **Resource sightings** (bounded; this replaces DESIGN.md 6.1's "fixed set of rays", which no
-  code defined): the candidates are the exposed blocks of resource classes
+- **Resource sightings** (bounded; the definition DESIGN.md 6.1 should state in place of "a
+  fixed set of rays [est]"): the candidates are the exposed blocks of resource classes
   (``concepts.resource``) whose centres lie within 24 blocks [est] of the eye, taken nearest
   first (ties: x, then y, then z). A candidate whose class already has ``PER_CLASS`` = 8 [est]
-  sightings is skipped without rays. Otherwise its facing open faces are traced, and it is
-  sighted if any ray is clear. Tracing stops before the first candidate that would take the call
-  past ``RAY_BUDGET`` = 768 rays [est]; the result then says ``complete=False``. So a call costs
-  at most 768 rays of at most ~43 cell steps each, whatever the terrain. The notebook keeps 48
-  places (DESIGN.md 6.3), so 8 positions per class are plenty. Without the caps (both None) every
-  sighted block is reported: at the spawn of a 128 x 128 test world that is 1,700-2,600 blocks
-  and 4,400-6,500 rays per call, too much for the M4 budget of <= 800 us per decision
-  (DESIGN.md 4.6). With the caps, calls at 75 random standing spots in generated test worlds
-  (surface and caves) used a median of 210 rays (90th percentile 500; 2 calls hit the budget).
+  sightings is skipped without rays. Otherwise its facing open faces are traced (at most 3 rays
+  of at most ~43 cell steps), and it is sighted if any ray is clear. The notebook keeps 48 places
+  (DESIGN.md 6.3), so 8 positions per class are plenty. Without the cap (``per_class=None``)
+  every sighted block is reported: at the spawn of a 128 x 128 test world that is 1,700-2,600
+  blocks and 4,400-6,500 rays per call, too much for the M4 budget of <= 800 us per decision
+  (DESIGN.md 4.6). With the cap, spawns cost 8-310 rays, and 75 random standing spots in generated
+  test worlds (surface and caves) a median of 210 rays (90th percentile 500, maximum 989). The
+  cost is not capped further: blocks exposed only to a sealed cave cost rays without being seen,
+  so any ray budget would let hidden cells decide which visible blocks are reported. ``rays``
+  in the result is a cost figure for profiling, never an input to the notebook or observation.
 - **Ray schedule:** sightings are computed every 5 ticks [est] (``RaySchedule``); the window is
   cheap and is computed on every call. ``SightingCache`` reuses the last result while the eye has
   not moved and no block within the sight box has changed, which gives exactly the same output
@@ -55,7 +56,8 @@ Definitions (DESIGN.md 6.1):
 
 Honesty: in normal mode nothing here reads a cell that is not exposed, except to learn that it
 is not see-through. Changing hidden cells to other opaque classes therefore never changes the
-output (``tests/test_perception.py`` checks it).
+output, the ``rays`` cost figure aside (``tests/test_perception.py`` checks it, from the surface
+and from inside a cave).
 """
 
 from __future__ import annotations
@@ -81,7 +83,6 @@ WINDOW_HALF_Y = 3  # DESIGN.md 6.2: 7 levels, y -3..+3
 WINDOW_SHAPE = (2 * WINDOW_HALF_XZ + 1, 2 * WINDOW_HALF_Y + 1, 2 * WINDOW_HALF_XZ + 1)
 RAY_PERIOD = 5  # DESIGN.md 6.1 [est] sightings checked every 5 ticks
 PER_CLASS = 8  # [est] sightings kept per resource class per call (the notebook holds 48 places)
-RAY_BUDGET = 768  # [est] rays per sightings call (module docstring)
 _BATCH = 128  # candidates traced per vectorized batch (does not change the result)
 
 # Faces in a fixed order: -x, +x, -y, +y, -z, +z.
@@ -273,9 +274,9 @@ class Sighting:
 class Sightings:
     """The resource blocks sighted at one tick (sorted by distance, then x, y, z).
 
-    ``counts`` is the number sighted per class (at most ``per_class``); ``rays`` the rays traced;
-    ``complete`` is False when the ray budget stopped the call before every candidate was
-    examined (the nearest candidates are always examined first).
+    ``counts`` is the number sighted per class (at most ``per_class``). ``rays`` is the number
+    of rays traced, a cost figure that depends on hidden cells (sealed caves): it is left out of
+    equality and must never reach the notebook or the observation.
     """
 
     tick: int
@@ -283,8 +284,7 @@ class Sightings:
     xray: bool
     items: tuple[Sighting, ...]
     counts: dict[int, int] = field(default_factory=dict)
-    rays: int = 0
-    complete: bool = True
+    rays: int = field(default=0, compare=False)
 
     def of(self, cls: int) -> tuple[Sighting, ...]:
         return tuple(s for s in self.items if s.cls == cls)
@@ -301,11 +301,10 @@ def _sight_box(eye: np.ndarray, sight_range: float) -> tuple[np.ndarray, np.ndar
 
 
 def sightings(world: World, eye: Sequence[float], tick: int = 0, *, xray: bool = False,
-              sight_range: float = SIGHT_RANGE, per_class: int | None = PER_CLASS,
-              ray_budget: int | None = RAY_BUDGET) -> Sightings:
-    """Resource blocks within ``sight_range`` of the eye that have a face in line of sight, nearest
-    first, at most ``per_class`` per class and ``ray_budget`` rays per call (module docstring;
-    None lifts a cap). ``xray``: resource blocks in range whether exposed or not, no rays."""
+              sight_range: float = SIGHT_RANGE, per_class: int | None = PER_CLASS) -> Sightings:
+    """Resource blocks within ``sight_range`` of the eye that have a face in line of sight, the
+    nearest ``per_class`` of each class (module docstring; None: all). ``xray``: resource blocks
+    in range whether exposed or not, no rays."""
     see_table, resource = _tables(world)
     eye_arr = np.asarray(eye, float)
     base, top = _sight_box(eye_arr, sight_range)
@@ -324,10 +323,9 @@ def sightings(world: World, eye: Sequence[float], tick: int = 0, *, xray: bool =
     cells, world_cells, dists = cells[order], world_cells[order], dists[order]
     classes = inner[tuple(cells.T)].astype(np.int64)
     cap = len(cells) + 1 if per_class is None else per_class
-    budget = math.inf if (ray_budget is None or xray) else ray_budget
     counts: dict[int, int] = {}
     chosen: list[int] = []
-    rays, complete = 0, True
+    rays = 0
     for b0 in range(0, len(cells), _BATCH):
         idx = np.arange(b0, min(b0 + _BATCH, len(cells)))
         idx = idx[[counts.get(int(c), 0) < cap for c in classes[idx]]]  # classes already full: skip
@@ -342,19 +340,14 @@ def sightings(world: World, eye: Sequence[float], tick: int = 0, *, xray: bool =
             c = int(classes[i])
             if counts.get(c, 0) >= cap:
                 continue
-            if rays + n > budget:
-                complete = False
-                break
             rays += n
             if vis:
                 counts[c] = counts.get(c, 0) + 1
                 chosen.append(i)
-        if not complete:
-            break
     items = tuple(Sighting(int(classes[i]), (int(world_cells[i, 0]), int(world_cells[i, 1]), int(world_cells[i, 2])),
                            float(dists[i])) for i in chosen)
     return Sightings(tick, (float(eye_arr[0]), float(eye_arr[1]), float(eye_arr[2])), xray, items,
-                     dict(sorted(counts.items())), rays, complete)
+                     dict(sorted(counts.items())), rays)
 
 
 def _faces_in_sight(see: np.ndarray, base: np.ndarray, eye: np.ndarray,
@@ -391,23 +384,24 @@ class SightingCache:
         self._result: Sightings | None = None
         self.hits = 0
 
-    def get(self, world: World, eye: Sequence[float], tick: int, **options) -> Sightings:
+    def get(self, world: World, eye: Sequence[float], tick: int, *, xray: bool = False,
+            sight_range: float = SIGHT_RANGE, per_class: int | None = PER_CLASS) -> Sightings:
         eye_t = (float(eye[0]), float(eye[1]), float(eye[2]))
-        key = (id(world), world.generation, eye_t, tuple(sorted(options.items())))
-        if key == self._key and self._result is not None and self._unchanged(world, eye_t, options):
+        key = (id(world), world.generation, eye_t, xray, sight_range, per_class)
+        if key == self._key and self._result is not None and self._unchanged(world, eye_t, sight_range):
             self._cursor = world.change_count
             self.hits += 1
             return replace(self._result, tick=tick)
-        self._result = sightings(world, eye_t, tick, **options)
+        self._result = sightings(world, eye_t, tick, xray=xray, sight_range=sight_range, per_class=per_class)
         self._key, self._cursor = key, world.change_count
         return self._result
 
-    def _unchanged(self, world: World, eye: tuple[float, float, float], options: dict) -> bool:
+    def _unchanged(self, world: World, eye: tuple[float, float, float], sight_range: float) -> bool:
         try:
             changes = world.changes_since(self._cursor)
         except ValueError:  # the log was trimmed past our cursor
             return False
-        base, top = _sight_box(np.asarray(eye), options.get("sight_range", SIGHT_RANGE))
+        base, top = _sight_box(np.asarray(eye), sight_range)
         return not any(base[0] <= c.x < top[0] and base[1] <= c.y < top[1] and base[2] <= c.z < top[2]
                        for c in changes)
 

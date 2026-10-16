@@ -18,15 +18,21 @@ With the patch, Mineflayer's wait equals DESIGN.md 4.3's formula for every block
 
 ### The Node host (M2) must call it first
 
-A `Block` copies `material` from the registry when it is constructed, so the patch must run **before any Block object exists**, that is, before the first `mineflayer.createBot`:
+A `Block` copies `material` from the registry when it is constructed, so the patch must run **before any Block object exists**, that is, before the first `mineflayer.createBot`. Both lines below are required:
 
 ```js
-const { applyDigTimePatch } = require('./node/patches') // path relative to bridge/
-applyDigTimePatch(require('prismarine-registry')('1.21.1')) // first thing at host startup
-// ... then create the bots
+const mineflayer = require('mineflayer')
+const { applyDigTimePatch, assertDigTimePatched, mineflayerRegistry } = require('./node/patches') // from bridge/
+
+applyDigTimePatch(mineflayerRegistry()) // 1. first thing at host startup, once per process
+
+const bot = mineflayer.createBot(options)
+bot.once('inject_allowed', () => assertDigTimePatched(bot.registry)) // 2. for every bot
 ```
 
-One call is enough for the whole process. The patch edits the block definitions in place, and they belong to minecraft-data's per-version cache. Every registry for 1.21.1 shares that cache, including each bot's `bot.registry`, which Mineflayer makes with `require('prismarine-registry')(version)`. A host can confirm this per bot by calling `applyDigTimePatch(bot.registry)` on `inject_allowed`, which should report 0 patched and 101 already patched.
+One call of `applyDigTimePatch` is enough for the whole process. The patch edits the block definitions in place, and they belong to minecraft-data's per-version cache. Every registry for 1.21.1 made by the same copy of prismarine-registry shares that cache, including each bot's `bot.registry`, which Mineflayer makes with `require('prismarine-registry')(version)` from its own folder. `mineflayerRegistry()` therefore loads prismarine-registry from Mineflayer's folder, not by bare name: if a future lock nested a second copy under `mineflayer`, a registry required by bare name would patch a cache that no bot reads.
+
+The per-bot check is mandatory. `assertDigTimePatched(bot.registry)` throws a `DigTimePatchError` unless all 101 tier-gated blocks of that bot's registry have the patched material; thrown from the `inject_allowed` listener, it ends the host process before the bot has loaded a chunk. A bot must never play unpatched, because nothing else would show it: it would simply mine the ore tech tree several times too slowly with every pickaxe but the wooden one (iron ore with a stone pickaxe: 91 ticks, not 23), and fail digs with a wooden axe, shovel or hoe. Mineflayer emits `inject_allowed` after setting `bot.registry` and before any chunk arrives (mineflayer 4.39.0, `lib/loader.js`).
 
 Patching only `bot.digTime` would not be enough: mineflayer-tool and mineflayer-pathfinder call `block.digTime` directly.
 
@@ -41,12 +47,14 @@ npm test                  # node --test "node/test/*.test.js"
 
 The script names the test files with a glob because Node 22's `--test` takes file patterns, not a directory (`node --test node/test` fails with "Cannot find module").
 
-`test/patches.test.js` loads prismarine-block through prismarine-registry for 1.21.1 and compares `digTime` with `test/dig_times.json` for every fixture pair: the 101 tier-gated blocks, the coal ores, stone, deepslate and their cobbles, all 40 members of the tag `logs`, dirt, grass block, sand, red sand, gravel and moss carpet, each with the empty hand and every v1 tool (26), on the ground, in water and in the air. It checks that:
+`test/patches.test.js` loads prismarine-registry and prismarine-block from Mineflayer's own folder (as the bots do) for 1.21.1 and compares `digTime` with `test/dig_times.json` for every fixture pair: the 101 tier-gated blocks, the coal ores, stone, deepslate and their cobbles, all 40 members of the tag `logs`, dirt, grass block, sand, red sand, gravel and moss carpet, each with the empty hand and every v1 tool (26), on the ground, in water and in the air. It checks that:
 
+- the copies Mineflayer resolves are prismarine-block 1.23.0, prismarine-registry 1.12.0 and minecraft-data 3.117.0, and Mineflayer, prismarine-chunk (`bot.blockAt`) and mineflayer-pathfinder all load the same prismarine-block;
 - unpatched `digTime` matches the reference model of unpatched Mineflayer for every pair, and is wrong on every tier-gated block;
 - the patch changes exactly those 101 blocks and logs the count;
 - patched `digTime` equals the design formula for every pair except moss carpet with a hoe;
-- a Block made before the patch keeps the old material (why the host must patch first), and a registry made afterwards shares the patched definitions;
+- a Block made before the patch keeps the old material (why the host must patch first), and a registry made afterwards shares the patched definitions and passes the per-bot check;
+- the per-bot check refuses a registry that is unpatched, partly patched or for another version;
 - the patch refuses data it was not written for.
 
 The fixture comes from the reference mechanics (`hivemind.sim.ref.mechanics`), never from Node. Regenerate it from the repository root after any change to the mechanics, the rules or the v1 tool classes:

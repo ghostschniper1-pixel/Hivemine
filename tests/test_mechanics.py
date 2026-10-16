@@ -263,12 +263,18 @@ def test_mineflayer_tool_speed_matches_minecraft_data_everywhere(rules: Rules) -
 DIG_FIXTURE_SCRIPT = REPO / "bridge" / "node" / "make_dig_fixture.py"
 
 
-def test_bridge_dig_fixture_is_current(rules: Rules) -> None:
-    # bridge/node/test/patches.test.js checks patched Mineflayer against this fixture, so it must
-    # follow the mechanics; regenerate with .venv/bin/python bridge/node/make_dig_fixture.py
+@pytest.fixture(scope="module")
+def dig_fixture_script():
     spec = importlib.util.spec_from_file_location("make_dig_fixture", DIG_FIXTURE_SCRIPT)
     gen = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gen)
+    return gen
+
+
+def test_bridge_dig_fixture_is_current(rules: Rules, dig_fixture_script) -> None:
+    # bridge/node/test/patches.test.js checks patched Mineflayer against this fixture, so it must
+    # follow the mechanics; regenerate with .venv/bin/python bridge/node/make_dig_fixture.py
+    gen = dig_fixture_script
     fixture = gen.build_fixture(rules)
     assert gen.render(fixture) == gen.FIXTURE_PATH.read_text(encoding="utf-8"), "rerun make_dig_fixture.py"
     held, obsidian = fixture["held"], fixture["blocks"]["obsidian"]
@@ -276,6 +282,37 @@ def test_bridge_dig_fixture_is_current(rules: Rules) -> None:
     assert obsidian["design"]["ground"][held.index("diamond_pickaxe")] == 188
     assert obsidian["unpatched"]["ground"][held.index("diamond_pickaxe")] == 1500
     assert {(e["block"], e["held"].endswith("_hoe")) for e in fixture["exceptions"]} == {("moss_carpet", True)}
+
+
+def test_patched_mineflayer_waits_design_ticks_on_every_block(rules: Rules, dig_fixture_script) -> None:
+    # DESIGN.md 5: with the bridge's dig-time patch, Mineflayer waits BreakTime.design_ticks for every
+    # 1.21.1 block, held tool and condition except moss carpet with a hoe. The fixture covers the v1
+    # blocks; this covers all of them (deduplicated by the inputs of the formula). It is why the
+    # simulator's count for the bridge is design_ticks, not the unpatched mineflayer_ticks.
+    c = m.constants_for(rules)
+    tier_gated = set(rules.tag("block", m.MINEFLAYER_TIER_GATED_TAG))
+    held_items = [None, *sorted(n for n, it in rules.items.items() if it.tool is not None)]
+    conditions = ((False, True), (True, True), (False, False))  # (in_water, on_ground)
+    differs: dict[tuple, bool] = {}  # (hardness, game speed, can harvest, patched speed) -> any tick differs
+    culprits, other_speed = set(), 0
+    for block, b in rules.blocks.items():
+        for held in held_items:
+            speed = rules.mining_speed(held, block)
+            patched = dig_fixture_script.patched_speed(rules, held, block, tier_gated)
+            if patched == speed:
+                continue  # same inputs, same ticks
+            other_speed += 1
+            key = (b.hardness, speed, rules.can_harvest(held, block), patched)
+            if key not in differs:
+                differs[key] = any(
+                    m.design_break_ticks(key[0], patched, key[2], in_water=w, on_ground=g, c=c)
+                    != m.design_break_ticks(key[0], speed, key[2], in_water=w, on_ground=g, c=c)
+                    for w, g in conditions)
+            if differs[key]:
+                culprits.add((block, rules.item(held).tool.kind if held else None))
+    assert culprits == {("moss_carpet", "hoe")}
+    # moss carpet and pink petals with each of the 6 hoes (pink petals break instantly anyway)
+    assert other_speed == 12 and len(rules.blocks) > 1000 and len(held_items) > 30
 
 
 def test_server_accept_example(rules: Rules) -> None:

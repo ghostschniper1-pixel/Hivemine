@@ -24,7 +24,16 @@
  * belong to minecraft-data's per-version cache, which every prismarine-registry for 1.21.1 in the
  * process shares (each Mineflayer bot's `bot.registry` is a shallow copy of it). So one call at
  * host startup, before the first `mineflayer.createBot`, patches every bot that process creates.
+ *
+ * That holds only for the copy of prismarine-registry (and of minecraft-data under it) that
+ * Mineflayer itself loads, so the host takes its registry from `mineflayerRegistry()`, which
+ * resolves the package from Mineflayer's own folder, never by bare name: a lock that nested a
+ * second copy under mineflayer would otherwise patch a cache no bot reads. Each bot must still
+ * pass `assertDigTimePatched(bot.registry)` on 'inject_allowed' (README.md): a bot that mined at
+ * unpatched speed would show no other sign of it.
  */
+
+const path = require('node:path')
 
 const GAME_VERSION = '1.21.1'
 const TIER_GATED_MATERIAL = 'incorrect_for_wooden_tool'
@@ -135,8 +144,57 @@ function applyDigTimePatch (registry, { log = console.log } = {}) {
   return { version, patched, alreadyPatched }
 }
 
+/**
+ * Throw a DigTimePatchError unless every one of the 101 tier-gated blocks of this registry has the
+ * patched material. Changes nothing. The host calls it for every bot on 'inject_allowed', with
+ * `bot.registry` (the registry the bot's Blocks will read), and must not let a bot that fails it
+ * play: it would mine the whole ore tech tree at unpatched speed with no other sign.
+ *
+ * @param {object} registry a bot's `bot.registry` (or any prismarine-registry for 1.21.1)
+ */
+function assertDigTimePatched (registry) {
+  const version = registry?.version?.minecraftVersion
+  if (version !== GAME_VERSION) {
+    throw new DigTimePatchError(`the registry is for ${version}, but the patch is for ${GAME_VERSION}`)
+  }
+  const unpatched = TIER_GATED_PICKAXE_ONLY.filter(name => registry.blocksByName?.[name]?.material !== PATCHED_MATERIAL)
+  if (unpatched.length > 0) {
+    throw new DigTimePatchError(`${unpatched.length} of the ${EXPECTED_COUNT} tier-gated blocks of this registry ` +
+      `are not patched (${unpatched.slice(0, 3).join(', ')}${unpatched.length > 3 ? ', ...' : ''}); ` +
+      'call applyDigTimePatch(mineflayerRegistry()) before creating any bot')
+  }
+}
+
+/**
+ * The folder of a package as `fromDir` would resolve it (Node's lookup through node_modules).
+ *
+ * @param {string} name package name
+ * @param {string} fromDir folder to resolve from
+ * @returns {string}
+ */
+function packageDir (name, fromDir) {
+  return path.dirname(require.resolve(`${name}/package.json`, { paths: [fromDir] }))
+}
+
+/**
+ * A prismarine-registry for `version`, made by the copy of prismarine-registry that Mineflayer
+ * itself loads (resolved from Mineflayer's folder), so it shares minecraft-data's block
+ * definitions with every `bot.registry` of this process. Patch this one at host startup.
+ *
+ * @param {string} [version] game version (1.21.1)
+ * @param {string} [fromDir] folder from which to resolve mineflayer (this module's folder)
+ * @returns {object}
+ */
+function mineflayerRegistry (version = GAME_VERSION, fromDir = __dirname) {
+  const mineflayerDir = packageDir('mineflayer', fromDir)
+  return require(require.resolve('prismarine-registry', { paths: [mineflayerDir] }))(version)
+}
+
 module.exports = {
   applyDigTimePatch,
+  assertDigTimePatched,
+  mineflayerRegistry,
+  packageDir,
   DigTimePatchError,
   GAME_VERSION,
   TIER_GATED_MATERIAL,

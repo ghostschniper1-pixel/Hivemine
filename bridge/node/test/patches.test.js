@@ -14,8 +14,16 @@ const path = require('node:path')
 const patches = require('../patches')
 
 const fixture = JSON.parse(fs.readFileSync(path.join(__dirname, 'dig_times.json'), 'utf8'))
-const registry = require('prismarine-registry')(fixture.version)
-const Block = require('prismarine-block')(registry)
+
+// Load the packages the way the bots do, from Mineflayer's own folder, never by bare name: what
+// matters is the copy Mineflayer resolves, whatever npm happens to hoist.
+const BRIDGE_DIR = path.join(__dirname, '..', '..')
+const MINEFLAYER_DIR = patches.packageDir('mineflayer', BRIDGE_DIR)
+const REGISTRY_DIR = patches.packageDir('prismarine-registry', MINEFLAYER_DIR)
+const BLOCK_DIR = patches.packageDir('prismarine-block', MINEFLAYER_DIR)
+const makeRegistry = require(REGISTRY_DIR)
+const registry = patches.mineflayerRegistry(fixture.version)
+const Block = require(BLOCK_DIR)(registry)
 
 const blockNames = Object.keys(fixture.blocks)
 const heldIds = fixture.held.map(name => (name === null ? null : registry.itemsByName[name].id))
@@ -47,6 +55,8 @@ const id = name => registry.itemsByName[name].id
 
 const obsidianMadeBeforePatch = makeBlock(registry, Block, 'obsidian')
 const unpatched = measureAll()
+let errorBeforePatch = null
+try { patches.assertDigTimePatched(registry) } catch (err) { errorBeforePatch = err }
 const patchLog = []
 const patchResult = patches.applyDigTimePatch(registry, { log: msg => patchLog.push(msg) })
 const patched = measureAll()
@@ -77,12 +87,21 @@ test('the embedded block list is the 1.21.1 tag incorrect_for_wooden_tool', () =
   for (const name of fixture.tier_gated) assert.equal(fixture.blocks[name].group, 'tier_gated', name)
 })
 
-test('the locked packages are the ones the fixture describes', () => {
-  const version = pkg => require(`${pkg}/package.json`).version
-  assert.equal(version('prismarine-block'), '1.23.0')
-  assert.equal(version('prismarine-registry'), '1.12.0')
-  assert.equal(version('minecraft-data'), '3.117.0')
+test('the packages Mineflayer itself loads are the ones the fixture describes', () => {
+  const version = dir => JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version
+  assert.equal(version(BLOCK_DIR), '1.23.0')
+  assert.equal(version(REGISTRY_DIR), '1.12.0')
+  assert.equal(version(patches.packageDir('minecraft-data', REGISTRY_DIR)), '3.117.0')
   assert.equal(registry.version.minecraftVersion, '1.21.1')
+})
+
+test('every package that makes Blocks for a bot loads the same prismarine-block as Mineflayer', () => {
+  // mineflayer (blocks plugin), prismarine-chunk (bot.blockAt), mineflayer-pathfinder (movements);
+  // mineflayer-tool and mineflayer-collectblock get their Blocks from the bot. One copy, so one
+  // digTime formula, whichever path a Block comes from.
+  const users = [MINEFLAYER_DIR, patches.packageDir('prismarine-chunk', MINEFLAYER_DIR),
+    patches.packageDir('mineflayer-pathfinder', BRIDGE_DIR)]
+  for (const dir of users) assert.equal(patches.packageDir('prismarine-block', dir), BLOCK_DIR, dir)
 })
 
 test('unpatched digTime is wrong on tier-gated blocks', () => {
@@ -153,13 +172,29 @@ test('a Block made before the patch keeps the old material: the host must patch 
 })
 
 test('a registry made after the patch, as each bot makes its own, shares the patched definitions', () => {
-  const botRegistry = require('prismarine-registry')('1.21.1')
+  const botRegistry = makeRegistry('1.21.1') // what mineflayer/lib/loader.js does for bot.registry
   assert.notEqual(botRegistry, registry)
-  const BotBlock = require('prismarine-block')(botRegistry)
+  const BotBlock = require(BLOCK_DIR)(botRegistry)
   assert.equal(botRegistry.blocksByName.obsidian.material, 'mineable/pickaxe')
   assert.equal(digTicks(makeBlock(botRegistry, BotBlock, 'obsidian'), id('diamond_pickaxe'), GROUND), 188)
+  patches.assertDigTimePatched(botRegistry) // the host's mandatory per-bot check passes
   const again = patches.applyDigTimePatch(botRegistry, { log: () => {} })
   assert.deepEqual([again.patched.length, again.alreadyPatched.length], [0, 101]) // idempotent
+})
+
+test('the per-bot check refuses a registry that is not fully patched', () => {
+  assert.ok(errorBeforePatch instanceof patches.DigTimePatchError) // the real registry, before the patch
+  assert.match(errorBeforePatch.message, /101 of the 101 tier-gated blocks of this registry are not patched/)
+  const unpatchedFake = fakeRegistry()
+  assert.throws(() => patches.assertDigTimePatched(unpatchedFake), /101 of the 101/)
+  const partly = fakeRegistry()
+  patches.applyDigTimePatch(partly, { log: () => {} })
+  partly.blocksByName.iron_ore.material = 'incorrect_for_wooden_tool'
+  assert.throws(() => patches.assertDigTimePatched(partly), /1 of the 101 .* \(iron_ore\)/)
+  partly.blocksByName.iron_ore.material = 'mineable/pickaxe'
+  patches.assertDigTimePatched(partly)
+  assert.throws(() => patches.assertDigTimePatched(fakeRegistry({ version: '1.20.4' })), patches.DigTimePatchError)
+  assert.throws(() => patches.assertDigTimePatched(undefined), patches.DigTimePatchError)
 })
 
 // A minimal stand-in registry for the refusal tests; never touches the real one.
