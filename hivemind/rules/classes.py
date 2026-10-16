@@ -313,7 +313,6 @@ BLOCK_SPECS: tuple[BlockSpec, ...] = (
     B("kelp", "kelp", "kelp_plant", phrase="kelp"),
     B("seagrass"),
     B("tall_seagrass"),
-    B("sea_pickle"),  # warm-ocean floor; its own class: the fallback it would join holds flower pots
     # crops (village farms)
     B("wheat", resource=True),
     B("carrots"),
@@ -355,6 +354,9 @@ BLOCK_SPECS: tuple[BlockSpec, ...] = (
     B("rail", "rail", "powered_rail", "detector_rail", "activator_rail", phrase="rail"),
     B("fire"),
     B("tnt", states={"unstable": ("false",)}),  # unstable TNT (no drops) falls back
+    # added in review 3 (last, so the ids above stay put): warm-ocean floor. It needs a class of
+    # its own because the fallback it would join holds flower pots, and it is no flower pot.
+    B("sea_pickle"),
 )
 
 # v1 item classes in id order (0 is "none"; non-v1 fallbacks follow).
