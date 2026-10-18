@@ -326,17 +326,23 @@ def _strata(rng: CounterRNG, cfg: WorldGenConfig, ids: dict[str, int], h: np.nda
     rock[:, :BEDROCK_ALWAYS_Y - MIN_Y + 1, :] = ids["bedrock"]
     blocks[:] = np.where(y <= hh, rock, 0)
 
-    # Soil: dirt depth per column; sand on beaches and under water.
+    # Soil: depth per column; the biome's soil and top; sand on beaches and under water.
+    surfaces = [BIOME_SURFACES[b] for b in cfg.biomes]
     depth = cfg.dirt_depth[0] + (rng.uniform_array(STEP_SOIL, 2, Purpose.WORLDGEN, cols, 0)
                                  * (cfg.dirt_depth[1] - cfg.dirt_depth[0] + 1)).astype(np.int32)
+    under_cls = np.array([ids[s.under] if s.under else 0 for s in surfaces], np.uint8)[biome]
+    under_depth = np.array([s.under_depth if s.under else 0 for s in surfaces], np.int32)[biome]
+    is_under = ((y >= hh - (depth + under_depth)[:, None, :]) & (y < hh - depth[:, None, :])
+                & (y > BEDROCK_NEVER_Y) & (under_depth[:, None, :] > 0))
+    blocks[:] = np.where(is_under, under_cls[:, None, :], blocks)
     wet = water_top >= h
     near = _dilate(wet, cfg.beach_distance)
     near_level = _grow_max(np.where(wet, water_top, MIN_Y - 1), cfg.beach_distance)
     beach = ~wet & near & (h <= near_level + cfg.beach_height)
     deep_water = wet & (water_top - h >= 3)  # [est] gravel floors in deeper water
-    soil_top = np.where(wet | beach, ids["sand"], ids["dirt"])
+    soil_top = np.where(wet | beach, ids["sand"], np.array([ids[s.soil] for s in surfaces], np.int64)[biome])
     soil_top = np.where(deep_water, ids["gravel"], soil_top)
-    top = np.where(wet | beach, soil_top, ids["grass_block"])
+    top = np.where(wet | beach, soil_top, np.array([ids[s.top] for s in surfaces], np.int64)[biome])
     is_soil = (y >= hh - depth[:, None, :]) & (y < hh) & (y > BEDROCK_NEVER_Y)
     blocks[:] = np.where(is_soil, soil_top[:, None, :], blocks)
     blocks[:] = np.where((y == hh) & (y > BEDROCK_NEVER_Y), top[:, None, :], blocks)
@@ -654,21 +660,35 @@ def vein_size_stats(size: int, n: int = 400, seed: int = 0) -> tuple[float, floa
 
 
 def _trees(rng: CounterRNG, cfg: WorldGenConfig, ids: dict[str, int], concepts: Concepts, blocks: np.ndarray,
-           h: np.ndarray) -> int:
-    """Oak and birch trees on grass blocks [est]; returns the number placed."""
+           h: np.ndarray, biome: np.ndarray) -> int:
+    """Oak and birch trees on grass blocks [est], as dense as each column's biome says; returns
+    the number placed. Per chunk, Poisson(the palette's densest biome x vegetation) attempts,
+    each kept with probability (its column biome's density) / (the densest) and birch with the
+    column biome's birch fraction (draws: x, z, height, keep, birch)."""
     sx, _, sz = blocks.shape
+    surfaces = [BIOME_SURFACES[b] for b in cfg.biomes]
+    density = np.array([s.trees_per_chunk for s in surfaces])
+    densest = float(density.max())
+    if densest <= 0.0 or cfg.vegetation <= 0.0:
+        return 0
+    keep_p = density / densest
+    birch_p = np.array([s.birch_fraction for s in surfaces])
     soft = concepts.replaceable | (np.arange(256) == 0)
     trunks: list[tuple[int, int]] = []
     for cx in range(-(-sx // CHUNK_SIZE)):
         for cz in range(-(-sz // CHUNK_SIZE)):
             s = rng.stream(STEP_TREES, 0, Purpose.WORLDGEN, _key(cx, cz))
-            for _ in range(s.poisson(cfg.trees_per_chunk)):
+            for _ in range(s.poisson(densest * cfg.vegetation)):
                 x, z = cx * CHUNK_SIZE + s.below(CHUNK_SIZE), cz * CHUNK_SIZE + s.below(CHUNK_SIZE)
                 height = s.randint(*cfg.trunk_height)
-                birch = s.bernoulli(cfg.birch_fraction)
+                u_keep, u_birch = s.uniform(), s.uniform()
                 t = rng.stream(STEP_TREES, 1, Purpose.WORLDGEN, _key(x, z))  # canopy corner draws
                 if x >= sx or z >= sz:
                     continue
+                b = int(biome[x, z])
+                if not u_keep < keep_p[b]:
+                    continue
+                birch = u_birch < birch_p[b]
                 g = int(h[x, z])
                 if blocks[x, g - MIN_Y, z] != ids["grass_block"] or g + height + 2 > MAX_Y:
                     continue
@@ -696,19 +716,29 @@ def _trees(rng: CounterRNG, cfg: WorldGenConfig, ids: dict[str, int], concepts: 
     return len(trunks)
 
 
-def _plants(rng: CounterRNG, cfg: WorldGenConfig, ids: dict[str, int], blocks: np.ndarray, h: np.ndarray) -> None:
-    """Short grass and flowers [est] on grass blocks with air above."""
+def _plants(rng: CounterRNG, cfg: WorldGenConfig, ids: dict[str, int], blocks: np.ndarray, h: np.ndarray,
+            biome: np.ndarray) -> None:
+    """Short grass and flowers [est] on grass blocks with air above, dead bushes on sand, at each
+    column biome's rates (scaled by ``vegetation``)."""
     sx, _, sz = blocks.shape
+    surfaces = [BIOME_SURFACES[b] for b in cfg.biomes]
+    v = cfg.vegetation
+    grass_p = np.array([s.grass_chance * v for s in surfaces])[biome]
+    flower_p = np.array([s.flower_chance * v for s in surfaces])[biome]
+    bush_p = np.array([s.dead_bush_chance * v for s in surfaces])[biome]
     xs, zs = np.meshgrid(np.arange(sx), np.arange(sz), indexing="ij")
     u = rng.uniform_array(STEP_PLANTS, 0, Purpose.WORLDGEN, _key(xs, zs), 0)
     ok = (h + 1 <= MAX_Y)
     top = blocks[xs, h - MIN_Y, zs]
     above = blocks[xs, np.minimum(h + 1, MAX_Y) - MIN_Y, zs]
-    ok &= (top == ids["grass_block"]) & (above == 0)
-    grass = ok & (u < cfg.grass_chance)
-    flower = ok & (u >= cfg.grass_chance) & (u < cfg.grass_chance + cfg.flower_chance)
+    ok &= above == 0
+    on_grass = ok & (top == ids["grass_block"])
+    grass = on_grass & (u < grass_p)
+    flower = on_grass & (u >= grass_p) & (u < grass_p + flower_p)
+    bush = ok & (top == ids["sand"]) & (u < bush_p)
     blocks[xs[grass], h[grass] + 1 - MIN_Y, zs[grass]] = ids["short_grass"]
     blocks[xs[flower], h[flower] + 1 - MIN_Y, zs[flower]] = ids["flower"]
+    blocks[xs[bush], h[bush] + 1 - MIN_Y, zs[bush]] = ids["dead_bush"]
 
 
 # ---------------------------------------------------------------------------
@@ -720,21 +750,24 @@ def generate(seed: int, config: WorldGenConfig | str = "default", *, concepts: C
     """A deterministic test world: the same seed and config give identical voxels."""
     cfg = PRESETS[config] if isinstance(config, str) else config
     concepts = concepts if concepts is not None else load_concepts()
+    check_biomes(cfg, concepts)
     ids = _ids(concepts)
     rng = CounterRNG(seed)
     h = _heights(rng, cfg)
     water_top = np.where(h < WATER_TOP, WATER_TOP, MIN_Y - 1).astype(np.int32)
     if cfg.pools_per_chunk > 0:
         _pools(rng, cfg, h, water_top)
-    blocks = _strata(rng, cfg, ids, h, water_top)
+    biome = biome_indices(rng, cfg)
+    blocks = _strata(rng, cfg, ids, h, water_top, biome)
     if cfg.caves_per_chunk > 0:
         _caves(rng, cfg, concepts, blocks)
     ore_blocks = _ores(rng, cfg, concepts, blocks) if (cfg.ores or cfg.stone_blobs) else {}
-    trees = _trees(rng, cfg, ids, concepts, blocks, h) if cfg.trees_per_chunk > 0 else 0
-    if cfg.grass_chance > 0 or cfg.flower_chance > 0:
-        _plants(rng, cfg, ids, blocks, h)
+    trees = _trees(rng, cfg, ids, concepts, blocks, h, biome)
+    if cfg.vegetation > 0:
+        _plants(rng, cfg, ids, blocks, h, biome)
     world = World(cfg.size_x, cfg.size_z, concepts=concepts)
     world.load(blocks)
+    world.set_biome_map(np.array([concepts.biome(b).id for b in cfg.biomes], np.uint8)[biome])
     world.meta.update(seed=seed, preset=config if isinstance(config, str) else None, config=asdict(cfg),
                       ore_blocks=ore_blocks, trees=trees, surface=h)
     world.meta["spawn"] = spawn_point(world)
