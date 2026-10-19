@@ -63,7 +63,7 @@ Example: `{"t": "ping", "nonce": 1}` is the frame `00 00 00 0f 82 a1 74 a4 70 69
 | `node` | str | `process.version` |
 | `packages` | map | every installed package: its path as the lock writes it (`node_modules/mineflayer`, `node_modules/@msgpack/msgpack`, `node_modules/prismarine-physics/node_modules/vec3`) → the `version` in that folder's `package.json`. Node visits every folder `node_modules/<name>` and `node_modules/@<scope>/<name>` at any depth under `bridge/` (not `.bin`, not `package.json` files inside a package's own subfolders). An `npm ci` tree gives exactly the lock's 99 entries *(checked)* |
 | `lock_sha256` | str | SHA-256 of `bridge/package-lock.json` after turning CRLF into LF; for the record only (the check uses `packages`) |
-| `mcdata` | map | `{version, sha256: {path: hash}}`: hashes of the minecraft-data files listed in `data/sources.json` (`data/pc/1.21.1/blocks.json`, ..., `data/pc/1.20.5/biomes.json`), read from `node_modules/minecraft-data` |
+| `mcdata` | map | `{version, sha256: {path: hash}}`: `version` is the minecraft-data package's version (3.117.0 in the lock), and `sha256` the SHA-256 of the **raw bytes** of each minecraft-data file listed in `data/sources.json`, keyed by its path as listed there (`data/pc/1.21.1/version.json`, ..., `data/pc/1.20/entityLoot.json`). Node reads them from the copy of minecraft-data that Mineflayer's prismarine-registry loads, `patches.packageDir('minecraft-data', patches.packageDir('prismarine-registry', patches.packageDir('mineflayer', bridgeDir)))` (`node_modules/minecraft-data` in the lock), where the npm package keeps the data one folder down: `<package>/minecraft-data/<path>`, e.g. `node_modules/minecraft-data/minecraft-data/data/pc/1.21.1/blocks.json` (`node_modules/minecraft-data/data` does not exist, *checked*) |
 
 ### 4.2 `hello` from the conductor (reply)
 
@@ -85,7 +85,7 @@ The conductor instead answers `bye{reason}` and closes when:
 - any `mcdata` hash differs from the pins in `data/sources.json`. Node reports block state ids, and Python maps them with tables built from the pinned files. In `bridge/package-lock.json` minecraft-data is 3.117.0, and all twelve pinned files are byte-identical to the pins *(checked 2026-10-19)*;
 - `packages` differs from the `packages` section of `bridge/package-lock.json`, compared by path and version, not by file bytes: a missing package (other than those the lock marks `optional`), an extra one, or another version. The M2 duration, dig and lag fits hold only for the pinned stack (mineflayer, mineflayer-pathfinder, prismarine-physics, prismarine-block, ...), so a host with any other version must not play (bridge/README.md: "A new Mineflayer is a bridge change").
 
-Committed text files keep LF on every OS (`bridge/.gitattributes`), and every hash of a text file in the bridge is taken after turning CRLF into LF, so a Windows checkout gives the same values.
+**Which hashes normalize line endings.** Committed text files keep LF on every OS (`bridge/.gitattributes`), and hashes of the repository's own text files are taken after turning CRLF into LF, so a Windows checkout gives the same values: `lock_sha256` here, and the hashes of `server.properties` and the gamerule files that `servertool.py` records in `hivemind-instance.json` (`sha256_text`). Files that npm installs, the `mcdata` files among them, are hashed as raw bytes (`sha256_file`), exactly as `data/sources.json` pins them: minecraft-data's `pc/1.21.1/recipes.json` has 28,094 CRLF line endings, so its normalized hash differs from the pin while its raw hash equals it; the other eleven files have none *(checked 2026-10-19)*. npm writes a package's files as its tarball holds them, on every OS [mem].
 
 Node writes all of these values, its own and the conductor's, into each bot's telemetry `session.json` (DESIGN.md 11.4); the conductor writes them into `runs/<id>/run.json`.
 
@@ -98,21 +98,19 @@ Node writes all of these values, its own and the conductor's, into each bot's te
 | Key | Value | Source |
 |---|---|---|
 | `perception` | `M` or `S` | the agents' network preset (DESIGN.md 6.4); it sets the two radii below |
-| `state_every_ticks` | 5 | resource sightings are checked every 5 ticks (DESIGN.md 6.1 [est]) |
+| `state_every_ticks` | 5 | the state and telemetry cadence (DESIGN.md 11.4, every 5 ticks), which is also the simulator's frame (DESIGN.md 4.5): the conductor checks for a new visible hostile at every `state` (6.4). Sightings are not recast at this rate but on the simulator's schedule (7.3) |
 | `mirror_radius_chunks` | 4 in preset M, 2 in S | covers everything perception reads from anywhere in the bot's chunk; the rule is in 7.2 |
 | `entity_radius` | 67 in preset M, 35 in S | blocks from the bot's eye to an entity's position; why in 7.1 |
-| `interrupt_hostile_radius` | 8 | DESIGN.md 4.5 |
 | `dig_verify_extra_ticks` | 2 | re-read a dug block after RT + 2 ticks (DESIGN.md 5) |
 | `chat_min_interval_ticks` | 40 | DESIGN.md 9 |
 | `pathfinder` | the map and table in 5.1 | DESIGN.md 4.5, 11.1, built from `hivemind/sim/ref/nav.py` |
 
 ### 4.5 `tables`
 
-Generated by the conductor from `hivemind.lang` and the concept tables at start-up, so that Node can render result words and detect hostiles without its own copy of the vocabulary:
+Generated by the conductor from `hivemind.lang` and the concept tables at start-up, so that Node can render result words without its own copy of the vocabulary. Node needs no list of hostiles: the conductor detects hostile interrupts (6.4).
 
 | Key | Content |
 |---|---|
-| `hostile` | vanilla entity types whose entity class has kind `hostile` |
 | `result_words` | failure code → words, with `{cause}`, `{station}` and `{container}` placeholders, from `Language.result_words` (DESIGN.md 5): `OK` → `done`, `NO_STATION` → `no {station} nearby`, `INV_FULL` → `{container} full`, `INTERRUPTED` → `interrupted by {cause}`, ... |
 | `phrases` | `{entity: {vanilla type: phrase}, station: {crafting_table: "crafting table", furnace: "furnace", bed: "bed"}, container: {inventory: "inventory", chest: "chest", furnace: "furnace"}, cause: {damage: "damage", message: "message"}}` for filling the placeholders |
 
@@ -136,9 +134,9 @@ Bots are created with Mineflayer's automatic respawn off (`respawn: false`; *che
 
 The order is part of the protocol: a host that gets it wrong mines at the wrong speed or paths differently from the simulator, with no other sign.
 
-1. **Patch first.** Call `applyDigTimePatch(mineflayerRegistry())` from `node/patches.js` once per process, before any prismarine-block `Block` object exists: before the first `mineflayer.createBot`, before any `new Movements(bot)` (its constructor makes a Block for every block type, *checked*: `lib/movements.js`), before mineflayer-pathfinder or mineflayer-tool is loaded into a bot (the pathfinder's inject makes a `Movements`, *checked*: `index.js`), and before any `require('prismarine-block')(registry)`. A Block copies its material when it is made, so a Block made earlier keeps the unpatched dig time (node/README.md). Then connect to the conductor and exchange `hello`.
+1. **Patch first.** Call `applyDigTimePatch(mineflayerRegistry())` from `node/patches.js` once per process, before any prismarine-block `Block` object exists: before the first `mineflayer.createBot`, before any `new Movements(bot)` (its constructor makes a Block for every block type, *checked*: `lib/movements.js`), before mineflayer-pathfinder or mineflayer-tool is loaded into a bot (the pathfinder's inject makes a `Movements`, *checked*: `index.js`), and before the host makes a `Block` class of its own. The host loads prismarine-block and prismarine-registry only from Mineflayer's folder (`patches.packageDir`, as `patches.js` and its test do), never by bare name: `bridge/package.json` does not declare them, and a bare-name copy could be one no bot reads (node/README.md). A Block copies its material when it is made, so a Block made earlier keeps the unpatched dig time (node/README.md). Then connect to the conductor and exchange `hello`.
 2. **Per `join`:** `mineflayer.createBot({host: '127.0.0.1', port, username, version: '1.21.1', auth: 'offline', respawn: false})`, then at once `bot.once('inject_allowed', () => assertDigTimePatched(bot.registry))`: a bot whose registry is not patched must end the host before it loads a chunk. Load mineflayer-pathfinder and mineflayer-tool; mineflayer-armor-manager and mineflayer-auto-eat stay unloaded, because equipping and eating are policy actions (DESIGN.md 11.1).
-3. **Pathfinder settings,** after `spawn`, from `settings.pathfinder` (built by the conductor from `nav.py`, the simulator's port of the package, so both sides find the same paths; `tests/test_nav.py` runs the installed package with exactly these settings and lists against nav.py):
+3. **Pathfinder settings,** after `spawn`, from `settings.pathfinder` (built by the conductor from `nav.py`, the simulator's port of the package, so both sides find the same paths; `tests/test_nav.py` runs the installed package's `Movements` and A* on the same scenes as nav.py, with the same `Movements` settings and lists and with no time limits, so that its result does not depend on the machine's speed):
 
 | Object | Setting | Value | Package default *(checked)* |
 |---|---|---|---|
@@ -153,7 +151,7 @@ The order is part of the protocol: a host that gets it wrong mines at the wrong 
 | | `allowEntityDetection` | false (entities in the way are ignored, as in the simulator) | true |
 | | `canDig` | true | true |
 | | `scafoldingBlocks` (the package's spelling) | the item ids of `nav.SCAFFOLDING_ITEMS`: `dirt`, `cobblestone` | the same two |
-| | `blocksCantBreak` | the package's set plus `nav.bridge_block_lists(concepts)["blocksCantBreak"]`: every member of the never-dug classes (stations, beds, chests, doors, fence gates; 70 vanilla names as built) | `chest` and every block minecraft-data marks not diggable |
+| | `blocksCantBreak` | the package's set plus `nav.bridge_block_lists(concepts)["blocksCantBreak"]`: every member of the classes `nav.never_break_classes` names: the chest, crafting table, furnace and bed classes, and every class with a door or fence-gate member. A class is never split, so this also takes the other members of the classes that merge iron and copper doors with iron bars, chains, iron and copper trapdoors, copper grates and the lightning rod (70 vanilla names as built) | `chest` and every block minecraft-data marks not diggable |
 | | `blocksToAvoid` | the package's set plus `nav.bridge_block_lists(concepts)["blocksToAvoid"]`: every member of the hazard classes (`cactus`, `campfire`, `cobweb`, `fire`, `lava`, `magma_block`, `powder_snow`, `soul_campfire`, `soul_fire`, `sweet_berry_bush`, `wither_rose` as built) | `fire`, `cobweb`, `lava` |
 
    `settings.pathfinder` is `{search: {tickTimeout, thinkTimeout, searchRadius}, movements: {allowParkour, canOpenDoors, dontCreateFlow, maxDropDown, allow1by1towers, allowEntityDetection, canDig}, scafoldingBlocks, blocksCantBreak, blocksToAvoid}`, the last three as lists of vanilla names. Node assigns `search` to `bot.pathfinder` and `movements` to a `new Movements(bot)`, maps the names with `bot.registry.itemsByName` and `blocksByName`, replaces `scafoldingBlocks` with the mapped ids, and **adds** the two block lists to the Sets the constructor made (the package's own entries stay). Every other setting keeps the package default, which is what `nav.Settings` models (`digCost`, `placeCost`, `liquidCost` 1; `dontMineUnderFallingBlock` and `infiniteLiquidDropdownDistance` true). Then `bot.pathfinder.setMovements(movements)`. `allowSprinting` is left at the package default, true, for now (section 13).
@@ -168,7 +166,7 @@ The order is part of the protocol: a host that gets it wrong mines at the wrong 
    ```
 
    Pathfinder nodes have integer `x`, `y`, `z`: the floored feet cell *(checked: `lib/move.js`)*, as nav.py's goals take them. The package's `GoalInvert` is not used: its end test and heuristic are not the simulator's.
-5. **First state.** After `spawn`, Node sends `joined` and then a `state` with every mirrored column (7.2). The conductor builds no observation, and sends no `act`, until the mirror holds every column within `mirror_radius_chunks` of the bot's chunk that intersects the area.
+5. **First state.** After `spawn`, Node sends `joined` and then a `state` with every mirrored column (7.2). The conductor builds no observation, and sends no `act`, until the mirror holds every column within `mirror_radius_chunks` of the bot's chunk that intersects the area, with the biomes-only sections of those columns and of the ring columns in that square (7.2).
 
 ## 6. Actions
 
@@ -230,7 +228,7 @@ Conventions:
 | `equip` | `items`, `dest`: `hand`, `off-hand`, `head`, `torso`, `legs`, `feet` | below |
 | `sleep` | `bed` (position) | `sleep` |
 | `give` | `player` (concept name), `items`, `count` | goto to ≤ 3 blocks + `toss` |
-| `chat` | `text`: the rendered line, `Language.chat_text(addressee, sentence)`, e.g. `everyone, i need 3 iron ingot.` (DESIGN.md 9); `channel`: `global`, `team` or `whisper`; `to`: concept name or nil | `chat`, or `/teammsg` and `/msg <username>` [mem] |
+| `chat` | `text`: the rendered line, `Language.chat_text(addressee, sentence)`, e.g. `everyone, i need 3 iron ingot.` | `bot.chat(text)`: plain public chat with the addressee first, as DESIGN.md 9 renders a message, whoever the addressee is. Sending team and player-addressed messages with `/teammsg` and `/msg` instead would change who hears them, so it waits for DESIGN.md 9 to decide, with the simulator delivering to the same listeners (section 13) |
 | `wait` | `ticks`: 20, 100 or 400 | no-op until the time is up or an interrupt |
 | `store` | `chest` (position), `items`, `count` | `openContainer`, `deposit` |
 | `take` | `chest`, `items`, `count` | `openContainer`, `withdraw` |
@@ -253,19 +251,24 @@ Conventions:
 
 ### 6.4 Interrupts: who detects what
 
-A running action is interrupted by damage, a new hostile within 8 blocks, a message to the agent from a teammate or the human, a vanished target or a full inventory (DESIGN.md 4.5). Each is detected on the side that can do so without parsing English or holding the vocabulary:
+A running action is interrupted by damage, a new hostile within 8 blocks, a message to the agent from a teammate or the human, a vanished target or a full inventory (DESIGN.md 4.5). Each is detected on the side that can do so without parsing English, holding the vocabulary or deciding what the agent knows (rule 2):
 
 | Trigger | Detected by | Result |
 |---|---|---|
 | health decreases | Node (`update_health`) | `INTERRUPTED`, cause `damage` |
-| a hostile (`tables.hostile`) inside `area` enters `interrupt_hostile_radius` during the action | Node | `INTERRUPTED`, cause `{hostile: <type>}` |
+| a new visible hostile within 8 blocks (below) | conductor (needs the shared perception on the mirror) | `cancel` with cause `{hostile: <vanilla type>}` |
 | chat addressed to the agent by a teammate or the human | conductor (needs the human tokenizer and the relation) | `cancel` with cause `message` |
 | target entity gone, target block changed | Node | `TARGET_LOST` or `NO_TARGET` |
 | no room for the next item | Node | `INV_FULL`, container `inventory` |
 | a deadline passes | Node | `TIMEOUT` |
 | the bot dies | Node | `DIED` |
 
-Hostiles outside the area are ignored [design]: the simulator has nothing beyond its barrier edge, and the client is told about mobs behind the area's wall. Messages from enemies do not interrupt; they only reach the chat field (DESIGN.md 4.5).
+**A new visible hostile** [design]. Node must not decide this: the client tracks mobs behind walls and in neighbouring caves (7.1, section 9), and `interrupted by zombie` in the agent's next observation (the last command's result words, DESIGN.md 6.2) would name a zombie the agent never saw (DESIGN.md 6.1). So the conductor decides it, with the shared perception, at every `state` during the action:
+- A hostile is an entity of `state.entities` whose entity class has kind `hostile`. It is *visible within 8 blocks* when `perception.entity_visible(mirror, eye, pos, height, max_distance=8)` holds at that state, with `eye` the bot's eye (its own `pos` + 1.62), `pos` the hostile's feet and `height` its entity class's box height: its middle within 8 blocks of the eye, and a clear segment from the eye to its feet, middle or top, through see-through cells of the mirror (DESIGN.md 6.1).
+- It is *new* when it was not visible within 8 blocks at the decision the command came from (the same test, on the mirror the observation was built from). A hostile the agent saw within 8 blocks when it chose the command never interrupts that command, which is what lets `flee` and `attack` run.
+- On the first state with a new one, the conductor sends `cancel` with its vanilla type (the nearest by the distance from the eye to its middle if several are new, then the lower entity id), and Node ends the action with `INTERRUPTED` and that cause.
+
+Hostiles outside the area never pass: the mirror reads barrier there, which is not see-through (7.2). DESIGN.md 4.5 says "a new hostile within 8 blocks"; this is the bridge's reading of it, and the simulator's macros must apply the same rule on their 5-tick frames so that both sides interrupt for the same hostiles (section 13). Messages from enemies do not interrupt; they only reach the chat field (DESIGN.md 4.5).
 
 ### 6.5 `result` (Node → conductor)
 
@@ -326,7 +329,9 @@ Node reads `age` and `time` from the raw `update_time` packet, as `Number(BigInt
 
 Python runs the shared perception (DESIGN.md 6.1, 6.2: the visible-only window, the panorama in preset M, the F3 group) and the notebook on a mirror of what the bot's client holds, so Node never decides what is visible. The conductor keeps one mirror per bot: a `World` (`hivemind/sim/ref/world.py`) the size of the bot's evaluation area (128 × 128, DESIGN.md 11.3), in local coordinates (local x = x − `area.x0`, local z = z − `area.z0`; y unchanged), and calls the same functions on it as the simulator does (`perception.perceive`, `debug_info`).
 
-**Clipped to the evaluation area.** Every cell outside the area (and below y −64) reads as `barrier`, and every cell above y 191 inside it as air: exactly how `World.get` reads the simulator's world edge (DESIGN.md 4.4, 11.3). The real barrier walls, the terrain beyond them and anything above 191 never reach perception, and perception treats the barrier as not see-through, so both sides see the same edge. Node sends only columns that intersect the area, and only their sections −4..11 (y −64..191; start areas keep their terrain at or below 191, DESIGN.md 4.4). A block placed above 191 in the real game is not mirrored.
+**Clipped to the evaluation area.** Every cell outside the area (and below y −64) reads as `barrier`, and every cell above y 191 inside it as air: exactly how `World.get` reads the simulator's world edge (DESIGN.md 4.4, 11.3). The real barrier walls, the terrain beyond them and anything above 191 never reach perception, and perception treats the barrier as not see-through, so both sides see the same edge. Node sends block states and light only for columns that intersect the area, and only for their sections −4..11 (y −64..191; start areas keep their terrain at or below 191, DESIGN.md 4.4). A block placed above 191 in the real game is not mirrored.
+
+**Biome cells reach one step further,** for F3's biome zoom only (below), which can choose a 4 × 4 × 4 cell one cell beyond the feet block's own cell on each axis. With q = (coordinate − 2) >> 2, a feet block at x = `area.x0` or `area.x0` + 1 can choose cell q = `area.x0`/4 − 1, in the column west of the area; one at `area.x1` − 2 or `area.x1` − 1 can choose a cell in the column east of it (likewise for z); and a feet y of 190 or more can choose a cell of section 12. So Node also sends, biomes only: sections 12..19 (y 192..319, the rest of the overworld) of the columns that intersect the area, and sections −4..19 of the **ring columns**, those within the mirrored square that do not intersect the area but lie within 4 blocks of it (with corners on multiples of 16, bridge/server/README.md section 8, the ring of columns around the area). The feet are always inside the area, so every cell the zoom can choose lies in the feet's column or a neighbouring one, inside the mirrored square for both radii. These cells never reach perception or the `World`'s voxels; the conductor keeps them beside the mirror for the zoom.
 
 **Radius.** Node mirrors the columns within `mirror_radius_chunks` (Chebyshev distance, in chunks) of the bot's chunk, and updates the set when the bot changes chunk. The rule: **r = ceil(R / 16)**, where R is the farthest horizontal distance from the eye at which perception reads a cell. The eye can be anywhere in its chunk c, x ∈ [16c, 16c + 16), so every cell within R of it lies in [16c − R, 16c + 16 + R), inside chunks c − ceil(R/16) … c + ceil(R/16); the same holds for z. The eye's chunk is the feet's chunk.
 - **Preset M:** R = 64, the panorama's range. perception.py walks each ray cell by cell and enters no cell beyond t = 64 blocks; its pixel rays are never parallel to x or z (column centres sit at odd multiples of 1.875°), so a ray moves less than 64 along either axis. r = 4: a 9 × 9 square of columns, the bot's chunk ± 64 blocks. Draft 0.4's 2 chunks covered only its 24-block perception.
@@ -335,13 +340,13 @@ Python runs the shared perception (DESIGN.md 6.1, 6.2: the visible-only window, 
 - perception.py fetches slightly larger boxes than it uses (the panorama's `World.region` spans ±66 cells around the eye's cell, `line_of_sight` one cell beyond each segment), so area cells outside the mirrored square must still hold some block class: the last mirrored value, or air where nothing was ever mirrored. They never change an output.
 
 **Fields** in `state`:
-- `chunks`: columns that entered the radius, or that the server sent again: `{x, z, sections}` with x, z in chunks. Each section is `{y, ...}` (section index −4..11) with:
+- `chunks`: columns that entered the radius, or that the server sent again: `{x, z, sections}` with x, z in chunks. Each section is `{y, ...}` (section index −4..19). Sections −4..11 of a column that intersects the area carry all three groups of fields below; the biomes-only sections (sections 12..19, and every section of a ring column) carry only the biome fields:
   - block states: `single: <state id>` when the section is uniform, otherwise `zids`: 4096 little-endian uint16 state ids, index (y × 16 + z) × 16 + x within the section, deflated with zlib;
   - biomes: the section's 4 × 4 × 4 biome cells (the game stores one biome per 4 × 4 × 4 cell, DESIGN.md 4.4): `biome_single: <id>` when uniform, otherwise `biomes`: 64 bytes, index (y4 × 4 + z4) × 4 + x4, read with `column.getBiome(pos)` (column-local x and z) at each cell's lowest corner. The ids are the server's network ids, named by `joined.biomes`;
   - light: `zsky` and `zblock`, each the section's 2,048 light bytes exactly as the server sent them, deflated, in the game's layout: cell (x, y, z) at index (y × 16 + z) × 16 + x, two cells per byte, low nibble first [mem]. A section whose light arrived as all zero (the packet's empty mask) is sent as 2,048 zero bytes; a section for which the client holds no light data at all (no bit in either mask yet) has no field.
 - `unload`: `[[x, z], ...]` for columns that left the radius or that the server unloaded.
-- `changes`: `[[x, y, z, state_id], ...]` for block updates in mirrored columns, y −64..191, since the previous `state`, in arrival order.
-- `light`: `[{x, z, y, zsky?, zblock?}, ...]`: sections of mirrored columns whose light the server updated since the previous `state` (`update_light` packets, which Mineflayer applies to its column, *checked*: `lib/plugins/blocks.js`), each with its full new contents, applied after `changes` of the same message. Mineflayer does not relight the column itself after a block change, so the mirror's light is the light the server sends [mem: the server sends updated light for changed sections].
+- `changes`: `[[x, y, z, state_id], ...]` for block updates in the mirrored columns that intersect the area, y −64..191, since the previous `state`, in arrival order.
+- `light`: `[{x, z, y, zsky?, zblock?}, ...]`: sections −4..11 of the mirrored columns that intersect the area whose light the server updated since the previous `state` (`update_light` packets, which Mineflayer applies to its column, *checked*: `lib/plugins/blocks.js`), each with its full new contents, applied after `changes` of the same message. Mineflayer does not relight the column itself after a block change, so the mirror's light is the light the server sends [mem: the server sends updated light for changed sections].
 - State ids are minecraft-data 1.21.1 ids, which are the protocol ids (verified at `hello` through the file hashes, and against the vanilla report by `servertool.py check-generator`). Python maps them to block classes with `data/block_classes-1.21.1.csv`.
 
 **Reading light without scrambling it.** Node must forward the light bytes as received: from the raw `map_chunk` and `update_light` packets (`skyLight[k]` is the 2,048 bytes of the k-th set bit of `skyLightMask`, a bit of `emptySkyLightMask` means all zero, and the same for block light; 1.21.1 packet layout *checked* in minecraft-data's protocol), or from prismarine-chunk's `column.dumpLight()`, which returns exactly the bytes it read *(checked)*. Light index i of a column covers section y = i − 5: the overworld's light arrays have one extra section below y −64 and one above *(checked: `getLightSectionIndex`)*. It must not use `column.getSkyLight`, `column.getBlockLight`, or `block.light` and `block.skyLight` from `bot.blockAt`: prismarine-chunk 1.41.0 reads network light as big-endian 64-bit words, so these getters return the light of another cell in the same row, x' = 14 − (x & ~1) + (x & 1) *(checked: `src/pc/1.18/ChunkColumn.js` and `src/pc/common/BitArray.js`)*, while the same class loads light from disk in the nibble layout above. Block states and biomes travel as palette indices packed into 64-bit longs [mem], the layout that reader expects, so `getBlockStateId` (which `bot.blockAt` relies on) and `getBiome` are not affected; M2 still compares a biome border with F3.
@@ -349,9 +354,15 @@ Python runs the shared perception (DESIGN.md 6.1, 6.2: the visible-only window, 
 **What the conductor's mirror holds:**
 - **Voxels:** the block class of each state id.
 - **Light:** the game's sky and block light as received. It is not provisional: the window's light, the panorama's light fields and the F3 group's light at the feet read it (DESIGN.md 6.2). The simulator's own light is an approximation (DESIGN.md 4.2), so the mirror never recomputes light from its voxels. `World` computes its light from the voxels today, so the mirror needs a way to hold given sky and block light arrays (section 13).
-- **Biome:** the F3 group reads one biome per column (`World.biome_at(x, z)` in `debug_info.py`), because test worlds assign one per column (DESIGN.md 4.4). On the mirror that value must be the biome F3 shows: `BiomeManager.getBiome` at the feet block, which picks one of eight 4 × 4 × 4 cells, q or q + 1 on each axis with q = (coordinate − 2) >> 2, by a jittered distance keyed by the hashed world seed [mem]; the chosen cell can lie in a neighbouring section or column, which the mirror holds. Rule [design]: before each F3 computation, the conductor writes into the mirror's `biome_map`, at the feet column, the zoomed biome of the feet block (the floored feet position), computed in absolute coordinates with `joined.hashed_seed` and mapped to its biome class (`Concepts.biome_of` of the vanilla name). The F3 group reads nothing else of `biome_map`, so this per-column value is exactly the game's for the one column it reads. The zoom must be one function in `hivemind/`, shared with the M3 importer, which keeps the 3-D cells (DESIGN.md 4.4: "checked against F3 in M3"); it does not exist yet (section 13).
+- **Biome:** the F3 group reads one biome per column (`World.biome_at(x, z)` in `debug_info.py`), because test worlds assign one per column (DESIGN.md 4.4). On the mirror that value must be the biome F3 shows: `BiomeManager.getBiome` at the feet block, which picks one of eight 4 × 4 × 4 cells, q or q + 1 on each axis with q = (coordinate − 2) >> 2, by a jittered distance keyed by the hashed world seed [mem]; the chosen cell can lie in a neighbouring section or column, even one outside the area or above section 11, which is why Node sends the biomes-only sections (above). The cell's y is clamped to the world's height (y −64..319), as the game's chunk lookup does [mem], so no section below −4 is needed. Rule [design]: before each F3 computation, the conductor writes into the mirror's `biome_map`, at the feet column, the zoomed biome of the feet block (the floored feet position), computed in absolute coordinates with `joined.hashed_seed` and mapped to its biome class (`Concepts.biome_of` of the vanilla name). The F3 group reads nothing else of `biome_map`, so this per-column value is exactly the game's for the one column it reads. The zoom must be one function in `hivemind/`, shared with the M3 importer, which keeps the 3-D cells (DESIGN.md 4.4: "checked against F3 in M3"); it does not exist yet (section 13).
 - **Clock:** `World.day_time` = `state.day_time` (the full counter), `World.tick` = `state.age` − the age at the episode's start.
-- **Entities:** the bot itself in an agent slot (its `pos`, `yaw`, `pitch` and home), and every entity of `state.entities` in the slot table of its kind: players as agents, mobs, dropped items. Boxes come from the entity classes' sizes (perception.py), never from Mineflayer.
+- **Entities:** rebuilt from each `state`, so that the mirror holds exactly what the client tracks within `entity_radius`:
+  - the bot itself in an agent slot (its `pos`, `yaw`, `pitch` and home);
+  - every player of `state.entities` in an agent slot, with its concept name (`red_7`, `human`) in a field the conductor adds with `SlotTable.add_field`. The observation builder names a player slot by that field: the agent table's `team` and `number` cannot name the human. A tracked player with no concept name (section 3) is an infrastructure fault: the conductor stops the episode rather than show a player it has no word for;
+  - every other entity whose class has kind `hostile`, `passive` or `other` in the mob table, by entity class (`cls`): mobs, and also arrows, experience orbs, primed TNT and the 43 vanilla types of the class `object`, which DESIGN.md 6.2 lists with relation word `object`;
+  - dropped items in the item table, with their item class and count.
+
+  Slots are filled in a fixed order, nearest first (distance from the eye to the entity's position, then entity id), and each records its protocol entity id (another added field), so that a slot maps back to its `EntityRef` for a plan (`attack`, `goto` an entity). The tables are sized from the state, not from the simulator's `ENTITY_CAPACITY` (32 mobs and 64 items, where `SlotTable.alloc` raises `SlotsFull`; more than 32 mobs within 67 blocks is ordinary at night): when a state holds more entities for a table than it has slots, the conductor replaces that table with a larger one, so no tracked entity is dropped. Boxes come from the entity classes' sizes (perception.py), never from Mineflayer.
 
 ### 7.3 Where each perceived input comes from
 
@@ -370,6 +381,8 @@ Python runs the shared perception (DESIGN.md 6.1, 6.2: the visible-only window, 
 | F3: sky light and block light at the feet | the mirror's light |
 
 Nothing in this table comes from the client's debug screen, from RCON or from the server's state.
+
+**When the conductor perceives: the simulator's schedule** (DESIGN.md 6.1). At each decision it builds the observation once (`perception.perceive`: the window, the panorama in preset M, the F3 group), and its sightings go to the notebook. During an action it recasts only the window and its sightings, on `perception.RaySchedule` (every 20 ticks [est] while the eye moves, with the agent's phase, on the bot's client tick), at the first `state` at or after each due tick (states come every 5 ticks, so at most 4 ticks late), through a `WindowCache`, so a still eye costs nothing; the panorama is not cast during actions. Recasting at every `state` would note resources on a walk four times as often as the simulator does, and the two notebooks would drift apart. The visible-hostile test of 6.4 is the one perception call made at every `state`.
 
 ## 8. Events (Node → conductor)
 
@@ -393,7 +406,7 @@ The owner asked how an agent remembers where things were, who is an enemy and ho
 
 | Notebook table | Fed by |
 |---|---|
-| Places (`iron ore`, `my furnace 2`, `my chest 1`, `my bed`, `lava`) | perception on the world mirror (7.2) every `state`: seen window cells and, in preset M, panorama pixels up to 64 blocks away (DESIGN.md 6.1); own stations from the positions in successful `place` results |
+| Places (`iron ore`, `my furnace 2`, `my chest 1`, `my bed`, `lava`) | perception on the world mirror (7.2), on the simulator's schedule (7.3): seen window cells and, in preset M, panorama pixels up to 64 blocks away (DESIGN.md 6.1); own stations from the positions in successful `place` results |
 | Players (relation, last seen, last message, damage, kills, gifts, times seen opening my chests) | `state.entities` (`player`, position, `team`, from which the relation word follows, as a player sees name colours), filtered by the shared perception (below); `chat` events (last message words); `hurt` events (damage each way, from `source` and `victim`); `death` and `entity_dead` (kills each way); `pickup` events and `give` results (items given each way, attributed by the fixed rule of DESIGN.md 6.3 from the notebook's own perception history); `lid` events on the agent's own chests (times seen opening my chests, by the rule below) |
 | Containers (contents as last seen) | `raw_state.container` after `store` and `take`, passed to `notebook.on_container_view`. A drop since the last look becomes `3 iron ingot missing from my chest 1`. No event ever names a thief: the game does not tell a client who took what (DESIGN.md 6.3) |
 | Events (ring buffer of sentences) | written by the conductor from the above, in the vocabulary's event sentences (contracts 4.3) |
@@ -423,13 +436,13 @@ Cond. → hello   {protocol: 1, session: "s-3f9c", rules_hash: "...", concepts_h
                  vocab_words_hash: "...", players: {red_0: "red_0", human: "<owner's username>"}, settings: {...}, tables: {...}}
 Cond. → join    {agent: "red_0", username: "red_0", server: {host: "127.0.0.1", port: 25565},
                  area: {x0: 0, z0: 0, x1: 128, z1: 128}, respawn_delay_ticks: null, ...}
-Node  → joined  {agent: "red_0", entity_id: 812, pos: [12.5, 70.0, -3.5], yaw: 180.0, pitch: 0.0, age: 1200,
+Node  → joined  {agent: "red_0", entity_id: 812, pos: [12.5, 70.0, 3.5], yaw: 180.0, pitch: 0.0, age: 1200,
                  day_time: 1200, tick: 0, hashed_seed: "-4437018226040387823", biomes: ["badlands", ...], ...}
 Node  → state   {agent: "red_0", tick: 5, day_time: 1205, chunks: [...], entities: [...], inventory: [...], ...}
 Cond. → act     {agent: "red_0", req: 1, command: "mine 4 iron ore.",
                  parsed: {verb: "mine", args: {block: "iron_ore", mine_count: 4}},
-                 plan: {targets: [[14, 52, -9], [15, 52, -9], [15, 53, -10]], count: 4}, deadline_ticks: 900, deadline_ms: 47000}
-Node  → state   {agent: "red_0", tick: 10, changes: [[14, 52, -9, 0]], light: [...], ...}
+                 plan: {targets: [[14, 52, 9], [15, 52, 9], [15, 53, 10]], count: 4}, deadline_ticks: 900, deadline_ms: 47000}
+Node  → state   {agent: "red_0", tick: 10, changes: [[14, 52, 9, 0]], light: [...], ...}
 Node  → event   {agent: "red_0", kind: "hurt", victim: {id: 812, type: "player", player: "red_0", username: "red_0"},
                  source: {id: 901, type: "zombie"}, damage_type: "mob_attack", health: 17.0}
 Node  → state   {agent: "red_0", tick: 61, ...}
@@ -447,4 +460,7 @@ Node  → result  {agent: "red_0", req: 1, code: "INTERRUPTED", cause: "damage",
 - **Sprinting.** mineflayer-pathfinder sprints whenever its path allows (`allowSprinting` true by default, *checked*: `index.js`), while nav.py's `GotoModel` uses the walking speed, 4.317 m/s [mem], and sprinting also costs the game more food [mem]. M2 decides: set `allowSprinting` false, or model sprinting in the simulator (DESIGN.md 4.5 has both speeds).
 - **Block-event range** for `lid`: 64 blocks is [mem]; M7 measures it, and the simulator uses the measured value (DESIGN.md 6.3).
 - **Kick results:** `TIMEOUT` with `aborted: kick` for now (6.6).
-- **Mirror bandwidth:** in preset M a bot mirrors up to 81 columns of 16 sections, each with deflated block states and light; the bytes per bot per second at walking speed, and the cost of the first fill, are measured in M2 [est].
+- **The hostile interrupt** (6.4): DESIGN.md 4.5 says "a new hostile within 8 blocks" without saying "visible"; the bridge reads it as a new *visible* hostile, decided by the conductor, because anything else would name hostiles the agent never saw. DESIGN.md 4.5 and the simulator's macros (`actions.py`, not built) must state and use the same rule, and the honesty tests must cover the result words (a zombie where no ray reaches must not interrupt).
+- **Chat channels** (6.2): every message is plain public chat for now, as DESIGN.md 9 renders it. If DESIGN.md 9 sends team and player-addressed messages with `/teammsg` and `/msg` instead, the `chat` plan gains the channel, and the simulator must deliver each message to the same listeners as the game.
+- **Naming player slots** (7.2): `World`'s agent table has `team` and `number` but no player name, so nothing can mark the human's slot. The shared observation builder must name player slots from one field that the simulator and the mirror both fill.
+- **Mirror bandwidth:** in preset M a bot mirrors up to 81 columns of 16 sections, each with deflated block states and light, plus the small biomes-only sections (7.2); the bytes per bot per second at walking speed, and the cost of the first fill, are measured in M2 [est].

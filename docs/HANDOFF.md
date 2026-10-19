@@ -35,6 +35,8 @@ Each is written into DESIGN.md with its reason; the decision numbers are in DESI
 
 ## 3. Status by milestone
 
+**Tests at handoff** (cloud, Linux, 2026-10-19): `pytest` gives 1,229 passed and 2 skipped; `npm test` in `bridge/` gives 13 passed; the three data builds' `--check` report up to date.
+
 ### M0: pin the version, build the rules, freeze the server config. Done, and checked against the real game
 
 - **Rules (`data/rules-1.21.1.json`).** Exact 1.21.1 data built from pinned sources (`data/sources.json`): 1,060 blocks, 1,333 items, 1,290 recipes, every loot table and tag, and labelled constants.
@@ -119,6 +121,8 @@ npm ci
 npm test
 cd ..
 ```
+
+Expect about 1,230 Python tests to pass (Windows may skip a few more than the 2 skipped in the cloud) and 13 Node tests. A failure in a byte-for-byte data test on Windows means CRLF line endings: check that `git config core.autocrlf` prints `false`, then delete the `data\` files and run `git checkout -- data`.
 
 **Rules for the work** (CLAUDE.md has the full list):
 - Run the tests before every commit.

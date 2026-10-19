@@ -2,7 +2,15 @@
 
 How to set up the real Minecraft servers the agents are evaluated on (DESIGN.md 11.2, 11.3, 11.6). Target machine: the owner's PC (Threadripper 3970X, 64 GB, 2× RTX 3090, Windows 11).
 
-**Status.** These files were written in a cloud container that cannot download the server jar or any mod (Mojang, Fabric maven and Modrinth are not reachable there). Nothing here has run against a real server yet. Steps marked **TODO-pin** need a version or hash filled in on first setup; anything marked [mem] is from memory and must be checked the first time it is used. The labels follow DESIGN.md: [n] is a reference there, [mem] is unverified memory, [est] is an estimate.
+**Status.** These files were written in a cloud container that cannot download the server jar or any mod (Mojang, Fabric maven and Modrinth are not reachable there), and then run against a real server on the owner's PC on 2026-10-19 (instance `inst-0`, first start and clean stop; DESIGN.md 4.1, 11.2). What that run checked:
+- `server.properties`: all 61 frozen keys as rendered; the server rewrote the file but added or removed no key, so the template's key list is right for 1.21.1.
+- Gamerules: all 51 rules and the difficulty read back over RCON on a fresh world (52 checks, no difference), so the vanilla defaults in `gamerule-defaults-1.21.1.json` and the reply formats `check-gamerules` parses are confirmed.
+- Carpet's `antiCheatDisabled` is false and the tick target is 20 TPS.
+- The game and RCON ports listen on 127.0.0.1 only, and the firewall block rules of section 5 are in place.
+- Every pin in `mods-1.21.1.json` (Java, the vanilla server jar, the Fabric loader and launcher, Lithium, Carpet, Chunky, Fabric API) was filled in from `check-mods`; only the harness mod (M2) is still **TODO-pin**.
+- `check-generator` on the vanilla data generator agreed with the rules on every check (section 7).
+
+Anything still marked [mem] below is from memory and must be checked the first time it is used. The labels follow DESIGN.md: [n] is a reference there, [mem] is unverified memory, [est] is an estimate.
 
 ## What is frozen
 
@@ -12,9 +20,9 @@ The server config is frozen at M0, before any measurement (DESIGN.md 11.2, D13).
 |---|---|
 | `server.properties` | The frozen properties template. Instances get a rendered copy that changes only the ports, the RCON password and the seed |
 | `gamerules-1.21.1.mcfunction` | The frozen gamerules (three active rules), plus a commented block of proposals for the owner to decide |
-| `gamerule-defaults-1.21.1.json` | All 51 gamerules of 1.21.1 with their vanilla defaults (names checked against the pinned mcmeta command tree, defaults [mem]). Every rule not in the gamerules file must keep this value |
+| `gamerule-defaults-1.21.1.json` | All 51 gamerules of 1.21.1 with their vanilla defaults (names checked against the pinned mcmeta command tree; defaults verified on a fresh 1.21.1 world on 2026-10-19). Every rule not in the gamerules file must keep this value |
 | `teams-1.21.1.mcfunction` | Scoreboard teams for team worlds (M9 on): colours give the relation word `teammate` / `enemy` (DESIGN.md 6.3, 10.1) |
-| `mods-1.21.1.json` | Pins for Java, the server jar, the Fabric loader and every mod (all TODO-pin until the first setup) |
+| `mods-1.21.1.json` | Pins for Java, the vanilla server jar, the Fabric loader and every mod, filled in on the owner's PC on 2026-10-19; only the harness mod (M2) is still TODO-pin |
 | `servertool.py` | Renders instance configs and checks them: properties, gamerules over RCON, Java and jar hashes, data-generator output |
 | `test_servertool.py` | Offline tests of the frozen values and of every check's verdicts (synthetic instances, generator output and a fake RCON server): `.venv/bin/python -m pytest bridge/server` |
 
@@ -26,7 +34,7 @@ Frozen values (DESIGN.md 11.2): `view-distance=10`, `simulation-distance=10`, `d
 
 ## 1. Prerequisites
 
-1. **Java 21** (64-bit JDK). Minecraft 1.20.5 and later need Java 21 [mem]. For example `winget install EclipseAdoptium.Temurin.21.JDK` or `winget install Microsoft.OpenJDK.21` [mem]. Check with `java -version`; `check-mods` prints the line to pin as `java.version` in `mods-1.21.1.json` (section 4, step 4).
+1. **Java 21** (64-bit JDK). Minecraft 1.20.5 and later need Java 21 [mem]. The pinned build is Eclipse Temurin 21.0.12.1 (`java.version` in `mods-1.21.1.json`), installed on the owner's PC with `winget install EclipseAdoptium.Temurin.21.JDK`. Check with `java -version`: `check-mods` fails on any other version line (section 4, step 4), so a newer Temurin from winget is a change of the frozen config, to be pinned and measured again (DESIGN.md 11.2).
 2. **Python 3.11+** with the repository venv (see the top-level README).
 3. **Node.js 22 or newer** for the bridge hosts later and for the bridge's Node test now (mineflayer 4.39.0 requires Node ≥ 22): `npm ci --ignore-scripts`, then `npm test`, inside `bridge\` (bridge/README.md). Not needed for the server itself.
 4. **Folders outside the repository**, so that worlds and the rendered RCON password never reach git:
@@ -53,19 +61,15 @@ RCON sends the password in plain text, which is fine only because it stays on lo
 
 Do this for `inst-0` first; the other instances are copies (section 8).
 
-1. **Fabric server.** Open https://fabricmc.net/use/server/, choose Minecraft **1.21.1**, the current loader (**TODO-pin**) and installer (**TODO-pin**), and either
-   - download the "executable server jar" (a launcher such as `fabric-server-mc.1.21.1-loader.<v>-launcher.<v>.jar`) into `C:\hivemind\servers\inst-0`; on first start it downloads the vanilla `server.jar` and the libraries into its working folder [mem]; or
-   - run the installer: `java -jar fabric-installer-<v>.jar server -mcversion 1.21.1 -loader <v> -downloadMinecraft -dir C:\hivemind\servers\inst-0` [mem], which produces `fabric-server-launch.jar` and `server.jar`.
-
-   Record the loader and installer versions and the launcher's file name in `mods-1.21.1.json` (`loader.version`, `loader.installer_version`, `loader.launcher_file`).
-2. **Mods** into `C:\hivemind\servers\inst-0\mods\`, each the Fabric build for 1.21.1:
-   - Lithium (**TODO-pin**): performance, with patches tested for vanilla parity [25].
-   - Carpet (**TODO-pin**): spawn tracking, mob caps, TPS logging, `/profile`, `/player` fake players [27]. Keep `antiCheatDisabled` at its default, false.
-   - Chunky (**TODO-pin**) for pregeneration (section 6) [mem]. It sits idle otherwise, so the mod set stays identical for every run.
-   - Fabric API (**TODO-pin**) only if the pinned Chunky build requires it [mem].
+1. **Fabric server.** Download the pinned "executable server jar" for Minecraft **1.21.1**, Fabric loader **0.19.5** and installer **1.1.2**, `fabric-server-mc.1.21.1-loader.0.19.5-launcher.1.1.2.jar`, into `C:\hivemind\servers\inst-0` (the URL is `loader.source` in `mods-1.21.1.json`; https://fabricmc.net/use/server/ builds the same download from these versions [mem]). On its first start it downloads Mojang's vanilla 1.21.1 jar to `.fabric\server\1.21.1-server.jar` in the instance folder, not to `server.jar`, and its libraries into the working folder [mem]; the pins point to that jar. The Fabric installer (`fabric-installer-<v>.jar server ...`) makes other files (`fabric-server-launch.jar`, `server.jar` [mem]), which the pins do not describe, so use the launcher.
+2. **Mods** into `C:\hivemind\servers\inst-0\mods\`, exactly the pinned files (names, versions and download URLs in `mods-1.21.1.json`):
+   - Lithium 0.15.4 (`lithium-fabric-0.15.4+mc1.21.1.jar`): performance, with patches tested for vanilla parity [25].
+   - Carpet 1.4.147 (`fabric-carpet-1.21-1.4.147+v240613.jar`): spawn tracking, mob caps, TPS logging, `/profile`, `/player` fake players [27]. Keep `antiCheatDisabled` at its default, false.
+   - Chunky 1.4.23 (`Chunky-Fabric-1.4.23.jar`) for pregeneration (section 6). It sits idle otherwise, so the mod set stays identical for every run.
+   - Fabric API 0.116.17+1.21.1 (`fabric-api-0.116.17+1.21.1.jar`), which the pinned Chunky build requires (its Fabric metadata lists it as a dependency).
    - The **harness mod** is planned (M2, DESIGN.md 11.3): server-side break-tick log, player-state restore, chunk-ticking report. Until it exists, Carpet's scarpet is the fallback, and `check-mods` reports `NOT FROZEN` for it.
 
-The jars are hashed and pinned after the first start (section 4, step 4), because with the launcher `server.jar` does not exist before then.
+`check-mods` compares the jars with the pins after the first start (section 4, step 4), because the launcher downloads the vanilla jar only then.
 
 ## 4. Configure, start and verify
 
@@ -80,7 +84,7 @@ The jars are hashed and pinned after the first start (section 4, step 4), becaus
 
    ```powershell
    Set-Location C:\hivemind\servers\inst-0
-   java -Xms5G -Xmx5G -jar <launcher or fabric-server-launch.jar> nogui
+   java -Xms5G -Xmx5G -jar fabric-server-mc.1.21.1-loader.0.19.5-launcher.1.1.2.jar nogui
    ```
 
    5 GB per instance (DESIGN.md 13 [est]). Record the JVM flags; they belong to the session record. Run every other command in a second window from the repository root.
@@ -90,14 +94,14 @@ The jars are hashed and pinned after the first start (section 4, step 4), becaus
    python bridge\server\servertool.py check-properties --dir C:\hivemind\servers\inst-0
    ```
 
-   Any key the server added that the template lacks is reported: the template's key list for 1.21.1 is from memory, and this is how it gets verified. Add such keys (with the server's default value) to the template and commit.
-4. **Pin and check the jars** (now that `server.jar` exists):
+   Any key the server added that the template lacks is reported. On 2026-10-19 the server added and removed no key, so the template's key list is right for 1.21.1; a reported key now means the server or its version changed.
+4. **Check the jars** (now that the launcher has downloaded the vanilla jar):
 
    ```powershell
    python bridge\server\servertool.py check-mods --dir C:\hivemind\servers\inst-0
    ```
 
-   It prints the Java version line (`java -version`; pass `--java <path>` if the server is started with another Java), the SHA-256 and SHA-1 of `server.jar`, the SHA-256 of the launcher (or of every candidate jar in the folder while `loader.launcher_file` is not pinned) and of every jar in `mods\`. Compare the SHA-1 with `downloads.server.sha1` in Mojang's 1.21.1 version JSON (linked from https://piston-meta.mojang.com/mc/game/version_manifest_v2.json). Copy the values and versions into `bridge/server/mods-1.21.1.json` and commit them. Until every entry there is pinned (Java, server jar SHA-256 and SHA-1, loader, installer, launcher file and hash, every mod's version and hash), `check-mods` reports `NOT FROZEN` and fails. From then on it fails on another Java, and on any missing, changed or extra jar. Telemetry records the jar hashes with every session (DESIGN.md 11.4).
+   It prints the Java version line (`java -version`; pass `--java <path>` if the server is started with another Java), the SHA-256 and SHA-1 of the vanilla jar (`.fabric\server\1.21.1-server.jar`, as `server_jar.file` names it), the SHA-256 of the launcher and of every jar in `mods\`, and compares each with `mods-1.21.1.json`. The pinned SHA-1, `59353fb4…`, is `downloads.server.sha1` in Mojang's 1.21.1 version JSON (`server_jar.source` there). It fails on another Java and on any missing or changed jar. Until the harness mod is pinned (M2), it also reports `NOT FROZEN` for that mod's version and hash and exits 1 by design, and it does not yet treat an extra jar in `mods\` as a problem (it lists it as `not pinned`), so read its output: every `DIFF` line other than the `NOT FROZEN` line is a real difference. Telemetry records the jar hashes with every session (DESIGN.md 11.4).
 5. **Apply and check the gamerules.** Gamerules live in the world's `level.dat`, so do this for every new or restored world:
 
    ```powershell
@@ -105,15 +109,15 @@ The jars are hashed and pinned after the first start (section 4, step 4), becaus
    python bridge\server\servertool.py check-gamerules --dir C:\hivemind\servers\inst-0
    ```
 
-   `check-gamerules` reads back **every** gamerule, not only the three frozen ones: rules not set by the gamerules file must keep the vanilla default from `gamerule-defaults-1.21.1.json`. Several of them matter to the bridge: `showDeathMessages false` would empty the death messages that feed the notebook's kill counters, `doImmediateRespawn true` would bypass the Node host's respawn delay. It also reads back the difficulty. The defaults in that table are [mem]: on the first fresh world, run `check-gamerules` right after applying the gamerules file and before anything else; a `DIFF` on a rule marked `vanilla default` then means the table is wrong. Fix it, set `defaults_verified` and commit. The reply formats it parses (`Gamerule X is currently set to: Y`, `The difficulty is Normal`) are [mem] too; if they differ, it prints the raw reply and fails, and the regexes in `servertool.py` need a fix.
-6. **Carpet and tick checks:** `python bridge\server\servertool.py rcon --instance 0 "carpet antiCheatDisabled" "tick query"`. Expect `antiCheatDisabled` false and a target of 20 TPS [mem].
+   `check-gamerules` reads back **every** gamerule, not only the three frozen ones: rules not set by the gamerules file must keep the vanilla default from `gamerule-defaults-1.21.1.json`. Several of them matter to the bridge: `showDeathMessages false` would empty the death messages that feed the notebook's kill counters, `doImmediateRespawn true` would bypass the Node host's respawn delay. It also reads back the difficulty. The defaults in that table were verified on a fresh 1.21.1 world on 2026-10-19 (52 checks, no difference), which also confirmed the reply formats it parses (`Gamerule X is currently set to: Y`, `The difficulty is Normal`). A `DIFF` on a rule marked `vanilla default` now means the world was changed; an unrecognised reply is printed raw and fails.
+6. **Carpet and tick checks:** `python bridge\server\servertool.py rcon --instance 0 "carpet antiCheatDisabled" "tick query"`. Expect `antiCheatDisabled` false and a target of 20 TPS (both seen on 2026-10-19).
 7. **Decide the proposed gamerules** in the commented block of `gamerules-1.21.1.mcfunction` before the M3 measurements. Two of them change what the agents meet and should be settled first: `doWeatherCycle false` (the simulator has no rain or storms) and `spawnChunkRadius 0` (otherwise spawn chunks tick with no agent nearby, unlike the simulator). Moving a proposal into the active part is a change of the frozen config: commit it before measuring. `check-gamerules` then expects the new value.
 
 ## 5. Firewall and exposure (DESIGN.md 11.6)
 
 Offline mode means anyone who can reach the game port can join under any name, including the human's. Three layers:
 
-1. **Loopback binding.** The template sets `server-ip=127.0.0.1`. Vanilla RCON has no bind address of its own and listens on `server-ip` too [mem], so this keeps both the game and RCON local. The owner's own client on the same PC connects to `127.0.0.1`. Node hosts also connect to `127.0.0.1`, not `localhost`, which may resolve to `::1` first. Check what is listening:
+1. **Loopback binding.** The template sets `server-ip=127.0.0.1`. Vanilla RCON has no bind address of its own and listens on `server-ip` too [mem], so this keeps both the game and RCON local; on 2026-10-19 both ports listened on 127.0.0.1 only. The owner's own client on the same PC connects to `127.0.0.1`. Node hosts also connect to `127.0.0.1`, not `localhost`, which may resolve to `::1` first. Check what is listening:
 
    ```powershell
    Get-NetTCPConnection -State Listen -LocalPort 25565,25575 | Select-Object LocalAddress,LocalPort,OwningProcess
@@ -160,12 +164,12 @@ python bridge\server\servertool.py rcon --instance 0 "chunky progress"
 
 ```powershell
 mkdir C:\hivemind\datagen; Set-Location C:\hivemind\datagen
-copy C:\hivemind\servers\inst-0\server.jar .
+copy C:\hivemind\servers\inst-0\.fabric\server\1.21.1-server.jar server.jar
 java "-DbundlerMainClass=net.minecraft.data.Main" -jar server.jar --server --reports
 Set-Location <repository root>
 ```
 
-Quote the `-D` argument in PowerShell. `--reports` is required: without it there are no `reports\` and three of the seven checks cannot run (DESIGN.md 4.1 gives the command without it). Use the vanilla `server.jar`, not the Fabric launcher. The output goes to `generated\` [mem]: `generated\data\minecraft\...` (recipes, loot tables, tags, worldgen) and `generated\reports\` (`blocks.json`, `items.json`, `registries.json`, ...). Then, from the repository root (the pinned sources must be in `data/sources/`; fetch them once with `python -m hivemind.rules.fetch_sources`):
+Quote the `-D` argument in PowerShell. `--reports` is required: without it there are no `reports\` and three of the seven checks cannot run (DESIGN.md 4.1 gives the command without it). Use the vanilla jar (the pinned SHA-1 `59353fb4…`, which the launcher keeps in `.fabric\server\`), not the Fabric launcher. The output goes to `generated\` [mem]: `generated\data\minecraft\...` (recipes, loot tables, tags, worldgen) and `generated\reports\` (`blocks.json`, `items.json`, `registries.json`, ...). Then, from the repository root (the pinned sources must be in `data/sources/`; fetch them once with `python -m hivemind.rules.fetch_sources`):
 
 ```powershell
 python bridge\server\servertool.py check-generator --generated C:\hivemind\datagen\generated
@@ -191,7 +195,7 @@ Each check prints its line as soon as it finishes, then the verdict:
 
 A `FAIL` lists examples: report it, because either the pinned sources or the rules build is wrong for 1.21.1, and the rules must be rebuilt before any measurement. The entity ids deserve attention: the rules take entities from minecraft-data's 1.20.5 files (contracts section 1), and this is the first check against the 1.21.1 registry.
 
-What was verified without a server: on the pinned mcmeta data and on reports synthesized from the rules in the remembered format, all seven checks pass (3,894 data files, 1,082 loot tables, 1,290 recipes, 331 tags, 1,060 blocks, 1,333 items, 2,523 registry ids). `test_servertool.py` reproduces that run, and shows on a small synthetic output that each check catches a deliberately changed value and that a missing or unrecognised input gives `INCOMPLETE`.
+**Checked on the owner's PC** on 2026-10-19 (DESIGN.md 4.1): on the generator's own output, all seven checks pass (1,082 loot tables, 1,290 recipes, 331 tags, 1,060 blocks, 1,333 items, 2,523 registry ids, which confirms the entity ids for 1.21.1). Its 3,894 data files equal mcmeta's except four flat-world presets that list `structure_overrides` in another order; the check compares that list as a set and reports the four as tolerated. Without a server, `test_servertool.py` runs the same checks on the pinned mcmeta data with reports synthesized from the rules, and shows on a small synthetic output that each check catches a deliberately changed value and that a missing or unrecognised input gives `INCOMPLETE`.
 
 ## 8. Evaluation instances: 4 × 10 bots
 
@@ -204,7 +208,7 @@ Forty bots on one server at simulation distance 10 would tick about 40 × 441 ch
 | 2 | `C:\hivemind\servers\inst-2` | 25567 | 25577 | 20–29 | `-Xmx5G` |
 | 3 | `C:\hivemind\servers\inst-3` | 25568 | 25578 | 30–39 | `-Xmx5G` |
 
-- **Making instances 1–3:** copy `inst-0` with its jars and `mods\` but without its world (and without `hivemind-instance.json`), render with `--instance K` and the instance's seed, start from the instance folder, then run `check-properties --dir`, `check-mods --dir`, the gamerule commands and `check-gamerules --dir` for each.
+- **Making instances 1–3:** copy `inst-0` with everything but its world and `hivemind-instance.json`: the launcher, `mods\` and `.fabric\`, which holds the vanilla jar the pins name, must come along; render with `--instance K` and the instance's seed, start from the instance folder, then run `check-properties --dir`, `check-mods --dir`, the gamerule commands and `check-gamerules --dir` for each.
 - **Areas:** each instance holds 10 single-agent areas of 128 × 128, one bot each, with centres at least 512 blocks apart (each bot ticks ±160 blocks, and 128 + 2 × 160 = 448). For example a 5 × 2 grid with 512-block spacing. Each area is walled with barrier blocks, matching the simulator's world edge. `/worldborder` is one square per world, so it is used only in team worlds (DESIGN.md 11.3).
 - **Area corners on chunk boundaries** [design]: put each area's minimum x and z on multiples of 16. The simulator's chunks start at its world's corner (`world.py`: a chunk index is floor(x / 16) from x = 0), so only then are the real game's ticking squares (spawns, furnaces, despawns run only in ticking chunks) the simulator's, and the conductor's world mirror (PROTOCOL.md 7.2) covers whole chunk columns. The conductor gives each bot its area in `join` and clips the mirror to it: every cell outside reads as barrier and every cell above y 191 inside it as air, as at the simulator's world edge, so the real walls and whatever lies beyond them never reach perception.
 - **Pristine copies** of every area live elsewhere in the same world, outside every bot's ticking square, and are the `/clone` source for resets. Each is filled once, by cloning its freshly pregenerated area into it before any bot plays (section 6). `/clone` needs both regions loaded [mem]; force-loaded chunks tick like spawn chunks [mem], so force-load the pristine region only for the duration of a reset.
@@ -218,4 +222,4 @@ Forty bots on one server at simulation distance 10 would tick about 40 × 441 ch
 - **Animals after resets.** `/clone` copies blocks and block entities, not entities [mem], and the design's reset ends with `/kill` on non-player entities (DESIGN.md 11.3). After a reset, an area therefore has none of the animals that chunk generation placed, while a fresh pregenerated area does. Snapshot replays need a recorded animal list to re-summon, or the simulator must start without generation-time animals. Decide before measuring animal rates.
 - **Respawn and player data.** Bots reuse their names, so player data (position, inventory, statistics such as `time_since_rest`) persists across episodes unless reset. The harness (M2) should reset it.
 - **The `allow-flight=false` kick.** If the lag shim triggers vanilla's "flying" kick, `allow-flight` may need to change. It does not affect mechanics.
-- **Everything [mem] above:** key names in `server.properties`, RCON reply formats, Chunky commands, `/clone` and force-load behaviour, Windows Firewall precedence. Each is checked by a step in this guide the first time it runs.
+- **Everything still [mem] above:** Chunky's commands, `/clone` and force-load behaviour, Windows Firewall precedence and the generator's output folder. Each is checked by a step in this guide the first time it runs. The key names in `server.properties` and the RCON reply formats were confirmed on 2026-10-19.

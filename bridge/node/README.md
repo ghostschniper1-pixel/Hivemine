@@ -94,7 +94,7 @@ The script names the test files with a glob because Node 22's `--test` takes fil
 - the per-bot check refuses a registry that is unpatched, partly patched or for another version;
 - the patch refuses data it was not written for.
 
-`bridge/package.json` declares prismarine-block 1.23.0 and prismarine-registry 1.12.0, the versions the lock already resolved under Mineflayer, because `patches.js` and this test load them directly; declaring them changed nothing in the lock but its root entry.
+`bridge/package.json` does not declare prismarine-block or prismarine-registry. `patches.js` and this test load them from Mineflayer's folder (`patches.packageDir`), never by bare name, so they get the copies the bots use; `package-lock.json` pins those (1.23.0 and 1.12.0), and the test above fails if Mineflayer ever resolves other versions.
 
 The fixture comes from the reference mechanics (`hivemind.sim.ref.mechanics`), never from Node. Regenerate it from the repository root after any change to the mechanics, the rules or the v1 tool classes:
 

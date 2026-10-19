@@ -290,8 +290,10 @@ def glob_reach_problem(pattern: str, base: str, root: Path) -> str | None:
     """Why the names a glob pattern matches might lie outside ``root``, or None when they cannot.
 
     ``base`` is the folder the pattern is taken from ("" for the working directory). A backslash
-    is read both ways: as a path separator (Windows) and as an escape (other systems)."""
-    readings = {pattern.replace("\\", "/"), re.sub(r"\\(.)", r"\1", pattern, flags=re.S)}
+    is read both ways: as a path separator (Windows), and as an escape of the character after it
+    (glob libraries; only dots, separators and glob syntax are unescaped, which is what can change
+    where a pattern reaches, so that a Windows path such as C:\\Users keeps its meaning)."""
+    readings = {pattern.replace("\\", "/"), re.sub(r"\\([.*?\[\]{},/\\])", r"\1", pattern)}
     for reading in sorted(readings):
         expansions = _brace_expansions(reading)
         if isinstance(expansions, str):
