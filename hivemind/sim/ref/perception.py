@@ -5,22 +5,28 @@ blocks. The bridge runs the same functions on the blocks Mineflayer holds (bridg
 7.2), so the simulator and the real game perceive alike. Usage::
 
     from hivemind.sim.ref.perception import perceive, voxel_window, panorama, PRESETS, WindowCache
-    p = perceive(world, feet, tick, preset="M", agent=slot)   # at a decision: window + panorama
+    p = perceive(world, agent=slot, preset="M")   # at a decision: window, panorama, F3 group
     p.window.classes        # uint8 (21, 9, 21) [x, y, z]: class ids, 255 = unseen
     p.panorama.block        # int16 (24, 96) [row, column]: class of the block hit (M only)
     p.sightings.items       # resource blocks seen, nearest 8 per class (for the notebook)
+    p.f3.block, p.f3.time_word                                # the F3 group (debug_info.py)
     perceive(world, feet, tick, panorama=False, cache=cache)  # in-macro recasts (RaySchedule)
     perceive(world, feet, tick, xray=True)                    # ablation only: flagged ``xray``
 
 Definitions (DESIGN.md 6.1, draft 0.5: surface-only vision):
 
-- **See-through cells:** classes with the ``transparent`` flag (air, glass, leaves, water,
-  torches, short grass, ...), except ``barrier`` and ``lava`` (and ``unseen``). The barrier
-  stands for the world edge (DESIGN.md 11.3 walls the evaluation areas with it), and nothing
-  beyond it can look back in; lava is flagged transparent in the data, but no player sees
-  through a lava pool [mem]. The bridge's world mirror must be clipped to the evaluation area
-  with barrier outside (bridge/PROTOCOL.md 7.2). Above y 191 the world reads as air
-  (``World.get``), as in the game. Every other class is *opaque* here.
+- **See-through cells** (``see_through_table``, perception's own table): classes with the data's
+  ``transparent`` flag (air, glass, leaves, water, torches, short grass, ...), except ``barrier``,
+  ``lava``, ``unseen`` and every class with a member in ``SIGHT_BLOCKING``. The flag is a
+  rendering flag (the block does not occlude a whole cube), so it also marks doors, trapdoors,
+  beds, cauldrons, shulker boxes and other blocks that hide what lies behind them; those are
+  opaque here, and so is a class that merges them with see-through blocks (iron bars with iron
+  doors, slime blocks with decorated pots), which is always honest. The barrier stands for the
+  world edge (DESIGN.md 11.3 walls the evaluation areas with it), and nothing beyond it can look
+  back in; lava is flagged transparent in the data, but no player sees through a lava pool
+  [mem]. The bridge's world mirror must be clipped to the evaluation area with barrier outside
+  (bridge/PROTOCOL.md 7.2). Above y 191 the world reads as air (``World.get``), as in the game.
+  Every other class is *opaque* here.
 - **Seen:** a cell is seen when a straight segment from the eye (feet + 1.62 [mem]) to it crosses
   only see-through cells before reaching it: to the centre of a see-through cell, or to the
   centre of a face of an opaque cell that points toward the eye (a face whose outward normal n
@@ -62,11 +68,16 @@ Definitions (DESIGN.md 6.1, draft 0.5: surface-only vision):
 
   The light of a pixel is the raw sky light and block light of the cell *in front of the face*:
   the last cell the ray crossed before the block (or the cell where it met the entity's box, or
-  where it ended when nothing was hit). With the head inside an opaque cell, every pixel shows
-  that cell at distance 0 with no face and that cell's light: the eye-cell exception, the
-  in-wall view of the game, and the honest case (nothing beyond is seen).
+  where it ended when nothing was hit).
+
+  The rule "the eye's own cell is never a hit" (DESIGN.md 6.1) is for a see-through eye cell
+  (water, short grass, a cobweb): the ray starts inside it and looks out. DESIGN.md does not say
+  what a head inside an opaque cell (a fallen block of sand, lava) sees. Here every pixel then
+  shows that cell at distance 0 with no face and that cell's light [design]: it is what the game
+  draws over the whole screen (the in-wall overlay [mem]), and the window shows nothing either,
+  since no segment leaves the eye's cell. Casting past it would show what the eye cannot see.
 - **Resource sightings** (``sightings``): the resource blocks (``concepts.resource``) among the
-  seen window cells and the panorama's block hits (up to 64 blocks [est]), by cell, sorted by
+  seen window cells and the panorama's block hits (entered within 64 blocks [est]), by cell, sorted by
   distance from the eye to the cell centre (ties: x, y, z), the nearest ``PER_CLASS`` = 8 [est] of
   each class (the notebook keeps 48 places, DESIGN.md 6.3). Preset S has no panorama, so its
   sightings come from the window alone.
@@ -81,26 +92,30 @@ Definitions (DESIGN.md 6.1, draft 0.5: surface-only vision):
 
 Honesty: in normal mode a ray stops at the first opaque cell, so nothing here reads a cell no
 straight segment from the eye reaches through see-through cells, except to learn that it is not
-see-through. Changing such cells into other opaque classes that block light and emit none
-therefore never changes the window, the panorama or the sightings (``tests/test_perception.py``
-checks it from the surface and from inside caves, around walls, sealed caves and floors). Light
-is the exception the design states: a light source out of sight changes the light of seen cells.
+see-through, and no entity box is entered beyond the first block a ray meets. Changing such cells
+into other opaque classes that block light and emit none, or putting entities where no ray
+reaches, therefore never changes the window, the panorama, the sightings or the F3 group
+(``tests/test_perception.py`` checks it in adversarial scenes and in generated cave worlds, from
+the surface and from inside caves; ``tests/test_debug_info.py`` checks the look ray). Light is
+the exception the design states: a light source out of sight changes the light of seen cells.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import numpy as np
 
+from hivemind.lang.world_words import FACES as WORLD_FACES
 from hivemind.sim.ref.world import AIR, MAX_LIGHT, UNSEEN, World
 
 if TYPE_CHECKING:
     from hivemind.rules.classes import Concepts
+    from hivemind.sim.ref.debug_info import DebugInfo
 
 EYE_HEIGHT = 1.62  # [mem] standing player eye height
 ENTITY_RANGE = 32.0  # DESIGN.md 6.2: the entity table lists visible entities within 32 blocks
@@ -113,12 +128,26 @@ DEFAULT_BOX = (0.6, 1.8)  # [est] width, height for entity classes whose size th
 # Neighbour offsets in a fixed order: -x, +x, -y, +y, -z, +z (``exposed_faces`` indexes these).
 FACES = np.array([(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)], np.int64)
 
-# The face words (DESIGN.md 6.2 order; the same as hivemind.lang.world_words.FACE_WORDS) and their
-# outward normals: north is -z, east +x [mem].
-FACE_WORDS: tuple[str, ...] = ("top", "bottom", "north", "south", "east", "west")
-FACE_NORMALS = np.array([(0, 1, 0), (0, -1, 0), (0, 0, -1), (0, 0, 1), (1, 0, 0), (-1, 0, 0)], np.int64)
-# _ENTERED[axis][step > 0]: the face a ray enters crossing into a cell along axis, normal = -step.
-_ENTERED = np.array([[4, 5], [0, 1], [3, 2]], np.int8)  # x: east, west; y: top, bottom; z: south, north
+# The face words and their outward normals, from the one table the observation builder also
+# reads (hivemind.lang.world_words: top, bottom, north, south, east, west; north is -z [mem]).
+FACE_WORDS: tuple[str, ...] = tuple(f.name for f in WORLD_FACES)
+FACE_NORMALS = np.array([f.normal for f in WORLD_FACES], np.int64)
+
+
+def _entered_table() -> np.ndarray:
+    """``[axis][step > 0]``: the index of the face a ray enters crossing into a cell along
+    ``axis`` in direction ``step`` (the face whose outward normal is -step along that axis)."""
+    out = np.zeros((3, 2), np.int8)
+    for axis in range(3):
+        for positive in (0, 1):
+            normal = [0, 0, 0]
+            normal[axis] = -1 if positive else 1
+            out[axis, positive] = [tuple(n) for n in FACE_NORMALS.tolist()].index(tuple(normal))
+    out.setflags(write=False)
+    return out
+
+
+_ENTERED = _entered_table()  # x: east, west; y: top, bottom; z: south, north
 
 
 def entered_face(axis: int, step: int) -> int:
@@ -174,9 +203,10 @@ class PerceptionConfig:
         return (2 * self.half_xz + 1, 2 * self.half_y + 1, 2 * self.half_xz + 1)
 
 
+DEFAULT_PANORAMA = PanoramaConfig()
 PRESETS: dict[str, PerceptionConfig] = {
     "S": PerceptionConfig("S", 7, 3, None),  # DESIGN.md 6.1: 15 x 15 x 7, no panorama
-    "M": PerceptionConfig("M", 10, 4, PanoramaConfig()),  # DESIGN.md 6.1: 21 x 21 x 9 and the panorama
+    "M": PerceptionConfig("M", 10, 4, DEFAULT_PANORAMA),  # DESIGN.md 6.1: 21 x 21 x 9 and the panorama
 }
 DEFAULT_PRESET = "M"  # DESIGN.md 6.4: M is the default
 
@@ -191,13 +221,56 @@ def config_of(preset: str | PerceptionConfig) -> PerceptionConfig:
 # ---------------------------------------------------------------------------
 
 
-def see_through_table(concepts: Concepts) -> np.ndarray:
-    """bool[256]: the classes a line of sight passes (transparent, except barrier, lava and unseen)."""
+_WOODS = ("oak", "spruce", "birch", "jungle", "acacia", "cherry", "dark_oak", "mangrove", "bamboo", "crimson",
+          "warped")  # [mem] the wood sets with doors, trapdoors and signs
+_COLOURS = ("white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray", "light_gray", "cyan",
+            "purple", "blue", "brown", "green", "red", "black")  # [mem] the 16 dye colours
+_COPPER = tuple(f"{wax}{age}copper" for wax in ("", "waxed_") for age in ("", "exposed_", "weathered_", "oxidized_"))
+
+# Vanilla blocks that minecraft-data flags ``transparent`` but that hide what lies behind them.
+# That flag is a rendering flag: the block does not occlude a whole cube, so the renderer draws
+# its neighbours' faces. It is not "a player sees through it". These members block sight here
+# [mem], and a class with any of them is opaque (treating a mixed class as opaque is always
+# honest):
+# - panels across a whole side or a whole floor or ceiling: doors and trapdoors, open or closed
+#   (one class holds both states), of wood, iron and copper; signs and banners (a board or cloth
+#   over at least half of a side);
+# - basins: cauldrons and hoppers (walls on every side, a floor across the cell);
+# - bulky shapes over most of the cell: shulker boxes, decorated pots, sniffer, dragon and turtle
+#   eggs, beds (9/16 high over the whole footprint), campfires (7/16), the beacon (core and base),
+#   chorus plants and flowers, the vault, pointed dripstone (up to 12/16 wide), azaleas (a slab
+#   of leaves over the top half);
+# - cells drawn opaque: the end portal and end gateway, and a moving piston (a block in motion).
+SIGHT_BLOCKING: frozenset[str] = frozenset({
+    *(f"{w}_door" for w in _WOODS), "iron_door", *(f"{c}_door" for c in _COPPER),
+    *(f"{w}_trapdoor" for w in _WOODS), "iron_trapdoor", *(f"{c}_trapdoor" for c in _COPPER),
+    *(f"{w}_{kind}" for w in _WOODS for kind in ("sign", "wall_sign", "hanging_sign", "wall_hanging_sign")),
+    *(f"{c}_{kind}" for c in _COLOURS for kind in ("banner", "wall_banner")),
+    "cauldron", "water_cauldron", "lava_cauldron", "powder_snow_cauldron", "hopper",
+    "shulker_box", *(f"{c}_shulker_box" for c in _COLOURS), *(f"{c}_bed" for c in _COLOURS),
+    "decorated_pot", "sniffer_egg", "dragon_egg", "turtle_egg", "campfire", "soul_campfire", "beacon",
+    "chorus_plant", "chorus_flower", "vault", "pointed_dripstone", "azalea", "flowering_azalea",
+    "end_portal", "end_gateway", "moving_piston",
+})
+
+
+@lru_cache(maxsize=8)
+def _see_through_for(concepts: Concepts) -> np.ndarray:
     see = concepts.transparent.copy()
-    see[concepts.block_class("barrier").id] = False
+    for c in concepts.block_classes:
+        if see[c.id] and any(m in SIGHT_BLOCKING for m in c.members):
+            see[c.id] = False
+    see[concepts.block_class("barrier").id] = False  # the world edge: nothing beyond it looks back in
     see[concepts.block_class("lava").id] = False  # [mem] nobody sees through lava
     see[UNSEEN] = False
+    see.setflags(write=False)
     return see
+
+
+def see_through_table(concepts: Concepts) -> np.ndarray:
+    """bool[256]: the classes a line of sight passes (module docstring): ``transparent`` in the
+    data, except classes with a ``SIGHT_BLOCKING`` member, barrier, lava and unseen."""
+    return _see_through_for(concepts).copy()
 
 
 @dataclass(frozen=True)
@@ -223,7 +296,7 @@ def _tables_for(concepts: Concepts) -> _Tables:
     for c in concepts.entity_classes:
         if c.width is not None and c.height is not None:
             width[c.id], height[c.id] = c.width, c.height
-    return _Tables(see_through_table(concepts), concepts.resource.copy(), water, concepts.block_class("lava").id,
+    return _Tables(_see_through_for(concepts), concepts.resource.copy(), water, concepts.block_class("lava").id,
                    concepts.entity_class("player").id, concepts.entity_class("item").id, width, height)
 
 
@@ -417,7 +490,7 @@ def seen_cells(world: World, eye: Sequence[float], origin: Sequence[int],
     ok = trace_rays(see, lo, eye_arr, np.concatenate(ends), np.concatenate(lasts))
     seen = np.zeros(len(cells), bool)
     seen[owner[ok]] = True
-    return seen.reshape(tuple(int(v) for v in s)), int(len(owner))
+    return seen.reshape(tuple(int(v) for v in s)), len(owner)
 
 
 @dataclass(frozen=True, eq=False)
@@ -454,7 +527,9 @@ class WindowCache:
     could change the window has changed (``World.changes_since``): any cell with x and z within
     16 of the window and y at most 16 below it. That box holds every cell the window's classes,
     segments and light read (block light travels at most 15 cells, sky light comes from above).
-    The output equals a fresh call. Keep one per agent."""
+    The output equals a fresh call. Keep one per agent. Worlds are told apart by
+    ``World.serial`` (a copy, such as a reset's copy of the pristine world, is another world) and
+    ``World.generation`` (a ``load``), never by ``id()``, which CPython reuses."""
 
     LIGHT_MARGIN = 16  # [design] MAX_LIGHT + 1 cells around the window
 
@@ -468,7 +543,7 @@ class WindowCache:
             xray: bool = False) -> VoxelWindow:
         cfg = config_of(config)
         feet_t = (float(feet[0]), float(feet[1]), float(feet[2]))
-        key = (id(world), world.generation, feet_t, cfg, xray)
+        key = (world.serial, world.generation, feet_t, cfg, xray)
         if key == self._key and self._result is not None and self._unchanged(world, self._result, cfg):
             self._cursor = world.change_count
             self.hits += 1
@@ -480,7 +555,7 @@ class WindowCache:
     def _unchanged(self, world: World, win: VoxelWindow, cfg: PerceptionConfig) -> bool:
         try:
             changes = world.changes_since(self._cursor)
-        except ValueError:  # the log was trimmed past our cursor
+        except ValueError:  # the log was trimmed past our cursor (or the cursor is not this world's)
             return False
         m = self.LIGHT_MARGIN
         x0, y0, z0 = win.origin
@@ -509,6 +584,16 @@ class EntityBoxes(_ArrayEq):
 
     def __len__(self) -> int:
         return len(self.cls)
+
+    def without_agent(self, agent: int | None) -> EntityBoxes:
+        """These boxes without agent slot ``agent``'s (the observer's own box), in the same order."""
+        if agent is None:
+            return self
+        keep = self.agent != agent
+        if keep.all():
+            return self
+        return EntityBoxes(self.lo[keep], self.hi[keep], self.cls[keep], self.agent[keep], self.source[keep],
+                           self.slot[keep])
 
 
 def entity_boxes(world: World, *, exclude_agent: int | None = None, items: bool = True) -> EntityBoxes:
@@ -540,12 +625,16 @@ def entity_boxes(world: World, *, exclude_agent: int | None = None, items: bool 
                        slot.astype(np.int16))
 
 
-def ray_box_entry(eye: Sequence[float], dirs: np.ndarray, lo: np.ndarray, hi: np.ndarray
-                  ) -> tuple[np.ndarray, np.ndarray]:
+def ray_box_entry(eye: Sequence[float], dirs: np.ndarray, lo: np.ndarray, hi: np.ndarray, *,
+                  inside_hits: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """Slab test: for rays from ``eye`` along ``dirs`` (n, 3) and boxes ``lo``/``hi`` (m, 3), the t
     at which each ray enters each box (n, m; inf when it misses, when the box is behind the eye or
     when the box contains the eye) and the slab axis of that entry (largest entry t; ties x, y,
-    z). t is in units of the direction's length."""
+    z). t is in units of the direction's length.
+
+    ``inside_hits``: a box that contains the eye (``lo <= eye < hi`` on every axis, the game's
+    ``AABB.contains`` [mem]) counts as entered at t = 0 instead, as the game's crosshair pick
+    does (``ProjectileUtil.getEntityHitResult`` [mem]); the F3 group uses it, the panorama not."""
     eye = np.asarray(eye, float)
     n, m = len(dirs), len(lo)
     if m == 0 or n == 0:
@@ -565,7 +654,11 @@ def ray_box_entry(eye: Sequence[float], dirs: np.ndarray, lo: np.ndarray, hi: np
     t_near = near.max(axis=2)
     t_far = far.min(axis=2)
     hit = (t_near <= t_far) & (t_near >= 0.0)
-    return np.where(hit, t_near, np.inf), axis
+    t = np.where(hit, t_near, np.inf)
+    if inside_hits:
+        contains = np.all((lo <= eye[None, :]) & (eye[None, :] < hi), axis=1)
+        t[:, contains] = 0.0
+    return t, axis
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +667,7 @@ def ray_box_entry(eye: Sequence[float], dirs: np.ndarray, lo: np.ndarray, hi: np
 
 
 @lru_cache(maxsize=8)
-def panorama_directions(cfg: PanoramaConfig = PanoramaConfig()) -> np.ndarray:
+def panorama_directions(cfg: PanoramaConfig = DEFAULT_PANORAMA) -> np.ndarray:
     """float64 (rows, columns, 3) unit vectors of the pixels' centre rays (module docstring). This
     table is the definition; the C++ core loads it rather than recomputing sines."""
     az = np.radians((np.arange(cfg.columns) + 0.5) * cfg.column_step)  # clockwise from north
@@ -620,8 +713,9 @@ class Panorama(_ArrayEq):
 def panorama(world: World, eye: Sequence[float], config: PanoramaConfig | None = None, *,
              exclude_agent: int | None = None, boxes: EntityBoxes | None = None) -> Panorama:
     """Cast the panorama from ``eye`` (module docstring). ``exclude_agent``: the observer's own
-    agent slot (its box is never a hit); ``boxes``: precomputed ``entity_boxes``."""
-    cfg = config if config is not None else PanoramaConfig()
+    agent slot (its box is never a hit, also when it is among ``boxes``); ``boxes``: precomputed
+    ``entity_boxes``, which may be shared by every observer."""
+    cfg = config if config is not None else DEFAULT_PANORAMA
     t = tables(world)
     eye_arr = np.asarray(eye, float)
     dirs = panorama_directions(cfg).reshape(-1, 3)
@@ -639,16 +733,15 @@ def panorama(world: World, eye: Sequence[float], config: PanoramaConfig | None =
                         np.full(shape, np.float32(blk[0]) / np.float32(MAX_LIGHT), np.float32),
                         np.broadcast_to(ec.astype(np.int32), (*shape, 3)).copy(), 0)
     max_t = float(cfg.range)
-    reach = int(math.ceil(max_t)) + 2
-    y_lo = int(math.floor(eye_arr[1] + min(0.0, float(dirs[:, 1].min())) * max_t)) - 2
-    y_hi = int(math.floor(eye_arr[1] + max(0.0, float(dirs[:, 1].max())) * max_t)) + 3
+    reach = math.ceil(max_t) + 2
+    y_lo = math.floor(eye_arr[1] + min(0.0, float(dirs[:, 1].min())) * max_t) - 2
+    y_hi = math.floor(eye_arr[1] + max(0.0, float(dirs[:, 1].max())) * max_t) + 3
     base = np.array([ec[0] - reach, y_lo, ec[2] - reach], np.int64)
     top = np.array([ec[0] + reach + 1, y_hi, ec[2] + reach + 1], np.int64)
     classes = world.region(int(base[0]), int(base[1]), int(base[2]), int(top[0]), int(top[1]), int(top[2]))
 
     # Entities: the nearest box entry per ray, within range.
-    if boxes is None:
-        boxes = entity_boxes(world, exclude_agent=exclude_agent)
+    boxes = entity_boxes(world, exclude_agent=exclude_agent) if boxes is None else boxes.without_agent(exclude_agent)
     t_box, box_axis = ray_box_entry(eye_arr, dirs, boxes.lo, boxes.hi)
     if len(boxes):
         first = np.argmin(t_box, axis=1)  # ties: the first box in ``entity_boxes`` order
@@ -834,7 +927,7 @@ def xray_sightings(world: World, eye: Sequence[float], tick: int = 0, *, sight_r
     resource = tables(world).resource
     eye_arr = np.asarray(eye, float)
     ec = np.floor(eye_arr).astype(np.int64)
-    r = int(math.ceil(sight_range)) + 1
+    r = math.ceil(sight_range) + 1
     base = ec - r
     region = world.region(int(base[0]), int(base[1]), int(base[2]),
                           int(ec[0] + r + 1), int(ec[1] + r + 1), int(ec[2] + r + 1))
@@ -869,8 +962,10 @@ class RaySchedule:
 
 @dataclass(frozen=True)
 class Perception:
-    """One perception call: the window, the panorama (preset M at a decision, else None) and the
-    sightings for the notebook."""
+    """One perception call: the window, the panorama (preset M at a decision, else None), the
+    sightings for the notebook and the F3 group (``debug_info.DebugInfo``, when the call names
+    the observer's agent slot, else None). ``xray`` marks the ablation; such a result must never
+    reach an agent that is evaluated or deployed (DESIGN.md 6.1)."""
 
     tick: int
     feet: tuple[float, float, float]
@@ -880,18 +975,36 @@ class Perception:
     panorama: Panorama | None
     sightings: Sightings
     xray: bool
+    f3: DebugInfo | None = None
 
 
-def perceive(world: World, feet: Sequence[float], tick: int | None = None, *,
+def perceive(world: World, feet: Sequence[float] | None = None, tick: int | None = None, *,
              preset: str | PerceptionConfig = DEFAULT_PRESET, agent: int | None = None, panorama: bool = True,
-             xray: bool = False, cache: WindowCache | None = None, per_class: int | None = PER_CLASS) -> Perception:
+             f3: bool = True, xray: bool = False, cache: WindowCache | None = None,
+             per_class: int | None = PER_CLASS) -> Perception:
     """The window (through ``cache`` when one is given), the panorama when ``panorama`` is set and
-    the preset has one (pass False for in-macro recasts), and the sightings from both.
-    ``agent``: the observer's slot, whose own box the panorama skips. ``xray``: the ablation
-    (module docstring), flagged in every part of the result."""
+    the preset has one (pass False for in-macro recasts), the sightings from both, and the F3
+    group when ``agent`` is given and ``f3`` is set.
+
+    ``agent``: the observer's slot. Its own box is never a panorama hit, its feet are the default
+    for ``feet``, and the F3 group is computed for it (``feet`` must then be where the slot
+    stands, so that the window and the F3 group describe one viewpoint). ``tick`` defaults to
+    ``world.tick``. ``xray``: the ablation (module docstring), flagged in the result, its window
+    and its sightings; the panorama and the F3 group are the same as without it."""
     cfg = config_of(preset)
     tick = world.tick if tick is None else tick
+    if feet is None:
+        if agent is None:
+            raise ValueError("perceive needs the feet position or the observer's agent slot")
+        feet = world.agents.pos[agent]
     feet_t = (float(feet[0]), float(feet[1]), float(feet[2]))
+    group = None
+    if agent is not None and f3:
+        from hivemind.sim.ref.debug_info import debug_info  # debug_info imports this module
+
+        if feet_t != tuple(float(v) for v in world.agents.pos[agent]):
+            raise ValueError(f"feet {feet_t} are not where agent slot {agent} stands")
+        group = debug_info(world, agent)
     eye = eye_of(feet_t)
     window = (cache.get(world, feet_t, cfg, xray=xray) if cache is not None
               else voxel_window(world, feet_t, cfg, xray=xray))
@@ -902,4 +1015,4 @@ def perceive(world: World, feet: Sequence[float], tick: int | None = None, *,
         seen = xray_sightings(world, eye, tick, per_class=per_class)
     else:
         seen = sightings(world.concepts, eye, tick, window, pano, per_class=per_class)
-    return Perception(int(tick), feet_t, eye, cfg.name, window, pano, seen, xray)
+    return Perception(int(tick), feet_t, eye, cfg.name, window, pano, seen, xray, group)

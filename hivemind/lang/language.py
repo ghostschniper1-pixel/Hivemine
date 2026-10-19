@@ -279,6 +279,8 @@ class Language:
         relation, place_kind or equip_slot. Biomes are named by their class name
         (``birch_forest`` -> ``birch forest``); faces (``top`` .. ``west``) and times of day
         (``day``, ``dusk``, ``night``, ``dawn``) by their word (``hivemind.lang.world_words``).
+        The causes are ``damage``, ``message`` and every hostile entity class, which has its
+        entity phrase (``phrase("cause", "cave_spider")`` -> ('cave', 'spider')).
         Verbs, result codes, chat intents and goals have no phrase of their own: they are named
         by their templates (``templates``, ``result_words``)."""
         try:
@@ -330,8 +332,8 @@ class Language:
             return self._phrase["pattern"][v]
         if domain == "container":
             return self._phrase["container"][v]
-        if domain == "cause":
-            return self._phrase["cause"][v] if v in self._phrase["cause"] else self._phrase["entity"][v]
+        if domain == "cause":  # damage, message, or a hostile entity class (its entity phrase)
+            return self._phrase["cause"][v]
         if domain in G.INT_DOMAINS:
             return (str(v),)
         raise KeyError(f"unknown domain {domain!r}")

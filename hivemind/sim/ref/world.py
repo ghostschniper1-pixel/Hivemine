@@ -24,14 +24,19 @@ light) come from ``load_concepts()`` and are shared by perception and the nav gr
 **Change tracking.** ``set`` appends a ``BlockChange`` to a log. Consumers (nav caches,
 perception caches, the viewer) keep a cursor: ``changes = world.changes_since(cursor)``, then
 ``cursor = world.change_count``. ``load`` (bulk replace, used by worldgen and resets) clears the
-log and bumps ``generation`` so consumers know to rebuild.
+log and bumps ``generation`` so consumers know to rebuild. A cursor is only meaningful for the
+world (and generation) it came from: ``changes_since`` raises for a cursor past ``change_count``
+rather than reading it as "no changes". Caches tell worlds apart by ``serial``, a number unique
+to each ``World`` object in the process (a copy gets a new one), never by ``id()``, which
+CPython reuses once an object is freed.
 
 **Light** (DESIGN.md 4.2: approximate) uses each class's *light filter*: minecraft-data's
 ``filter_light`` of its members (``light_filter_table``), the game's own light data. It is 0 for
 air, glass, torches, plants, snow layers, slabs, stairs, fences, carpets, chests, farmland and dirt
 paths; 1 for water, lava, leaves, ice and cobwebs; 15 for full blocks and tinted glass. The
-rendering flag ``transparent`` is not used for light (perception uses it for sight): a snow
-layer is not transparent but lets all light through. Fallback classes whose members differ take
+rendering flag ``transparent`` is not used for light (perception builds its see-through table
+from it, ``perception.see_through_table``, which also takes out doors, beds and other blocks
+that hide what is behind them): a snow layer is not transparent but lets all light through. Fallback classes whose members differ take
 the filter of most of their states.
 
 - Block light is a 4-bit flood from light-emitting classes: light entering a cell with filter
@@ -84,6 +89,7 @@ index is ``floor(x / 16)``; the world's chunks start at x = z = 0.
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -114,6 +120,7 @@ CHESTS_PER_AGENT = 8  # [design] DESIGN.md 4.4: from M9 chests <= 8 per agent (c
 ENTITY_CAPACITY: dict[str, int] = {"agents": 40, "mobs": 32, "items": 64, "furnaces": 16,
                                    "chests": CHESTS_PER_AGENT * 40}
 CHEST_SLOTS = 27  # [mem] a single chest holds 27 stacks
+_WORLD_SERIALS = itertools.count(1)  # World.serial: one number per World object in the process
 
 
 class SlotsFull(RuntimeError):
@@ -263,7 +270,8 @@ class World:
         self.size_x, self.size_z = int(size_x), int(size_z)
         self.barrier = c.block_class("barrier").id
         # Class property tables (indexed by class id), shared with perception and nav.
-        self.transparent: np.ndarray = c.transparent  # rendering flag (sight), not used for light
+        self.transparent: np.ndarray = c.transparent  # rendering flag, not used for light; not sight either
+        # (perception.see_through_table is the sight table)
         self.light_filter: np.ndarray = light_filter_table(c)
         self.emission: np.ndarray = c.light
         self.blocks = np.zeros((self.size_x, HEIGHT, self.size_z), np.uint8)
@@ -272,6 +280,7 @@ class World:
         self.biome_map = np.full((self.size_x, self.size_z), c.biome(DEFAULT_BIOME).id, np.uint8)
         self.tick = 0
         self.day_time = int(day_time)
+        self.serial = next(_WORLD_SERIALS)  # unique per World object (module docstring)
         self.generation = 0
         self._log: list[BlockChange] = []
         self._log_offset = 0
@@ -289,6 +298,11 @@ class World:
 
     def __repr__(self) -> str:
         return f"World({self.size_x}x{self.size_z}, tick={self.tick}, day_time={self.day_time})"
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Unpickling, ``copy.copy`` and ``copy.deepcopy`` make another object: a new ``serial``."""
+        self.__dict__.update(state)
+        self.serial = next(_WORLD_SERIALS)
 
     # -- geometry ---------------------------------------------------------------------
 
@@ -376,9 +390,12 @@ class World:
         return self._log_offset + len(self._log)
 
     def changes_since(self, cursor: int) -> list[BlockChange]:
-        """Changes numbered ``cursor`` and later. Raises if they were trimmed away."""
+        """Changes numbered ``cursor`` and later. Raises if they were trimmed away, or if the
+        cursor lies past ``change_count`` (it came from another world or generation)."""
         if cursor < self._log_offset:
             raise ValueError(f"changes before {self._log_offset} were trimmed (asked for {cursor})")
+        if cursor > self.change_count:
+            raise ValueError(f"cursor {cursor} is past this world's {self.change_count} changes")
         return self._log[cursor - self._log_offset:]
 
     def trim_changes(self, cursor: int) -> None:
@@ -579,6 +596,7 @@ class World:
         """A deep copy (resets copy a pristine world, DESIGN.md 4.4); the change log starts empty."""
         w = World.__new__(World)
         w.__dict__.update(self.__dict__)
+        w.serial = next(_WORLD_SERIALS)  # another object: caches must not take it for this one
         w.blocks = self.blocks.copy()
         w.block_light = self.block_light.copy()
         w.heightmap = self.heightmap.copy()

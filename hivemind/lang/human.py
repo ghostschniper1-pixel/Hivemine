@@ -10,11 +10,16 @@
 1. lower case; contractions (``where's`` -> ``where is``, ``i've`` -> ``i have``, ``gimme`` ->
    ``give me``); punctuation removed (a leading minus on a number is kept).
 2. Numbers: digits, number words (``one`` .. ``twenty``, ``thirty-two``, ``sixty four``),
-   ``a dozen`` (12), ``a couple`` (2), ``a stack`` (64), ``half a stack`` (32), ``2 stacks``
-   (128). A number that is not a number token becomes the nearest one (ties down, above 64 is
-   64). ``a``/``an`` become ``1`` only before an item (or a resource block: ``mine an iron
-   ore``); elsewhere they are unknown words. ``1st`` .. ``16th`` and ``first``/``closest`` are
-   the ordinals (``first`` and ``closest`` are ``nearest``: rank 1 by distance).
+   ``a dozen`` (12), ``a couple`` (2). A number that is not a number token becomes the nearest
+   one (ties down, above 64 is 64). ``a``/``an`` become ``1`` only before an item (or a
+   resource block: ``mine an iron ore``); elsewhere they are unknown words. ``1st`` .. ``16th``
+   and ``first``/``closest`` are the ordinals (``first`` and ``closest`` are ``nearest``: rank
+   1 by distance). ``a stack``, ``half a stack`` and ``2 stacks`` (or ``two stacks``) count
+   items of the item named after them, by its stack size (the vocabulary's item rows, from the
+   rules data): ``a stack of torches`` is 64, ``a stack of eggs`` 16, ``half a stack of eggs``
+   8. Where the words after it name no item, or an item that does not stack (``a stack of
+   iron pickaxes``), the count is ``<unk>`` and the text gives no reading; ``mine``, which
+   counts blocks, takes no stacks.
 3. Synonyms, each true of what it maps to (``SYNONYMS``, ``PHRASE_SYNONYMS``): ``pick`` ->
    ``pickaxe``, ``workbench`` -> ``crafting table``, ``wood`` -> ``log`` (the log class is
    every log and six-sided wood block; only as a noun: in ``wood planks`` it stays unknown),
@@ -208,8 +213,16 @@ class Tok:
 
     raw: str
     word: str
-    kind: str  # "word" (vocabulary), "alias" (only in member names), "num", "article", "filler", "unknown"
+    kind: str  # "word" (vocabulary), "alias" (only in member names), "num", "stack", "article", "filler", "unknown"
     num: int | None = None
+    stacks: float | None = None  # kind "stack": how many stacks ("half a stack" 0.5, "2 stacks" 2)
+
+
+@dataclass(frozen=True)
+class _Stacks:
+    """An item count given in stacks, until the item it counts is read (``HumanReader._stack_count``)."""
+
+    stacks: float
 
 
 @dataclass(frozen=True)
@@ -233,6 +246,14 @@ class HumanMessage:
 _IRREGULAR = {"foot": "feet", "man": "men", "mouse": "mice", "tooth": "teeth", "goose": "geese", "cactus": "cacti",
               "child": "children", "person": "people"}
 _VOWELS = set("aeiou")
+# The nouns whose "-ves" plural comes from "-f" or "-fe" (leaf -> leaves), as word endings so a
+# compound matches too (bookshelves, dripleaves). Every other "-ves" word is the regular plural
+# of a "-ve" word (caves, graves, olives): guessing "-f"/"-fe" for it would invent unrelated
+# words (caves -> "cafe"), and guessing "-ve" for these would too (leaves -> "leave").
+_F_PLURAL_ENDINGS = {"leaves": "leaf", "wolves": "wolf", "knives": "knife", "wives": "wife", "shelves": "shelf",
+                     "halves": "half", "loaves": "loaf", "thieves": "thief", "calves": "calf", "elves": "elf",
+                     "selves": "self", "scarves": "scarf", "hooves": "hoof", "dwarves": "dwarf", "sheaves": "sheaf"}
+_F_PLURAL_WORDS = {"lives": "life"}  # whole words only: "olives" is not "olife"
 
 
 def plurals(w: str) -> set[str]:
@@ -265,7 +286,13 @@ def singulars(w: str) -> set[str]:
     if w.endswith("ies"):
         out.add(w[:-3] + "y")
     elif w.endswith("ves"):
-        out |= {w[:-3] + "f", w[:-3] + "fe"}
+        end = next((e for e in _F_PLURAL_ENDINGS if w.endswith(e)), None)
+        if w in _F_PLURAL_WORDS:
+            out.add(_F_PLURAL_WORDS[w])
+        elif end is not None:
+            out.add(w[:-len(end)] + _F_PLURAL_ENDINGS[end])
+        else:
+            out.add(w[:-1])  # caves -> cave
     elif w.endswith(("oes", "ches", "shes", "xes", "sses", "zes")):
         out.add(w[:-2])
     elif w.endswith("s") and not w.endswith(("ss", "us", "is")):
@@ -408,21 +435,25 @@ class HumanReader:
                 toks.append(Tok(w, w.strip("x"), "num", int(w.strip("x"))))
                 i += 1
                 continue
-            if re.fullmatch(r"-?\d+", w):
-                n = int(w)
-                if nxt in ("stack", "stacks"):
-                    toks.append(Tok(f"{w} {nxt}", str(n * 64), "num", n * 64))
-                    i += 2
-                    continue
-                toks.append(Tok(w, w, "num", n))
-                i += 1
+            # stacks: how many items depends on the item counted (its stack size)
+            if re.fullmatch(r"-?\d+", w) and nxt in ("stack", "stacks"):
+                toks.append(Tok(f"{w} {nxt}", f"{w} {nxt}", "stack", stacks=float(int(w))))
+                i += 2
                 continue
             if w == "half" and raw[i + 1:i + 3] == ["a", "stack"]:
-                toks.append(Tok("half a stack", "32", "num", 32))
+                toks.append(Tok("half a stack", "half a stack", "stack", stacks=0.5))
                 i += 3
                 continue
-            if w in ("a", "an") and nxt in ("dozen", "couple", "stack"):
-                n = {"dozen": 12, "couple": 2, "stack": 64}[nxt]
+            if w in ("a", "an") and nxt == "stack":
+                toks.append(Tok(f"{w} {nxt}", f"{w} {nxt}", "stack", stacks=1.0))
+                i += 2
+                continue
+            if re.fullmatch(r"-?\d+", w):
+                toks.append(Tok(w, w, "num", int(w)))
+                i += 1
+                continue
+            if w in ("a", "an") and nxt in ("dozen", "couple"):
+                n = {"dozen": 12, "couple": 2}[nxt]
                 skip = 3 if nxt == "couple" and raw[i + 2:i + 3] == ["of"] else 2
                 toks.append(Tok(f"{w} {nxt}", str(n), "num", n))
                 i += skip
@@ -433,6 +464,11 @@ class HumanReader:
                 continue
             if w in UNITS or w in TENS:
                 n, j = self._number_words(raw, i)
+                if j < len(raw) and raw[j] in ("stack", "stacks"):  # "two stacks"
+                    text = " ".join(raw[i:j + 1])
+                    toks.append(Tok(text, text, "stack", stacks=float(n)))
+                    i = j + 1
+                    continue
                 toks.append(Tok(" ".join(raw[i:j]), str(n), "num", n))
                 i = j
                 continue
@@ -536,6 +572,30 @@ class HumanReader:
             self._count_first_keys = {ph[0] for dom in ("item", "block") for ph in self.index(dom) if ph}
         return self.key(toks[i].word) in self._count_first_keys
 
+    def _items_after(self, toks: Sequence[Tok], i: int) -> set[str]:
+        """The v1 items named by the longest item phrase (or member name) at token i, after
+        fillers and an ``of`` (``a stack of oak logs``); empty if none starts there."""
+        while i < len(toks) and (toks[i].kind == "filler" or (toks[i].kind == "word" and toks[i].word == "of")):
+            i += 1
+        readings = list(self._phrase_readings("item", toks, i)) if i < len(toks) else []
+        longest = max((used for _, used, _ in readings), default=0)
+        return {v for v, used, _ in readings if used == longest}
+
+    def _stack_count(self, stacks: float, items: set[str]) -> int | None:
+        """How many items ``stacks`` stacks of ``items`` hold: None unless every item has the
+        same stack size, it stacks (an iron pickaxe comes one at a time: a "stack" of them is no
+        number), and the count is a whole number of at least 1 (half a stack of eggs is 8)."""
+        if not items or not all(i in self.lang.domains["item"] for i in items):
+            return None  # a nonce word, or no item: the stack size is unknown
+        sizes = {self.lang.row("item", i)["stack_size"] for i in items}
+        if len(sizes) != 1:
+            return None
+        (size,) = sizes
+        n = stacks * size
+        if size < 2 or n < 1 or n != int(n):
+            return None
+        return int(n)
+
     def normalize(self, text: str) -> list[str]:
         """Typed text -> vocabulary words (``<unk>`` for anything else)."""
         toks = self.tokens(text)
@@ -559,6 +619,9 @@ class HumanReader:
                 out.append(t.word if t.word in self.vocab else G.UNK)
             elif t.kind == "num":
                 out.append(str(_snap_number(t.num)))
+            elif t.kind == "stack":  # the count, if the words after it name items of one stack size
+                n = self._stack_count(t.stacks, self._items_after(toks, i + 1))
+                out.append(G.UNK if n is None else str(_snap_number(n)))
             elif t.kind == "article":
                 out.append("1" if self._starts_count_phrase(toks, i + 1) else G.UNK)
             else:
@@ -643,6 +706,8 @@ class HumanReader:
                     yield G.snap(t.num, bins), 1, 0.0
             if t is not None and t.kind == "article" and dom in DEFAULT_COUNT_SLOTS + ("wait_seconds",):
                 yield G.snap(1, bins), 1, 0.0
+            if t is not None and t.kind == "stack" and dom == "item_count":  # resolved with the item (read)
+                yield _Stacks(t.stacks), 1, 0.0
             if dom in DEFAULT_COUNT_SLOTS:
                 yield 1, 0, COST_DEFAULT_COUNT
             return
@@ -684,7 +749,9 @@ class HumanReader:
                 for cost, pairs in self._match(path, rest, speaker_name):
                     total = base + cost + addr_cost
                     alt = dict(pairs).get("_alt")
-                    pairs = tuple(p for p in pairs if p[0] != "_alt")
+                    pairs = self._resolve_stacks(tuple(p for p in pairs if p[0] != "_alt"))
+                    if pairs is None:
+                        continue  # a count in stacks of an item that has no stack of that size
                     if alt == "equip" and (dict(pairs).get("template") == "wear") != self._is_armor(dict(pairs)["item"]):
                         continue  # "equip" means wear for armor and hold for anything else
                     if best is None or (total, order) < best[:2]:
@@ -697,6 +764,22 @@ class HumanReader:
             return HumanMessage(speaker_name or speaker, prefix[-1] if prefix else None, None, words)
         content = best[2]
         return HumanMessage(speaker_name or speaker, best_addr, content, words, tuple(self.lang.to_words(content)))
+
+    def _resolve_stacks(self, pairs: tuple) -> tuple | None:
+        """Replace an item count given in stacks by the number of the item read with it
+        (``give me a stack of eggs``: 16), snapped to the count's bins; None if it has none."""
+        if not any(isinstance(v, _Stacks) for _, v in pairs):
+            return pairs
+        item = dict(pairs).get("item")
+        out = []
+        for k, v in pairs:
+            if isinstance(v, _Stacks):
+                n = self._stack_count(v.stacks, {item} if item is not None else set())
+                if n is None:
+                    return None
+                v = G.snap(n, G.INT_DOMAINS["item_count"])  # (only item_count reads stacks)
+            out.append((k, v))
+        return tuple(out)
 
     def _is_armor(self, item: str) -> bool:
         return self.lang.row("item", item).get("equip_slot") in ARMOR_SLOTS

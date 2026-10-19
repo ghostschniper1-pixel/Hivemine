@@ -23,34 +23,40 @@ builder turns into words: the facing and face words are direction and face conce
   given (evaluation areas sit hundreds of blocks apart). A slot without a home raises.
 - **Facing:** yaw wrapped to [-180, 180) and pitch, in Minecraft's convention [mem] (yaw 0 south,
   90 west, 180 north, -90 east; pitch -90 up, +90 down; ``Mth.wrapDegrees`` [mem]), and F3's
-  4-way word, ``Direction.fromYRot``: south, west, north, east for floor(yaw / 90 + 0.5) & 3 [mem].
+  4-way word, ``Direction.fromYRot``: south, west, north, east for floor(yaw / 90 + 0.5) & 3 [mem]
+  (``hivemind.lang.world_words.facing_word``, the table the observation builder reads).
 - **Look ray:** from the eye (feet + 1.62 [mem]) along the view vector the game computes,
   ``Entity.calculateViewVector`` with float32 ``Mth.sin``/``Mth.cos`` (a 65,536-entry sine table)
   [mem], so the ray is bit-exact and needs no libm. Cells are walked with perception's DDA (ties
-  x, y, z), t in blocks, starting with the eye's own cell (t = 0):
+  x, y, z), t in blocks, starting with the eye's own cell (t = 0). Ranges are strict, as the
+  game's ``Vec3.closerThan`` (distance < range) [mem]:
 
   * ``water`` (or a bubble column) is passed; the first one met is the **targeted fluid**
     ``water``.
   * ``lava`` stops the ray (it is not see-through, DESIGN.md 6.1: a stated deviation from F3); if
     no fluid came first it is the targeted fluid ``lava``.
   * any other cell that is not air is the **targeted block**: class, distance t (where the ray
-    enters it) and the face word of the side entered. If it is the eye's own cell (the head inside
-    a block), t = 0 and the face is the game's choice for a ray that starts inside a shape,
-    ``Direction.getNearest(d).getOpposite()`` (ties: down, up, north, south, west, east) [mem].
-  * a cell entered beyond 4.5 blocks (the block reach [mem]; F3 itself picks to 20 [mem]) ends
-    the ray with no block. A fluid counts only if it comes before the targeted block, or within
-    4.5 when there is none.
+    enters it) and the face word of the side entered. Glass, leaves and plants are targeted too
+    (each class is taken as a full cell; block shapes are not modelled). If it is the eye's own
+    cell (the head inside a block), t = 0 and the face is the game's choice for a ray that starts
+    inside a shape, ``Direction.getNearest(d).getOpposite()`` (ties: down, up, north, south,
+    west, east) [mem].
+  * a cell entered at 4.5 blocks or more (the block reach [mem]; F3 itself picks to 20 [mem])
+    ends the ray with no block. A fluid counts only if it comes before the targeted block, or
+    within 4.5 when there is none.
   * the **targeted entity** is the first entity box the ray enters within 3.0 blocks (the entity
     reach [mem]) and strictly nearer than the targeted block's entry point or a lava cell: other
-    live agents (players) and mobs; dropped items are not pickable in the game [mem] and the
-    agent's own box and boxes containing the eye are skipped.
+    live agents (players) and mobs. Dropped items are not pickable in the game [mem], and the
+    agent's own box is skipped. A box that contains the eye counts at distance 0, as in the
+    game's pick (``ProjectileUtil.getEntityHitResult`` [mem]).
 
-  None of it can name something behind a wall: the ray stops at the first opaque cell.
+  None of it can name something behind a wall: the ray stops at the first opaque cell, and at
+  glass or leaves, which are targeted blocks.
 - **Time:** the tick within the day (``world.time_of_day``) and its word: ``day`` 0-11999,
   ``dusk`` 12000-12999, ``night`` 13000-22999, ``dawn`` 23000-23999 [design, from [15]]; the day
   number floor(day time / 24000) [mem: F3's Local Difficulty "Day N"], where the day time is the
   game's clock (a night skip moves it); ``ticks``, the game ticks since the episode began
-  (``world.tick``).
+  (``world.tick``). The words and numbers come from ``hivemind.lang.world_words``.
 - **Biome** of the feet's column (``world.biome_at``; test worlds assign one per column).
 - **Light** at the feet cell: raw sky light and block light, F3's "Client Light" parts [mem].
 
@@ -67,6 +73,7 @@ from functools import lru_cache
 
 import numpy as np
 
+from hivemind.lang.world_words import TICKS_PER_DAY, day_number, facing_word, tick_of_day, time_word
 from hivemind.sim.ref.perception import (
     FACE_WORDS,
     EntityBoxes,
@@ -80,29 +87,9 @@ from hivemind.sim.ref.world import AIR, World
 
 BLOCK_REACH = 4.5  # [mem] survival block interaction range (DESIGN.md 4.5)
 ENTITY_REACH = 3.0  # [mem] survival entity interaction range (DESIGN.md 4.5)
-TICKS_PER_DAY = 24_000  # [mem] 20 minutes at 20 ticks per second
 
-# DESIGN.md 6.2 [design, from [15]]: (word, first tick, last tick + 1); together they cover the day.
-TIME_WORDS: tuple[tuple[str, int, int], ...] = (("day", 0, 12_000), ("dusk", 12_000, 13_000),
-                                                ("night", 13_000, 23_000), ("dawn", 23_000, TICKS_PER_DAY))
-_FACING = ("south", "west", "north", "east")  # [mem] Direction.from2DDataValue order
-
-
-def time_word(day_time: int) -> str:
-    """``day``, ``dusk``, ``night`` or ``dawn`` for a day-time counter (any day)."""
-    t = int(day_time) % TICKS_PER_DAY
-    return next(w for w, lo, hi in TIME_WORDS if lo <= t < hi)
-
-
-def day_number(day_time: int) -> int:
-    """floor(day time / 24000) [mem]."""
-    return int(day_time) // TICKS_PER_DAY
-
-
-def facing_word(yaw: float) -> str:
-    """F3's "Facing" word: ``Direction.fromYRot``, floor(yaw / 90 + 0.5) & 3 -> south, west,
-    north, east [mem]."""
-    return _FACING[math.floor(float(yaw) / 90.0 + 0.5) & 3]
+__all__ = ["BLOCK_REACH", "ENTITY_REACH", "TICKS_PER_DAY", "DebugInfo", "LookTargets", "day_number", "debug_info",
+           "facing_word", "look_targets", "tick_of_day", "time_word", "view_vector", "wrap_degrees"]
 
 
 def wrap_degrees(angle: float) -> float:
@@ -212,8 +199,10 @@ def look_targets(world: World, eye: Sequence[float], direction: Sequence[float],
                  boxes: EntityBoxes | None = None, exclude_agent: int | None = None,
                  reach: float = BLOCK_REACH, entity_reach: float = ENTITY_REACH) -> LookTargets:
     """The targeted block, fluid and entity along the ray from ``eye`` along the unit vector
-    ``direction`` (module docstring). ``boxes``: precomputed ``entity_boxes`` (dropped items are
-    not targets; they are left out here)."""
+    ``direction`` (module docstring). ``boxes``: precomputed ``entity_boxes``, which may be shared
+    by every observer (dropped items are not targets; they are left out here). ``exclude_agent``:
+    the observer's own slot, whose box is never a target, also when it is among ``boxes`` (it
+    contains the eye, so it would be met at distance 0)."""
     t = tables(world)
     e = [float(v) for v in eye]
     d = [float(v) for v in direction]
@@ -225,7 +214,7 @@ def look_targets(world: World, eye: Sequence[float], direction: Sequence[float],
     block = block_t = block_face = fluid = fluid_t = None
     stop_t = math.inf  # where the ray stops: the targeted block's entry point or a lava cell
     t_in, axis = 0.0, -1  # the eye's own cell first
-    while t_in <= reach:
+    while t_in < reach:
         c = world.get(cell[0], cell[1], cell[2])
         if t.water[c]:
             if fluid is None:
@@ -248,12 +237,14 @@ def look_targets(world: World, eye: Sequence[float], direction: Sequence[float],
     entity = entity_agent = entity_t = None
     if boxes is None:
         boxes = entity_boxes(world, exclude_agent=exclude_agent, items=False)
+    else:
+        boxes = boxes.without_agent(exclude_agent)
     keep = np.flatnonzero(boxes.source != 2)  # dropped items cannot be targeted [mem]
     if keep.size:
-        tb, _ = ray_box_entry(e, np.asarray([d]), boxes.lo[keep], boxes.hi[keep])
+        tb, _ = ray_box_entry(e, np.asarray([d]), boxes.lo[keep], boxes.hi[keep], inside_hits=True)
         k = int(np.argmin(tb[0]))  # ties: the first box in ``entity_boxes`` order
         tk = float(tb[0, k])
-        if tk <= entity_reach and tk < stop_t:
+        if tk < entity_reach and tk < stop_t:
             i = int(keep[k])
             entity, entity_t = int(boxes.cls[i]), tk
             entity_agent = int(boxes.agent[i]) if boxes.agent[i] >= 0 else None
@@ -282,6 +273,6 @@ def debug_info(world: World, agent: int, *, reach: float = BLOCK_REACH,
         block=look.block, block_distance=look.block_distance, block_face=look.block_face,
         fluid=look.fluid, fluid_distance=look.fluid_distance,
         entity=look.entity, entity_agent=look.entity_agent, entity_distance=look.entity_distance,
-        tick_of_day=world.time_of_day, time_word=time_word(world.day_time), day=day_number(world.day_time),
+        tick_of_day=tick_of_day(world.day_time), time_word=time_word(world.day_time), day=day_number(world.day_time),
         ticks=world.tick, biome=biome, biome_name=world.concepts.biome(biome).name,
         sky_light=int(sky[0]), block_light=int(blk[0]))

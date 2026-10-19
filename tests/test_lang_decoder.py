@@ -493,6 +493,78 @@ def test_lookahead_masks_a_value_whose_next_slot_is_empty(lang: Language) -> Non
     dec = lang.decoder(Prov(lang, ["place"], {"item": {"stone", "torch"}}))
     dec.feed_word("place")
     assert dec.allowed_words() == ["torch"]
+    # the static automaton looks just as far ahead: "stone" is the prefix of longer item phrases
+    # (stone pickaxe, ...) over the full value set, but none of them is offered here
+    wk = AutomatonWalker(lang.automaton(), lang, Prov(lang, ["place"], {"item": {"stone", "torch"}}))
+    wk.feed(lang.word_id("place"))
+    assert [lang.word(int(i)) for i in np.flatnonzero(wk.allowed())] == ["torch"]
+    # when a longer phrase is offered, "stone" stays allowed, but only to go on to "pickaxe"
+    prov = Prov(lang, ["place"], {"item": {"stone", "stone_pickaxe", "torch"}})
+    dec, wk = lang.decoder(prov), AutomatonWalker(lang.automaton(), lang, prov)
+    for w in ("place", "stone"):
+        assert (dec.allowed() == wk.allowed()).all()
+        dec.feed_word(w)
+        wk.feed(lang.word_id(w))
+    assert dec.allowed_words() == ["pickaxe"] and (dec.allowed() == wk.allowed()).all()
+
+
+def test_automaton_walker_raises_on_dead_ends_like_the_decoder(lang: Language) -> None:
+    with pytest.raises(DeadEndError, match="allows no command"):
+        AutomatonWalker(lang.automaton(), lang, Restricted(lang, [])).allowed()
+    prov = Restricted(lang, ["give"], {"player": set()})  # as in test_bad_providers
+    wk = AutomatonWalker(lang.automaton(), lang, prov)
+    for w in ("give", "3", "bread"):
+        wk.feed(lang.word_id(w))
+    with pytest.raises(DeadEndError, match="give 3 bread"):
+        wk.allowed()
+
+
+class Holey(RandomProvider):
+    """RandomProvider whose value slots are sometimes empty (depending on the slots chosen so
+    far), so its commands meet dead ends one word ahead and deeper."""
+
+    def __init__(self, lang: Language, seed: int, p: float, pool: Mapping[str, Collection[Any]] | None = None):
+        super().__init__(lang, seed, k=4, pool=pool)
+        self.p = p
+
+    def options(self, verb: str, slot: str, chosen: Mapping[str, Any]) -> list:
+        vals = super().options(verb, slot, chosen)
+        if slot not in G.CHOICE_SLOTS and self._rng("hole", verb, slot, tuple(chosen.items())).random() < self.p:
+            return []
+        return vals
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_automaton_walker_matches_decoder_with_dead_ends(lang: Language, auto, seed: int) -> None:
+    """Word by word the same masks, and a DeadEndError at the same word, on providers whose
+    slots can be empty (a scratch run of 160 such providers x 30 walks found no mismatch)."""
+    flags = Flags.all()
+    rng = np.random.default_rng(seed)
+    ends = {"complete": 0, "dead end": 0}
+    for p, pool in ((0.15, None), (0.4, CONFUSABLE)):
+        prov = Holey(lang, seed, p, pool)
+        for _ in range(15):
+            dec, wk = lang.decoder(prov, flags), AutomatonWalker(auto, lang, prov, flags)
+            while True:
+                try:
+                    m1 = dec.allowed()
+                except DeadEndError as e:
+                    with pytest.raises(DeadEndError) as e2:
+                        wk.allowed()
+                    assert str(e2.value) == str(e)
+                    ends["dead end"] += 1
+                    break
+                m2 = wk.allowed()
+                assert (m1 == m2).all(), (dec.text(), [lang.word(int(i)) for i in np.flatnonzero(m1 != m2)])
+                if dec.done:
+                    assert wk.done and wk.command() == dec.command()
+                    ends["complete"] += 1
+                    break
+                assert not wk.done
+                w = int(rng.choice(np.flatnonzero(m1)))
+                dec.feed(w)
+                wk.feed(w)
+    assert ends["complete"] and ends["dead end"], ends  # both kinds of ending were exercised
 
 
 def test_fork_is_independent(lang: Language) -> None:
@@ -520,7 +592,9 @@ def test_automaton_shape(lang: Language, auto) -> None:
             below = np.zeros(len(dt.values), bool)
             for c in ch.values():
                 below |= dt.incidence[c]
+            assert (below == dt.below[node]).all(), (name, node)  # values going on past the node
             if dt.terminal[node] >= 0:
+                assert not below[dt.terminal[node]]
                 below[dt.terminal[node]] = True
             assert (below == dt.incidence[node]).all(), (name, node)
     start_words = {lang.word(int(w)) for w in np.flatnonzero(auto.transition[auto.start] >= 0)}

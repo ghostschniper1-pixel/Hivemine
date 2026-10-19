@@ -7,6 +7,7 @@ import pytest
 from hivemind.lang import Command, Language, Sentence
 from hivemind.lang import grammar as G
 from hivemind.lang.human import PHRASE_SYNONYMS, SENTENCE_OPTIONAL, SYNONYMS, HumanReader, plurals, singulars
+from hivemind.rules.classes import load_concepts
 
 
 @pytest.fixture(scope="module")
@@ -68,6 +69,16 @@ CASES = [
     ("mine iron ore", "human", "mine 1 iron ore.", None),
     ("can i have a stack of planks", "human", "give me 64 planks", None),
     ("i need half a stack of torches", "human", "i need 32 torch", None),
+    # a stack is the item's stack size (test_stacks_count_by_the_items_stack_size)
+    ("give me a stack of eggs", "human", "give me 16 egg", None),
+    ("i need half a stack of eggs", "human", "i need 8 egg", None),
+    ("i need a stack of ender pearls", "human", "i need 16 ender pearl", None),
+    ("i need two stacks of snowballs", "human", "i need 32 snowball", None),
+    ("give 2 stacks of torches to red 1", "human", "give 64 torch to red 1.", None),  # 128: the top bin
+    ("i have a stack of iron pickaxes", "human", None, None),  # pickaxes do not stack
+    ("i need a stack of dax", "human", None, None),  # a nonce item has no known stack size
+    ("i need a stack", "human", None, None),
+    ("mine a stack of stone", "human", None, None),  # a stack counts items; mine counts blocks
     ("explore north east 50 blocks", "human", "explore northeast 64 blocks.", None),
     ("dig down to y -20", "human", "dig down to y -16.", None),
     ("dig down to y -64", "human", "dig down to y -54.", None),  # the deepest band
@@ -144,6 +155,10 @@ CASES = [
     ("mine 4 wheat", "human", None, None),  # "wheat" is the item, not the wheat crops
     ("mine 4 blorp", "human", None, None),
     ("red 0, mine 4 blorp", "human", None, "red_0"),
+    # an English word is never read as a vocabulary word it only looks like an inflection of
+    ("attack the cafe spider", "human", None, None),  # not "caves" (a biome word), hence not the cave spider
+    ("flee from the caf spider", "human", None, None),
+    ("attack the cave spiders", "human", "attack the nearest cave spider.", None),
     ("", "human", None, None),
 ]
 
@@ -198,6 +213,14 @@ NORMALIZE = [
     ("wood planks", "<unk> planks"),  # a modifier: not "log planks"
     ("retreat", "flee"),
     ("i need 3 carrots", "i need 3 carrots"),  # a vocabulary word is kept (context-free; see content_words)
+    ("cafe", "<unk>"),  # not a singular of "caves"
+    ("caf", "<unk>"),
+    ("leave", "<unk>"),  # "leaves" is the plural of "leaf", not of "leave"
+    ("a stack of eggs", "16 of egg"),
+    ("half a stack of torches", "32 of torch"),
+    ("a stack of oak logs", "64 of oak log"),
+    ("a stack of iron pickaxes", "<unk> of iron pickaxe"),
+    ("a stack", "<unk>"),
 ]
 
 
@@ -212,6 +235,38 @@ def test_word_forms() -> None:
     assert "zombies" in plurals("zombie") and "potatoes" in plurals("potato") and "endermen" in plurals("enderman")
     assert singulars("berries") == {"berry"} and singulars("planks") == {"plank"} and "leaf" in singulars("leaves")
     assert singulars("lapis") == set() and singulars("glass") == set()
+    # "-ves": "-ve" is the regular singular; "-f"/"-fe" only for the nouns that have it
+    assert singulars("caves") == {"cave"} and singulars("olives") == {"olive"} and singulars("graves") == {"grave"}
+    assert singulars("leaves") == {"leaf"} and singulars("wolves") == {"wolf"} and singulars("knives") == {"knife"}
+    assert singulars("bookshelves") == {"bookshelf"} and singulars("dripleaves") == {"dripleaf"}
+    assert singulars("lives") == {"life"}
+
+
+def test_no_known_word_has_rival_singulars(reader: HumanReader) -> None:
+    """Every vocabulary or member-name word has at most one singular form: rival guesses (for
+    "caves": "cafe" beside "cave") would register an unrelated English word as a variant."""
+    for w in reader.vocab | reader.alias_words:
+        assert len(singulars(w)) <= 1, (w, singulars(w))
+    assert reader.key("caves") == reader.key("cave")
+    assert not {"caf", "cafe", "leave", "leafe"} & set(reader.variants)
+
+
+def test_stacks_count_by_the_items_stack_size(lang: Language) -> None:
+    """``a stack of X`` is X's stack size (from the rules data, through the vocabulary's item
+    rows), never a fixed 64: 16 for eggs, no reading for an item that does not stack."""
+    sizes = {}
+    for c in load_concepts().item_classes:
+        sizes[c.name] = c.stack_size
+    assert {sizes[i] for i in lang.domains["item"]} == {1, 16, 64}
+    for i in lang.domains["item"]:
+        phrase = " ".join(lang.phrase("item", i))
+        for text, stacks in ((f"i need a stack of {phrase}", 1), (f"i need half a stack of {phrase}", 0.5)):
+            got = lang.parse_human(text)
+            if sizes[i] == 1:
+                assert got is None, text
+            else:
+                n = G.snap(int(sizes[i] * stacks), G.INT_DOMAINS["item_count"])
+                assert got == Sentence("need", item_count=n, item=i), (text, got)
 
 
 def test_number_variants_share_a_key(reader: HumanReader) -> None:

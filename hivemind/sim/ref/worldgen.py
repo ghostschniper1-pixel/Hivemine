@@ -25,12 +25,16 @@ of evaluation and two seeds never share numbers):
    pools [est] add small ponds above sea level.
 3. **Biomes** (draft 0.5; DESIGN.md 4.4): one per column from a smooth value-noise field [est]
    cut into bands along ``WorldGenConfig.biomes`` (default desert, plains, forest, birch forest,
-   so a desert borders plains and a birch forest borders a forest). Each biome must be true of
-   its column: ``BIOME_SURFACES`` decides the column's surface and plants (below), and every
-   biome of the palette must list exactly the ore-table rows that ``WorldGenConfig.biome`` places
-   (true of plains, forest, birch forest and desert; ``generate`` checks it). Only overworld
-   biomes, and never an underground one (``lush caves``, ``dripstone caves``, ``deep dark``).
-   Columns under water keep their land biome: a pond in a plain is plains in the game too.
+   so a desert borders plains and a birch forest borders a forest); a region smaller than
+   ``MIN_BIOME_COLUMNS`` = 24 columns [est] joins its neighbours' biome, so no biome is a speck.
+   Each biome must be true of its column: ``BIOME_SURFACES`` decides the column's surface and
+   plants (below), and every biome of the palette must list exactly the ore-table rows that
+   ``WorldGenConfig.biome`` places (true of plains, forest, birch forest, desert and ocean;
+   ``generate`` checks it). Only overworld biomes, and never an underground one (``lush caves``,
+   ``dripstone caves``, ``deep dark``). A sea-level water body of at least ``SEA_COLUMNS`` = 256
+   columns [est] is a sea and takes ``sea_biome`` (``ocean``); ponds and small sea-level lakes
+   keep their land biome, as a pond in a plain is plains in the game. The default terrain seldom
+   dips below sea level, so default worlds rarely hold a sea.
 4. **Strata:** bedrock at y -64 with the vanilla rough layer (a gradient to y -59 [mem]),
    deepslate at y <= 0 with a transition band up to y 8 [mem], stone above, then 3-4 layers [est]
    of the biome's soil under its top block: dirt under a grass block, or in a desert sand under
@@ -83,6 +87,8 @@ _DISCARD_DRAW0 = 1 << 20  # draw indices of a vein's per-cell air-exposure draws
 
 # DESIGN.md 4.4 [design]: biomes a column biome never names (they are caves, in the game's 3-D cells).
 UNDERGROUND_BIOMES = frozenset({"lush_caves", "dripstone_caves", "deep_dark"})
+MIN_BIOME_COLUMNS = 24  # [est] a land biome region (4-connected columns) is never smaller than this
+SEA_COLUMNS = 256  # [est] a sea-level water body of at least this many columns is a sea (``sea_biome``)
 
 
 @dataclass(frozen=True)
@@ -110,6 +116,9 @@ BIOME_SURFACES: dict[str, BiomeSurface] = {
     "birch_forest": BiomeSurface("grass_block", "dirt", None, 0, 5.0, 1.0, 0.15, 0.01, 0.0),
     # [mem] sand over sandstone, no trees or grass, dead bushes; depths and density [est]
     "desert": BiomeSurface("sand", "sand", "sandstone", 3, 0.0, 0.0, 0.0, 0.0, 0.01),
+    # Only on sea columns, which are always under water: their floor is sand, or gravel in deeper
+    # water (``_strata``) [mem: ocean floors are sand and gravel]; nothing grows there.
+    "ocean": BiomeSurface("sand", "sand", None, 0, 0.0, 0.0, 0.0, 0.0, 0.0),
 }
 
 
@@ -134,10 +143,11 @@ class WorldGenConfig:
     stone_blobs: bool = True  # place the table's granite, diorite, andesite, tuff, dirt and gravel blobs
     ore_density: float = 1.0  # DESIGN.md 10.2 scarcity knob
     biome: str = "plains"  # which rows of the ore table apply (ore_table.OreFeature.in_biome)
-    # The column biomes, in band order along the biome noise (keys of BIOME_SURFACES) [est].
+    # The land biomes of the columns, in band order along the biome noise (keys of BIOME_SURFACES) [est].
     biomes: tuple[str, ...] = ("desert", "plains", "forest", "birch_forest")
-    biome_octaves: tuple[tuple[int, float], ...] = ((48, 1.0), (16, 0.25))  # [est] (spacing, amplitude)
+    biome_octaves: tuple[tuple[int, float], ...] = ((64, 1.0), (32, 0.25))  # [est] (spacing, amplitude)
     biome_spread: float = 0.5  # [est] the bands split [-spread, spread] of the normalized noise evenly
+    sea_biome: str | None = "ocean"  # the biome of sea columns (None: they keep their land biome)
     vegetation: float = 1.0  # scales every biome's trees, grass, flowers and dead bushes
     trunk_height: tuple[int, int] = (4, 6)  # [est]
 
@@ -269,14 +279,22 @@ def _pools(rng: CounterRNG, cfg: WorldGenConfig, h: np.ndarray, water_top: np.nd
             water_top[disk] = level
 
 
+def biome_palette(cfg: WorldGenConfig) -> tuple[str, ...]:
+    """The biomes a world of ``cfg`` may hold, as indexed by ``column_biomes``: the land biomes
+    in band order, then the sea biome if there is one."""
+    return cfg.biomes + ((cfg.sea_biome,) if cfg.sea_biome is not None else ())
+
+
 def check_biomes(cfg: WorldGenConfig, concepts: Concepts) -> None:
-    """Raise ValueError unless every biome of ``cfg.biomes`` can be true of its columns (module
-    docstring, step 3): an overworld biome that is not underground, with a ``BIOME_SURFACES``
-    entry, listing exactly the ore-table rows of ``cfg.biome``."""
+    """Raise ValueError unless every biome of ``biome_palette(cfg)`` can be true of its columns
+    (module docstring, step 3): an overworld biome that is not underground, with a
+    ``BIOME_SURFACES`` entry, listing exactly the ore-table rows of ``cfg.biome``."""
     if not cfg.biomes:
-        raise ValueError("a test world needs at least one biome")
+        raise ValueError("a test world needs at least one land biome")
+    if len(set(biome_palette(cfg))) != len(biome_palette(cfg)):
+        raise ValueError(f"a biome is listed twice in {biome_palette(cfg)}")
     rows = {r.name for r in ore_table(cfg.biome)}
-    for name in cfg.biomes:
+    for name in biome_palette(cfg):
         b = concepts.biome(name)
         if not b.overworld or name in UNDERGROUND_BIOMES:
             raise ValueError(f"{name}: test-world columns take overworld surface biomes only")
@@ -287,10 +305,11 @@ def check_biomes(cfg: WorldGenConfig, concepts: Concepts) -> None:
 
 
 def biome_indices(rng: CounterRNG, cfg: WorldGenConfig) -> np.ndarray:
-    """int [size_x, size_z]: each column's index into ``cfg.biomes``. The octaves of
-    ``cfg.biome_octaves`` are summed and normalized by their amplitudes, then cut into
+    """int [size_x, size_z]: each column's land biome, an index into ``cfg.biomes``. The octaves
+    of ``cfg.biome_octaves`` are summed and normalized by their amplitudes, then cut into
     ``len(cfg.biomes)`` bands of equal width over [-spread, spread] [est] (the outer bands extend
-    to the ends)."""
+    to the ends); then every region smaller than ``MIN_BIOME_COLUMNS`` joins a neighbour
+    (``merge_small_regions``)."""
     n = len(cfg.biomes)
     if n == 1:
         return np.zeros((cfg.size_x, cfg.size_z), np.int64)
@@ -299,13 +318,92 @@ def biome_indices(rng: CounterRNG, cfg: WorldGenConfig) -> np.ndarray:
         field += amplitude * _value_noise(rng, cfg.size_x, cfg.size_z, spacing, octave, STEP_BIOMES)
     field /= sum(a for _, a in cfg.biome_octaves)
     edges = np.linspace(-cfg.biome_spread, cfg.biome_spread, n + 1)[1:-1]
-    return np.searchsorted(edges, field, side="right").astype(np.int64)
+    return merge_small_regions(np.searchsorted(edges, field, side="right").astype(np.int64), MIN_BIOME_COLUMNS)
+
+
+def column_regions(values: np.ndarray) -> tuple[np.ndarray, list[int]]:
+    """The 4-connected regions of equal values of a 2-D array: a label per cell (0, 1, ... in the
+    order of each region's first cell in row-major order) and each region's size."""
+    sx, sz = values.shape
+    labels = np.full((sx, sz), -1, np.int64)
+    vals = values.tolist()
+    lab = labels.tolist()
+    sizes: list[int] = []
+    for x0 in range(sx):
+        for z0 in range(sz):
+            if lab[x0][z0] >= 0:
+                continue
+            r, v = len(sizes), vals[x0][z0]
+            lab[x0][z0] = r
+            stack, n = [(x0, z0)], 0
+            while stack:
+                x, z = stack.pop()
+                n += 1
+                for a, b in ((x - 1, z), (x + 1, z), (x, z - 1), (x, z + 1)):
+                    if 0 <= a < sx and 0 <= b < sz and lab[a][b] < 0 and vals[a][b] == v:
+                        lab[a][b] = r
+                        stack.append((a, b))
+            sizes.append(n)
+    return np.asarray(lab, np.int64).reshape(sx, sz), sizes
+
+
+def _neighbours(mask: np.ndarray) -> np.ndarray:
+    """The cells 4-adjacent to a 2-D mask, outside it."""
+    out = np.zeros_like(mask)
+    out[1:, :] |= mask[:-1, :]
+    out[:-1, :] |= mask[1:, :]
+    out[:, 1:] |= mask[:, :-1]
+    out[:, :-1] |= mask[:, 1:]
+    return out & ~mask
+
+
+def merge_small_regions(bands: np.ndarray, min_columns: int) -> np.ndarray:
+    """Give every 4-connected region of fewer than ``min_columns`` columns the band its
+    neighbouring columns hold most often (ties: the lower band), smallest region first (ties: the
+    first in row-major order), until none is left; a region with no neighbour (the whole world)
+    stays. Each pass relabels the regions and merges only regions that touch no region merged
+    earlier in the pass, so every merge sees the regions as they are. Deterministic: it reads
+    only the bands."""
+    bands = bands.copy()
+    while True:
+        labels, sizes = column_regions(bands)
+        small = sorted((n, r) for r, n in enumerate(sizes) if n < min_columns)
+        if not small or len(sizes) == 1:
+            return bands
+        changed = np.zeros(bands.shape, bool)
+        for _, r in small:
+            mask = labels == r
+            around = _neighbours(mask)
+            if changed[mask | around].any():
+                continue  # next pass, after relabelling
+            values, counts = np.unique(bands[around], return_counts=True)
+            best = int(values[np.argmax(counts)])  # np.unique sorts: the lower band wins ties
+            bands[mask] = best
+            changed |= mask
+
+
+def column_biomes(rng: CounterRNG, cfg: WorldGenConfig, water_top: np.ndarray) -> np.ndarray:
+    """int [size_x, size_z]: each column's biome, an index into ``biome_palette(cfg)``: the land
+    bands of ``biome_indices``, except that every sea-level water body (4-connected columns whose
+    water stands at ``WATER_TOP``, not the dug ponds above it) of at least ``SEA_COLUMNS``
+    columns takes ``cfg.sea_biome``. Smaller ones keep their land biome, as a pond in a plain is
+    plains in the game."""
+    biome = biome_indices(rng, cfg)
+    if cfg.sea_biome is None:
+        return biome
+    sea = water_top == WATER_TOP
+    labels, sizes = column_regions(sea)
+    big = [r for r, n in enumerate(sizes) if n >= SEA_COLUMNS]
+    if big:
+        is_sea = np.isin(labels, big) & sea
+        biome = np.where(is_sea, len(cfg.biomes), biome)
+    return biome
 
 
 def _strata(rng: CounterRNG, cfg: WorldGenConfig, ids: dict[str, int], h: np.ndarray,
             water_top: np.ndarray, biome: np.ndarray) -> np.ndarray:
     """Fill the columns: bedrock, deepslate, stone, the biome's soil and top block (sand on beaches
-    and under water) and water. ``biome`` holds each column's index into ``cfg.biomes``."""
+    and under water) and water. ``biome`` holds each column's index into ``biome_palette(cfg)``."""
     sx, sz = h.shape
     y = np.arange(MIN_Y, MAX_Y + 1)[None, :, None]
     cols = _key(np.arange(sx)[:, None], np.arange(sz)[None, :])
@@ -327,7 +425,7 @@ def _strata(rng: CounterRNG, cfg: WorldGenConfig, ids: dict[str, int], h: np.nda
     blocks[:] = np.where(y <= hh, rock, 0)
 
     # Soil: depth per column; the biome's soil and top; sand on beaches and under water.
-    surfaces = [BIOME_SURFACES[b] for b in cfg.biomes]
+    surfaces = [BIOME_SURFACES[b] for b in biome_palette(cfg)]
     depth = cfg.dirt_depth[0] + (rng.uniform_array(STEP_SOIL, 2, Purpose.WORLDGEN, cols, 0)
                                  * (cfg.dirt_depth[1] - cfg.dirt_depth[0] + 1)).astype(np.int32)
     under_cls = np.array([ids[s.under] if s.under else 0 for s in surfaces], np.uint8)[biome]
@@ -666,7 +764,7 @@ def _trees(rng: CounterRNG, cfg: WorldGenConfig, ids: dict[str, int], concepts: 
     each kept with probability (its column biome's density) / (the densest) and birch with the
     column biome's birch fraction (draws: x, z, height, keep, birch)."""
     sx, _, sz = blocks.shape
-    surfaces = [BIOME_SURFACES[b] for b in cfg.biomes]
+    surfaces = [BIOME_SURFACES[b] for b in biome_palette(cfg)]
     density = np.array([s.trees_per_chunk for s in surfaces])
     densest = float(density.max())
     if densest <= 0.0 or cfg.vegetation <= 0.0:
@@ -721,7 +819,7 @@ def _plants(rng: CounterRNG, cfg: WorldGenConfig, ids: dict[str, int], blocks: n
     """Short grass and flowers [est] on grass blocks with air above, dead bushes on sand, at each
     column biome's rates (scaled by ``vegetation``)."""
     sx, _, sz = blocks.shape
-    surfaces = [BIOME_SURFACES[b] for b in cfg.biomes]
+    surfaces = [BIOME_SURFACES[b] for b in biome_palette(cfg)]
     v = cfg.vegetation
     grass_p = np.array([s.grass_chance * v for s in surfaces])[biome]
     flower_p = np.array([s.flower_chance * v for s in surfaces])[biome]
@@ -757,7 +855,7 @@ def generate(seed: int, config: WorldGenConfig | str = "default", *, concepts: C
     water_top = np.where(h < WATER_TOP, WATER_TOP, MIN_Y - 1).astype(np.int32)
     if cfg.pools_per_chunk > 0:
         _pools(rng, cfg, h, water_top)
-    biome = biome_indices(rng, cfg)
+    biome = column_biomes(rng, cfg, water_top)
     blocks = _strata(rng, cfg, ids, h, water_top, biome)
     if cfg.caves_per_chunk > 0:
         _caves(rng, cfg, concepts, blocks)
@@ -767,7 +865,7 @@ def generate(seed: int, config: WorldGenConfig | str = "default", *, concepts: C
         _plants(rng, cfg, ids, blocks, h, biome)
     world = World(cfg.size_x, cfg.size_z, concepts=concepts)
     world.load(blocks)
-    world.set_biome_map(np.array([concepts.biome(b).id for b in cfg.biomes], np.uint8)[biome])
+    world.set_biome_map(np.array([concepts.biome(b).id for b in biome_palette(cfg)], np.uint8)[biome])
     world.meta.update(seed=seed, preset=config if isinstance(config, str) else None, config=asdict(cfg),
                       ore_blocks=ore_blocks, trees=trees, surface=h)
     world.meta["spawn"] = spawn_point(world)

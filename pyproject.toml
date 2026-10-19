@@ -11,6 +11,9 @@ dependencies = ["numpy>=1.26"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+# tools/agent.py, the Claude Agent SDK runner (see tools/README.md). Pinned: the runner was written
+# against this version's source. Its wheels for Windows x64, macOS and Linux bundle Claude Code.
+agent = ["claude-agent-sdk==0.2.168"]
 
 [tool.setuptools.packages.find]
 include = ["hivemind*"]

@@ -146,6 +146,8 @@ def test_concept_tables(lang: Language) -> None:
             assert lang.concept("block", c.phrase) == c.name
     for c in concepts.item_classes:
         assert lang.phrase("item", c.name) == c.phrase
+        row = lang.row("item", c.name)  # the human reader reads stacks and "equip" from these
+        assert (row["stack_size"], row["equip_slot"], row["v1"]) == (c.stack_size, c.equip_slot, c.v1)
     for c in concepts.entity_classes:
         assert lang.phrase("entity", c.name) == c.phrase
         assert lang.row("entity", c.name)["entity_kind"] == c.kind
@@ -157,6 +159,25 @@ def test_concept_tables(lang: Language) -> None:
     assert lang.phrase("equip_slot", "offhand") == ("off", "hand")
     assert lang.phrase("container", "furnace") == ("furnace",)  # draft 0.5: furnace full
     assert lang.concept("container", ("furnace",)) == "furnace"
+
+
+def test_every_interrupt_cause_is_a_concept(lang: Language) -> None:
+    """Contracts 4.2: interrupt causes are a phrase kind. They are ``damage``, ``message`` and
+    every hostile entity class (DESIGN.md 5: ``interrupted by creeper``), the ``cause`` domain;
+    each has a phrase that inverts, and a hostile's is its entity phrase."""
+    hostiles = [c.name for c in load_concepts().entity_classes if c.kind == "hostile"]
+    assert lang.domains["cause"] == (*G.CAUSE_WORDS, *hostiles) and "monster" in hostiles
+    assert set(lang.kinds) >= {"cause"} and len(lang.raw["sources"]["interrupt causes"]) > len(G.CAUSE_WORDS)
+    for c in lang.domains["cause"]:
+        ph = lang.phrase("cause", c)
+        assert ph == lang.value_words("cause", c) and lang.concept("cause", ph) == c
+        assert ph == ((c,) if c in G.CAUSE_WORDS else lang.phrase("entity", c))
+        assert lang.parse_result(lang.result_words("INTERRUPTED", cause=c)) == ("INTERRUPTED", {"cause": c})
+    assert lang.phrase("cause", "cave_spider") == ("cave", "spider")
+    assert lang.concept("cause", ("creeper",)) == "creeper"
+    for not_a_cause in ("cow", "villager", "player"):  # a passive mob or a player never interrupts by appearing
+        with pytest.raises(KeyError):
+            lang.phrase("cause", not_a_cause)
 
 
 def test_biome_phrases(lang: Language) -> None:
@@ -272,5 +293,5 @@ def test_class_phrase_ids(lang: Language) -> None:
 def test_vocabulary_size_report(fresh: dict) -> None:
     text = V.report(fresh)
     assert f"{len(fresh['words'])} words" in text
-    assert 450 <= len(fresh["words"]) <= 700  # DESIGN.md 6.4: about 600 words [est]
+    assert 450 <= len(fresh["words"]) <= 700  # DESIGN.md 6.4: about 560 words (561 in the draft 0.5 build)
     assert "biomes" in text and "time words" in text and "face words" in text

@@ -28,7 +28,7 @@ Frozen values (DESIGN.md 11.2): `view-distance=10`, `simulation-distance=10`, `d
 
 1. **Java 21** (64-bit JDK). Minecraft 1.20.5 and later need Java 21 [mem]. For example `winget install EclipseAdoptium.Temurin.21.JDK` or `winget install Microsoft.OpenJDK.21` [mem]. Check with `java -version`; `check-mods` prints the line to pin as `java.version` in `mods-1.21.1.json` (section 4, step 4).
 2. **Python 3.11+** with the repository venv (see the top-level README).
-3. **Node.js 22 or newer** for the bridge hosts later (mineflayer 4.39.0 requires Node ≥ 22). Not needed for the server itself.
+3. **Node.js 22 or newer** for the bridge hosts later and for the bridge's Node test now (mineflayer 4.39.0 requires Node ≥ 22): `npm ci --ignore-scripts`, then `npm test`, inside `bridge\` (bridge/README.md). Not needed for the server itself.
 4. **Folders outside the repository**, so that worlds and the rendered RCON password never reach git:
 
    ```
@@ -206,6 +206,7 @@ Forty bots on one server at simulation distance 10 would tick about 40 × 441 ch
 
 - **Making instances 1–3:** copy `inst-0` with its jars and `mods\` but without its world (and without `hivemind-instance.json`), render with `--instance K` and the instance's seed, start from the instance folder, then run `check-properties --dir`, `check-mods --dir`, the gamerule commands and `check-gamerules --dir` for each.
 - **Areas:** each instance holds 10 single-agent areas of 128 × 128, one bot each, with centres at least 512 blocks apart (each bot ticks ±160 blocks, and 128 + 2 × 160 = 448). For example a 5 × 2 grid with 512-block spacing. Each area is walled with barrier blocks, matching the simulator's world edge. `/worldborder` is one square per world, so it is used only in team worlds (DESIGN.md 11.3).
+- **Area corners on chunk boundaries** [design]: put each area's minimum x and z on multiples of 16. The simulator's chunks start at its world's corner (`world.py`: a chunk index is floor(x / 16) from x = 0), so only then are the real game's ticking squares (spawns, furnaces, despawns run only in ticking chunks) the simulator's, and the conductor's world mirror (PROTOCOL.md 7.2) covers whole chunk columns. The conductor gives each bot its area in `join` and clips the mirror to it: every cell outside reads as barrier and every cell above y 191 inside it as air, as at the simulator's world edge, so the real walls and whatever lies beyond them never reach perception.
 - **Pristine copies** of every area live elsewhere in the same world, outside every bot's ticking square, and are the `/clone` source for resets. Each is filled once, by cloning its freshly pregenerated area into it before any bot plays (section 6). `/clone` needs both regions loaded [mem]; force-loaded chunks tick like spawn chunks [mem], so force-load the pristine region only for the duration of a reset.
 - **Bots and hosts:** 10 Node host processes × 4 bots (at most 4–5 bots per process, DESIGN.md 11.1). Bot b plays on instance b ÷ 10, in area b mod 10. A host's bots may sit on different instances; every bot has its own connection.
 - **CPU budget** for 40 bots (DESIGN.md 13 [est]): servers 12–16 threads, Node hosts about 6, conductor 1–2, inference on GPU 0.

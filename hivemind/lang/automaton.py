@@ -12,8 +12,12 @@ the CPU between words. This module compiles the templates, once, into the tables
     ``children[node]``  word id -> child node (node 0 is the root)
     ``terminal[node]``  index of the value whose phrase ends at the node, or -1
     ``incidence``       bool [n_nodes, n_values]: value's phrase passes through (or ends at) node
-                        -- the "prefix-node x value incidence": a trie edge into ``node`` is
-                        allowed iff ``(incidence[node] & bitset).any()``.
+                        -- the "prefix-node x value incidence"
+    ``below``           bool [n_nodes, n_values]: value's phrase goes on past node (passes
+                        through one of its children); ``incidence[node]`` is ``below[node]``
+                        plus the value ending at the node. A phrase that has reached ``node``
+                        can go on iff ``(below[node] & bitset).any()``, and can end there iff
+                        ``bitset[terminal[node]]``.
     The entity slot is split in two, as DESIGN.md 5 describes: ``ordinal`` (1-16) and
     ``entity_target`` (entity classes, then ``("dropped", item)``), whose bitset depends on
     the ordinal chosen ("the entity given the ordinal").
@@ -36,15 +40,24 @@ Atoms are conditions on the bitsets, evaluated along each live item's own chosen
                                         in the automaton at all: ``Automaton.flags``)
     ("choice", slot, id)                template / intent / goal id is offered
     ("enter", slot, domain)             the slot has at least one value (one-word lookahead)
-    ("through", slot, domain, node)     some offered value of the slot passes through node
+    ("below", slot, domain, node)       some offered value of the slot goes on past node
+                                        (``below[node]``): the phrase may stay in the trie
     ("value", slot, domain, index)      the value ending here is offered; it becomes chosen
+
+A word that moves a phrase into trie node ``n`` is allowed through a target item only if that
+item survives: the item that stays in the trie needs ``("below", .., n)``, the item that ends
+the value at ``n`` and moves on needs ``("value", .., terminal[n])`` and then whatever the next
+element needs (``enter`` for a next slot). That is the Decoder's one-word lookahead: a value
+whose next slot is empty is masked out even when, over the full value set, it is the prefix of
+a longer phrase (``stone`` of ``stone pickaxe``) that the provider does not offer.
 
 The runtime keeps, per agent, the state id plus a bitmask of live items (at most
 ``max_items`` per state) and their chosen values (registers: only the few dependent slots
 need them). The mask of word w is the OR, over moves (s, w) whose source item is live, of the
 AND of the move's atoms; feeding w sets the live items of the next state to the move targets
 whose atoms held. ``AutomatonWalker`` is the reference implementation of exactly that, driven
-by a ``SlotProvider``; the tests check it against the ``Decoder`` word by word.
+by a ``SlotProvider``; the tests check it against the ``Decoder`` word by word, including the
+``DeadEndError`` a provider with a dead end deeper than one word causes.
 """
 
 from __future__ import annotations
@@ -59,7 +72,7 @@ from hivemind.lang import grammar as G
 from hivemind.lang.decoder import SlotProvider, choice_ids
 from hivemind.lang.grammar import Lit, Slot
 from hivemind.lang.language import Language, Mark, _expand, assemble
-from hivemind.lang.types import EntityRef, Flags
+from hivemind.lang.types import DeadEndError, EntityRef, Flags
 
 Atom = tuple
 
@@ -73,6 +86,7 @@ class DomainTrie:
     children: list[dict[int, int]]
     terminal: np.ndarray
     incidence: np.ndarray
+    below: np.ndarray
     index: dict[Any, int] = field(repr=False, default_factory=dict)
 
     @property
@@ -135,9 +149,12 @@ def _domain_trie(name: str, values: Iterable[Any], phrase_ids) -> DomainTrie:
         terminal[node] = i
         paths.append(path)
     inc = np.zeros((len(children), len(values)), bool)
+    below = np.zeros((len(children), len(values)), bool)
     for i, path in enumerate(paths):
         inc[path, i] = True
-    return DomainTrie(name, values, children, np.array(terminal, np.int32), inc, {v: i for i, v in enumerate(values)})
+        below[path[:-1], i] = True  # every node of the path but the one the phrase ends at
+    return DomainTrie(name, values, children, np.array(terminal, np.int32), inc, below,
+                      {v: i for i, v in enumerate(values)})
 
 
 def _domains(lang: Language) -> dict[str, DomainTrie]:
@@ -233,8 +250,8 @@ def build_automaton(lang: Language, flags: Flags | None = None) -> Automaton:
             _, ei, node = it
             _, slot, child = edges[ei]
             dt = doms[slot.domain]
-            if dt.children[node]:
-                out.append((it, ()))
+            if dt.children[node]:  # stay in the trie, if an offered phrase goes on past node
+                out.append((it, (("below", slot.name, slot.domain, node),)))
             v = int(dt.terminal[node])
             if v >= 0:
                 out += [(x, (("value", slot.name, slot.domain, v), *a)) for x, a in closure(("t", child))]
@@ -242,13 +259,15 @@ def build_automaton(lang: Language, flags: Flags | None = None) -> Automaton:
         return out
 
     def word_moves(it: tuple) -> list[tuple[int, tuple, tuple]]:
-        """(word, target item, atoms) for each word the item can take."""
+        """(word, target item, atoms) for each word the item can take. A trie edge needs no atom
+        of its own: every item of the child's closure needs ``below`` or ``value`` there, each
+        of which implies that some offered value passes through the child."""
         if it[0] == "t":
             return [(lang.word_id(e.word), ("t", child), ()) for e, child in tchildren[it[1]].items() if isinstance(e, Lit)]
         _, ei, node = it
         _, slot, _ = edges[ei]
         dt = doms[slot.domain]
-        return [(w, ("s", ei, n2), (("through", slot.name, slot.domain, n2),)) for w, n2 in dt.children[node].items()]
+        return [(w, ("s", ei, n2), ()) for w, n2 in dt.children[node].items()]
 
     start_cl = closure(("t", 0))
     start_items = tuple(sorted({iid(x) for x, _ in start_cl}))
@@ -354,9 +373,9 @@ class AutomatonWalker:
             elif kind == "enter":
                 if not self._bits(verb, a[1], a[2], chosen, ordinal).any():
                     return None
-            elif kind == "through":
+            elif kind == "below":
                 _, slot, dom, node = a
-                if not (self.auto.domains[dom].incidence[node] & self._bits(verb, slot, dom, chosen, ordinal)).any():
+                if not (self.auto.domains[dom].below[node] & self._bits(verb, slot, dom, chosen, ordinal)).any():
                     return None
             elif kind == "value":
                 _, slot, dom, idx = a
@@ -392,12 +411,19 @@ class AutomatonWalker:
         return bool(self.live) and all(items[x.item] in self.auto.final_items for x in self.live)
 
     def allowed(self) -> np.ndarray:
+        """As ``Decoder.allowed``: the words that continue some live item; ``DeadEndError``
+        when the command is not complete and no word is (the provider offered a dead end
+        deeper than the one-word lookahead, or allows no command)."""
         mask = np.zeros(len(self.auto.words), bool)
         if self.done:
             return mask
         for w in np.flatnonzero(self.auto.transition[self.state] >= 0):
             if self._step(int(w)):
                 mask[w] = True
+        if not mask.any():
+            so_far = " ".join(self.auto.words[i] for i in self.ids)
+            raise DeadEndError(f"no valid continuation after {so_far!r} (the provider offered a dead end)"
+                               if self.ids else "the provider allows no command")
         return mask
 
     def feed(self, w: int) -> None:

@@ -27,9 +27,12 @@ The file also stores what the language layer needs without reading the class tab
 - ``concepts``: one row per named concept: ``kind`` (block, item, entity, biome, player,
   setter, addressee, nonce, number, ordinal, dir, face, time, pattern, station, container,
   cause, relation, place_kind, equip_slot), ``name``, ``phrase`` and, for classes, ``id``,
-  ``fallback`` and ``resource`` (blocks), ``v1`` and ``equip_slot`` (items), ``entity_kind``
-  (entities) or ``overworld`` and ``dimension`` (biomes). Face and time rows are the words of
-  ``hivemind.lang.world_words`` (draft 0.5).
+  ``fallback`` and ``resource`` (blocks), ``v1``, ``equip_slot`` and ``stack_size`` (items:
+  the human reader needs the slot for ``equip`` and the stack size for ``a stack of``),
+  ``entity_kind`` (entities) or ``overworld`` and ``dimension`` (biomes). Face and time rows
+  are the words of ``hivemind.lang.world_words`` (draft 0.5). The cause rows are ``damage``,
+  ``message`` and every hostile entity class (named by its entity phrase): the values of the
+  ``cause`` domain.
 - ``domains``: the full value list of every slot domain (see ``grammar.SLOT_DOMAINS``), in a
   fixed order. These are the "full v1 sets" the parser accepts and bitsets index.
 - ``templates``: the command templates by verb and template id, the chat sentences, goals,
@@ -74,6 +77,12 @@ def player_names(teams: Iterable[str] = G.TEAMS, size: int = G.TEAM_SIZE) -> lis
     return out
 
 
+def _hostiles(concepts: Concepts) -> list:
+    """The hostile entity classes, by id: with ``damage`` and ``message`` the interrupt causes
+    (contracts 4.3, DESIGN.md 5: the hostile that appeared)."""
+    return [c for c in concepts.entity_classes if c.kind == "hostile"]
+
+
 def _rows(concepts: Concepts) -> list[dict]:
     rows: list[dict] = []
     for c in concepts.block_classes:
@@ -81,7 +90,7 @@ def _rows(concepts: Concepts) -> list[dict]:
                      "resource": c.resource})
     for c in concepts.item_classes:
         rows.append({"kind": "item", "name": c.name, "id": c.id, "phrase": list(c.phrase), "fallback": c.fallback,
-                     "v1": c.v1, "equip_slot": c.equip_slot})
+                     "v1": c.v1, "equip_slot": c.equip_slot, "stack_size": c.stack_size})
     for c in concepts.entity_classes:
         rows.append({"kind": "entity", "name": c.name, "id": c.id, "phrase": list(c.phrase), "fallback": c.fallback,
                      "entity_kind": c.kind})
@@ -114,6 +123,8 @@ def _rows(concepts: Concepts) -> list[dict]:
         rows.append({"kind": "container", "name": c, "phrase": [c]})
     for c in G.CAUSE_WORDS:
         rows.append({"kind": "cause", "name": c, "phrase": [c]})
+    for c in _hostiles(concepts):  # "interrupted by creeper": a hostile is named by its entity phrase
+        rows.append({"kind": "cause", "name": c.name, "phrase": list(c.phrase)})
     for r in G.RELATIONS:
         rows.append({"kind": "relation", "name": r, "phrase": [r]})
     for p in G.PLACE_KINDS:
@@ -147,7 +158,7 @@ def _domains(concepts: Concepts) -> dict[str, Any]:
         "pattern": list(G.PATTERNS),
         "station": list(G.STATIONS),
         "container": list(G.CONTAINERS),
-        "cause": list(G.CAUSE_WORDS) + [c.name for c in concepts.entity_classes if c.kind == "hostile"],
+        "cause": list(G.CAUSE_WORDS) + [c.name for c in _hostiles(concepts)],
         **{k: list(v) for k, v in G.INT_DOMAINS.items()},
     }
 
@@ -164,7 +175,7 @@ def _sources(concepts: Concepts) -> dict[str, list[str]]:
         return out
 
     lit = G.literal_words()
-    hostile = [c.phrase for c in concepts.entity_classes if c.kind == "hostile"]
+    hostile = [c.phrase for c in _hostiles(concepts)]
     return {
         "block classes": words_of(c.phrase for c in concepts.block_classes if not c.fallback),
         "fallback block classes": words_of(c.phrase for c in concepts.block_classes if c.fallback),
@@ -260,7 +271,7 @@ def build_vocab(concepts: Concepts | None = None) -> dict:
     missing = sorted({w for r in vocab["concepts"] for w in r["phrase"]} - seen)
     if missing:
         raise ValueError(f"phrase words missing from the vocabulary: {missing}")
-    for kind in ("biome", "face", "time", "container"):  # lang.concept(kind, words) must invert phrase
+    for kind in ("biome", "face", "time", "container", "cause"):  # lang.concept(kind, words) must invert phrase
         phrases = [tuple(r["phrase"]) for r in vocab["concepts"] if r["kind"] == kind]
         if len(set(phrases)) != len(phrases):
             raise ValueError(f"two {kind} concepts share a phrase")

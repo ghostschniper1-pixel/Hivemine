@@ -283,6 +283,130 @@ def test_buried_diamonds_avoid_air():
         assert (touching > 0) == may_touch
 
 
+# -- biomes per column (draft 0.5) ----------------------------------------------------------------
+
+
+def _ids_of(names):
+    return {C.biome(n).id for n in names}
+
+
+def test_biome_bands_are_deterministic_and_seeded():
+    cfg = wg.WorldGenConfig()
+    a, b = wg.biome_indices(CounterRNG(3), cfg), wg.biome_indices(CounterRNG(3), cfg)
+    assert np.array_equal(a, b) and a.shape == (128, 128)
+    assert (wg.biome_indices(CounterRNG(4), cfg) != a).mean() > 0.2
+    small = wg.preset("default", size_x=48, size_z=48, caves_per_chunk=0.0, ores=False)
+    assert np.array_equal(wg.generate(9, small).biome_map, wg.generate(9, small).biome_map)
+
+
+def test_biome_regions_are_smooth():
+    """Regions of one biome are large and contiguous, and neighbouring bands border each other."""
+    cfg = wg.WorldGenConfig()
+    for seed in range(10):
+        b = wg.biome_indices(CounterRNG(seed), cfg)
+        _, sizes = wg.column_regions(b)
+        assert min(sizes) >= wg.MIN_BIOME_COLUMNS == 24, seed
+        assert len(sizes) <= 16, seed
+        jumps = np.concatenate([np.abs(np.diff(b, axis=0)).ravel(), np.abs(np.diff(b, axis=1)).ravel()])
+        assert jumps.max() <= 1, seed  # a desert borders plains, not a forest
+        assert (jumps > 0).mean() < 0.05, seed  # under 5% of neighbouring columns differ
+
+
+def test_merge_small_regions():
+    b = np.ones((10, 10), np.int64)
+    b[4, 4] = 0  # a single-column speck
+    b[0:2, 7:9] = 3  # a 4-column island in the corner
+    out = wg.merge_small_regions(b, 5)
+    assert (out == 1).all()
+    tie = np.zeros((6, 6), np.int64)
+    tie[:, 3:] = 2
+    tie[2, 2:4] = 1  # two columns, bordered by three 0s and three 2s: the lower band wins
+    merged = wg.merge_small_regions(tie, 4)
+    assert merged[2, 2] == 0 and merged[2, 3] == 0
+    one = np.full((5, 5), 2, np.int64)
+    assert np.array_equal(wg.merge_small_regions(one, 100), one)  # the whole world: nothing to join
+
+
+def test_biomes_are_true_of_the_terrain(default_world):
+    w = default_world
+    b = w.blocks
+    names = {C.biome(i).name for i in np.unique(w.biome_map).tolist()}
+    assert names <= set(wg.biome_palette(wg.PRESETS["default"])) and len(names) >= 3
+    assert not names & wg.UNDERGROUND_BIOMES and all(C.biome(n).overworld for n in names)
+    h = w.meta["surface"]
+    xs, zs = np.meshgrid(np.arange(w.size_x), np.arange(w.size_z), indexing="ij")
+    top = b[xs, h - MIN_Y, zs]
+    desert = w.biome_map == C.biome("desert").id
+    green = np.isin(w.biome_map, list(_ids_of(("plains", "forest", "birch_forest"))))
+    assert desert.sum() > 500 and green.sum() > 500
+    assert np.isin(top[desert], [ID["sand"], ID["gravel"]]).all()  # sand on top (gravel only deep under water)
+    assert (top[green] == ID["grass_block"]).mean() > 0.95  # the rest: beaches, ponds, dirt under trunks
+    assert not (top[green] == ID["sandstone"]).any()
+    ys = np.arange(MIN_Y, MIN_Y + b.shape[1])[None, :, None]
+    sandstone = (b == ID["sandstone"]).any(axis=1)
+    near_top = ((b == ID["sandstone"]) & (ys >= h[:, None, :] - 8) & (ys < h[:, None, :] - 2)).any(axis=1)
+    assert (near_top[desert]).mean() > 0.95  # sandstone under the desert's sand [mem]
+    assert not sandstone[green].any()
+    # Plants and trees follow the column's biome.
+    above = b[xs, np.minimum(h + 1, 191) - MIN_Y, zs]
+    assert not np.isin(above[desert], [ID["short_grass"], ID["flower"], ID["log"]]).any()
+    assert (above[desert] == ID["dead_bush"]).any() and not (above[~desert] == ID["dead_bush"]).any()
+    trunks = (b[xs, h + 1 - MIN_Y, zs] == ID["log"]) & (b[xs, h - MIN_Y, zs] == ID["dirt"])
+    assert not trunks[desert].any()
+    forest = w.biome_map == C.biome("forest").id
+    plains = w.biome_map == C.biome("plains").id
+    assert trunks[forest].mean() > 5 * trunks[plains].mean() > 0  # forests are dense, plains sparse
+
+
+def test_birch_forest_grows_only_birch():
+    w = wg.generate(5, wg.preset("forest", biomes=("birch_forest",)))
+    assert (w.biome_map == C.biome("birch_forest").id).all() and w.meta["trees"] > 10
+    assert (w.blocks == ID["leaves"]).sum() > 0 and not (w.blocks == ID["oak_leaves"]).any()
+
+
+def test_presets_name_one_biome(flat_worlds, forest):
+    assert (flat_worlds[0].biome_map == C.biome("plains").id).all()
+    assert (forest.biome_map == C.biome("forest").id).all()
+
+
+@pytest.mark.parametrize("overrides", [
+    {"biomes": ("lush_caves",)},  # underground: names a cave, not a column
+    {"biomes": ("plains", "nether_wastes")},  # not an overworld biome
+    {"biomes": ("badlands",)},  # no surface for it, and it lists extra gold rows
+    {"biomes": ("plains", "plains")},
+    {"biomes": ()},
+    {"biome": "badlands", "biomes": ("plains",)},  # badlands rows placed under a plains name
+    {"biome": "windswept_hills"},  # emerald rows under plains, desert and forest names
+    {"sea_biome": "deep_dark"},
+])
+def test_check_biomes_rejects_false_names(overrides):
+    with pytest.raises(ValueError):
+        wg.check_biomes(wg.preset("default", **overrides), C)
+
+
+def test_sea_columns_are_ocean_ponds_keep_their_land_biome():
+    cfg = wg.preset("default", size_x=64, size_z=64, surface_y=59.0, caves_per_chunk=0.0, ores=False,
+                    stone_blobs=False, pools_per_chunk=0.0)
+    w = wg.generate(2, cfg)
+    h = w.meta["surface"]
+    sea = h < wg.WATER_TOP
+    ocean = w.biome_map == C.biome("ocean").id
+    labels, sizes = wg.column_regions(sea)
+    big = np.isin(labels, [r for r, n in enumerate(sizes) if n >= wg.SEA_COLUMNS]) & sea
+    assert big.sum() > 500 and np.array_equal(ocean, big)  # every sea, and only seas
+    assert (w.blocks[:, wg.WATER_TOP - MIN_Y, :][ocean] == ID["water"]).all()
+    xs, zs = np.nonzero(ocean)
+    assert np.isin(w.blocks[xs, h[xs, zs] - MIN_Y, zs], [ID["sand"], ID["gravel"]]).all()
+    small = sea & ~big
+    if small.any():
+        assert not ocean[small].any()  # small lakes keep the land biome
+    dry = wg.generate(2, wg.preset("default", size_x=64, size_z=64, surface_y=59.0, caves_per_chunk=0.0,
+                                   ores=False, stone_blobs=False, pools_per_chunk=0.0, sea_biome=None))
+    assert not (dry.biome_map == C.biome("ocean").id).any()
+    differs = (dry.blocks != w.blocks).any(axis=1)  # e.g. sandstone under a sea floor in a desert band
+    assert not differs[~ocean].any()  # nothing else changes when the seas keep their land biome
+
+
 # -- spawn ---------------------------------------------------------------------------------------
 
 

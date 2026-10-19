@@ -8,10 +8,12 @@ import pytest
 from hivemind.rules import load_concepts
 from hivemind.sim.ref.world import (
     CHESTS_PER_AGENT,
+    DEFAULT_BIOME,
     ENTITY_CAPACITY,
     MAX_Y,
     MIN_Y,
     SIMULATION_DISTANCE,
+    UNSEEN,
     BlockChange,
     SlotsFull,
     World,
@@ -67,7 +69,12 @@ def test_get_set_and_world_edge():
         w.set(0, MAX_Y + 1, 0, STONE)  # but nothing can be placed there
     assert C.hardness[BARRIER] < 0  # unbreakable
     with pytest.raises(ValueError):
-        w.set(1, 1, 1, 255)  # "buried" is a perception class, never a voxel
+        w.set(1, 1, 1, UNSEEN)  # "unseen" is a perception class, never a voxel
+    assert UNSEEN == 255 and C.block_class(UNSEEN).name == "unseen"
+    bad = w.blocks.copy()
+    bad[0, 0, 0] = UNSEEN
+    with pytest.raises(ValueError):
+        w.load(bad)
 
 
 def test_region_pads_with_barrier():
@@ -94,9 +101,28 @@ def test_change_log_cursor_and_trim():
     assert w.changes_since(cursor + 1) == changes[1:]
     with pytest.raises(ValueError):
         w.changes_since(cursor)
+    assert w.changes_since(w.change_count) == []
+    with pytest.raises(ValueError):  # a cursor from the future (another world) is not "no changes"
+        w.changes_since(w.change_count + 1)
     gen = w.generation
     w.load(w.blocks)
     assert w.generation == gen + 1 and w.change_count == 0
+    with pytest.raises(ValueError):  # the cursor of the previous generation
+        w.changes_since(cursor + 2)
+
+
+def test_every_world_object_has_its_own_serial():
+    import copy
+    import pickle
+
+    w = small_world()
+    others = [small_world(), w.copy(), copy.copy(w), copy.deepcopy(w), pickle.loads(pickle.dumps(w))]
+    serials = [w.serial, *(o.serial for o in others)]
+    assert len(set(serials)) == len(serials)
+    assert others[1].generation == w.generation  # a copy keeps the generation, so caches need the serial
+    gen = w.generation
+    w.load(w.blocks)
+    assert w.serial == serials[0] and w.generation == gen + 1  # a load keeps the object, bumps the generation
 
 
 # -- heightmap and sky light ---------------------------------------------------------------
@@ -268,8 +294,64 @@ def test_copy_is_deep():
     v = w.copy()
     v.set(1, 61, 1, STONE)
     v.agents.pos[0] = (0, 0, 0)
+    v.biome_map[0, 0] = C.biome("desert").id
     assert w.get(1, 61, 1) == 0 and w.agents.pos[0].tolist() == [3.5, 61.0, 3.5]
     assert v.change_count == 1 and w.change_count == 0
+    assert w.biome_map[0, 0] == C.biome(DEFAULT_BIOME).id
+
+
+def test_light_points_equal_pointwise():
+    w = small_world()
+    for x, y, z, cls in ((3, 70, 3, LEAVES), (3, 66, 3, WATER), (4, 64, 4, STONE), (8, 61, 8, TORCH),
+                         (12, 62, 12, LAVA), (6, 63, 6, TINTED)):
+        w.set(x, y, z, cls)
+    cells = np.array([(x, y, z) for x in (-1, 0, 3, 4, 8, 9, 12, 23, 24) for y in (MIN_Y - 1, 59, 60, 61, 62, 65,
+                                                                                    69, 70, 71, MAX_Y, MAX_Y + 1)
+                      for z in (-2, 3, 4, 8, 12, 23)])
+    sky, block = w.light_points(cells)
+    assert sky.dtype == np.uint8 and block.dtype == np.uint8
+    assert sky.tolist() == [w.sky_light(*c) for c in cells.tolist()]
+    assert block.tolist() == [w.block_light_at(*c) for c in cells.tolist()]
+    assert w.light_points(np.zeros((0, 3), int))[0].shape == (0,)
+
+
+# -- agents: facing and home ------------------------------------------------------------------
+
+
+def test_alloc_agent_facing_and_home():
+    w = World(16, 16)
+    a = w.alloc_agent((3.5, 64.0, 5.5), yaw=-90.0, pitch=30.0)
+    assert w.agents.pos[a].tolist() == [3.5, 64.0, 5.5] and w.agents.home[a].tolist() == [3.5, 64.0, 5.5]
+    assert w.agents.yaw.dtype == np.float32 and (w.agents.yaw[a], w.agents.pitch[a]) == (-90.0, 30.0)
+    b = w.alloc_agent((8.5, 64.0, 8.5), home=(1.0, 2.0, 3.0), team=1, number=7)
+    assert w.agents.home[b].tolist() == [1.0, 2.0, 3.0] and (w.agents.team[b], w.agents.number[b]) == (1, 7)
+    assert w.agents.alive[b] and w.agents.health[b] == 20.0
+    raw = w.agents.alloc(pos=(1.5, 64.0, 1.5))  # a slot whose home was never set: NaN, never 0
+    assert np.isnan(w.agents.home[raw]).all()
+    for pitch in (-90.5, 91.0):
+        with pytest.raises(ValueError):
+            w.alloc_agent((1.5, 64.0, 1.5), pitch=pitch)
+
+
+# -- biomes -----------------------------------------------------------------------------------
+
+
+def test_biome_map_default_set_and_lookup():
+    w = World(16, 8)
+    plains, desert = C.biome("plains").id, C.biome("desert").id
+    assert DEFAULT_BIOME == "plains" and w.biome_map.shape == (16, 8) and (w.biome_map == plains).all()
+    biomes = np.full((16, 8), plains, np.uint8)
+    biomes[8:, :] = desert
+    w.set_biome_map(biomes)
+    biomes[:] = plains  # the world keeps its own copy
+    assert w.biome_at(7.99, 3.0) == plains and w.biome_at(8.0, 3.0) == desert
+    assert w.biome_at(-5.0, 3.0) == plains and w.biome_at(40.0, -3.0) == desert  # outside: the nearest column
+    with pytest.raises(ValueError):
+        w.set_biome_map(np.zeros((8, 16), np.uint8))
+    with pytest.raises(TypeError):
+        w.set_biome_map(np.zeros((16, 8), np.int64))
+    with pytest.raises(ValueError):
+        w.set_biome_map(np.full((16, 8), len(C.biomes), np.uint8))
 
 
 # -- clock ---------------------------------------------------------------------------------
