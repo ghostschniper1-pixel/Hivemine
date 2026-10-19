@@ -27,6 +27,11 @@ that wheel, against a local fake API (no real calls):
   Reading files inside the repository is left to Claude Code, which allows it; a few calls are
   refused (``refusal_reason``); every other call goes to ``can_use_tool``, and the runner asks
   y/n in the terminal. Without a terminal to ask, it says no.
+- What is shown: every character a terminal would not show as written (escape sequences,
+  carriage returns, bidirectional overrides and the like) is printed escaped, as \\x1b or \\u202e,
+  in streamed text and in the questions alike, so the text of a tool call cannot rewrite the
+  question about it. Claude Code 2.1.301 refuses control characters in Bash commands, but not in
+  the content of a Write, for example.
 - Switched off: background tasks and scheduled prompts (the environment variables in ``CLI_ENV``)
   and the tools in ``SWITCHED_OFF_TOOLS``. The runner can ask about a tool call only while a turn
   of the person's runs, so all work has to happen inside those turns.
@@ -57,6 +62,7 @@ import queue
 import re
 import sys
 import threading
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +76,13 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")  # claude_agent_sdk.ty
 CREATE_NO_WINDOW = 0x08000000  # Windows process creation flag, as subprocess.CREATE_NO_WINDOW
 PREVIEW_LINES = 12  # lines of a file edit or a prompt shown when asking for permission ("a" shows all)
 PREVIEW_WIDTH = 200  # characters of such a line shown when asking ("a" shows all)
+GLOB_EXPANSION_LIMIT = 64  # brace alternatives of a glob pattern worked out before asking instead
+# Characters a terminal does not show as written: control characters (C0, DEL, C1; they can move
+# the cursor, erase lines or hide text), format characters (Cf: bidirectional overrides,
+# zero-width and tag characters), surrogates, and line and paragraph separators. Everything the
+# runner prints shows them escaped (\x1b, ‮), apart from newline and tab.
+HIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+_NOT_PLAIN = re.compile(r"[^\t\n\x20-\x7e]")  # what may be hidden: everything but tab, newline, printable ASCII
 
 # Tools that only read files, with the input fields that name what they read. They are allowed
 # without asking only when every such path lies inside the repository. Claude Code 2.1.301 has
@@ -149,6 +162,10 @@ TURN_OVER = ("your turn ended before you could be asked",
              "Not allowed: the user's turn ended before they could be asked.")
 NO_TERMINAL = ("no terminal to ask; run the session interactively to approve tools",
                "Not allowed: this session has no terminal where the user could approve the tool call.")
+# What Claude is told about a call refused by rule (refusal_reason). Claude Code 2.1.301 shows a
+# PreToolUse hook's deny reason to Claude as "PreToolUse:<tool> hook error: <reason>", so the reason
+# itself has to say that this is a refusal and not a fault.
+REFUSAL_MESSAGE = "Not allowed: tools/agent.py refuses this without asking the user ({reason}). Do not retry this call."
 
 
 # ----------------------------------------------------------------------------------------------
@@ -222,6 +239,73 @@ def _fixed_part(pattern: str) -> str:
     return head if head.endswith(("/", "\\")) or head == pattern else os.path.dirname(head)
 
 
+def _brace_expansions(pattern: str) -> list[str] | str:
+    """The patterns that the brace groups of a glob pattern stand for ("a{b,c}" -> ["ab", "ac"]),
+    or why they were not worked out: a group holds ".." (a parent folder, or a range such as
+    {a..c} that a shell fills with characters not written in the pattern), or there would be more
+    than GLOB_EXPANSION_LIMIT of them."""
+    done: list[str] = []
+    todo = [pattern]
+    while todo:
+        text = todo.pop()
+        group = re.search(r"\{([^{}]*)\}", text)  # an innermost group
+        if group is None:
+            done.append(text)
+        elif ".." in group.group(1):
+            return f"a brace group holds .. (a parent folder or a range): {pattern}"
+        else:
+            todo += [text[:group.start()] + choice + text[group.end():] for choice in group.group(1).split(",")]
+        if len(done) + len(todo) > GLOB_EXPANSION_LIMIT:
+            return f"more than {GLOB_EXPANSION_LIMIT} brace alternatives to check: {pattern}"
+    return done
+
+
+def _could_name_parent(segment: str) -> bool:
+    """Whether one path segment of a glob pattern could match "..", the parent folder.
+
+    A leading dot in a name is matched only by a written dot or a bracket expression (the rule
+    for hidden names that shells and glob libraries share), so a segment that starts with * or ?
+    cannot. Every bracket expression is taken to match a dot."""
+    if not segment or segment[0] in "*?":
+        return False
+    regex, i = "", 0
+    while i < len(segment):
+        char = segment[i]
+        if char == "[":
+            j = i + 1
+            if j < len(segment) and segment[j] in "!^":
+                j += 1
+            if j < len(segment) and segment[j] == "]":  # a ] right after [ or [! belongs to the set
+                j += 1
+            end = segment.find("]", j)
+            regex += "."
+            i = i + 1 if end < 0 else end + 1  # an unclosed [ is taken as a wildcard too
+            continue
+        regex += ".*" if char == "*" else "." if char == "?" else re.escape(char)
+        i += 1
+    return re.fullmatch(regex, "..", re.S) is not None
+
+
+def glob_reach_problem(pattern: str, base: str, root: Path) -> str | None:
+    """Why the names a glob pattern matches might lie outside ``root``, or None when they cannot.
+
+    ``base`` is the folder the pattern is taken from ("" for the working directory). A backslash
+    is read both ways: as a path separator (Windows) and as an escape (other systems)."""
+    readings = {pattern.replace("\\", "/"), re.sub(r"\\(.)", r"\1", pattern, flags=re.S)}
+    for reading in sorted(readings):
+        expansions = _brace_expansions(reading)
+        if isinstance(expansions, str):
+            return expansions
+        for expanded in expansions:
+            if any(_could_name_parent(part) for part in expanded.split("/")):
+                return f"the pattern can name a parent folder (..): {pattern}"
+            fixed = _fixed_part(expanded)
+            path = os.path.join(base, fixed) if base and fixed else (fixed or base)
+            if not is_inside(path, root):
+                return f"reads outside the repository: {path}"
+    return None
+
+
 def permission_verdict(tool_name: str, tool_input: Mapping[str, Any], root: Path = REPO_ROOT) -> Verdict:
     """Allow a tool call without asking, or ask: which calls the runner lets through."""
     if tool_name in READ_ONLY_SESSION_TOOLS:
@@ -239,16 +323,21 @@ def permission_verdict(tool_name: str, tool_input: Mapping[str, Any], root: Path
         if not isinstance(value, str):
             return Verdict(False, f"{name} is not a path")
         paths.append(value)
-    if tool_name == "Glob":
-        pattern = tool_input.get("pattern")
-        if not isinstance(pattern, str):
-            return Verdict(False, "no text pattern given")
-        fixed = _fixed_part(pattern)
-        base = tool_input.get("path") or ""
-        paths.append(os.path.join(base, fixed) if base and fixed else (fixed or base))
     for path in paths:
         if not is_inside(path, root):
             return Verdict(False, f"reads outside the repository: {path}")
+    # Glob's pattern names what it lists; Grep's glob only filters, but is held to the same rule.
+    pattern_field = {"Glob": "pattern", "Grep": "glob"}.get(tool_name)
+    if pattern_field is not None:
+        pattern = tool_input.get(pattern_field)
+        if tool_name == "Glob" and (not isinstance(pattern, str) or not pattern):
+            return Verdict(False, "no text pattern given")
+        if pattern is not None and pattern != "":
+            if not isinstance(pattern, str):
+                return Verdict(False, f"{pattern_field} is not text")
+            problem = glob_reach_problem(pattern, tool_input.get("path") or "", root)
+            if problem:
+                return Verdict(False, problem)
     return Verdict(True, "reads only, inside the repository")
 
 
@@ -266,13 +355,19 @@ def refusal_reason(tool_name: str, tool_input: Mapping[str, Any]) -> str | None:
     return None
 
 
+def refusal_message(reason: str) -> str:
+    """What Claude is told when a call is refused by rule (``refusal_reason``)."""
+    return REFUSAL_MESSAGE.format(reason=reason)
+
+
 def pre_tool_use_decision(tool_name: str, tool_input: Mapping[str, Any],
                           root: Path = REPO_ROOT) -> tuple[str | None, str]:
-    """What the runner's PreToolUse hook answers for a tool call: (decision, reason).
+    """What the runner's PreToolUse hook decides for a tool call: (decision, reason).
 
-    "deny" refuses the call; "ask" makes Claude Code put it to ``can_use_tool`` even when it would
-    run it without asking; None leaves the call to Claude Code's own rules, which is done only
-    for calls the runner would allow anyway (reading inside the repository)."""
+    "deny" refuses the call (the reason is the one ``refusal_reason`` gives); "ask" makes Claude
+    Code put it to ``can_use_tool`` even when it would run it without asking; None leaves the call
+    to Claude Code's own rules, which is done only for calls the runner would allow anyway
+    (reading inside the repository)."""
     refusal = refusal_reason(tool_name, tool_input)
     if refusal:
         return "deny", refusal
@@ -283,11 +378,14 @@ def pre_tool_use_decision(tool_name: str, tool_input: Mapping[str, Any],
 
 
 def hook_output(decision: str | None, reason: str) -> dict[str, Any]:
-    """The PreToolUse hook's answer in the form Claude Code reads (PreToolUseHookSpecificOutput)."""
+    """The PreToolUse hook's answer in the form Claude Code reads (PreToolUseHookSpecificOutput).
+
+    For "deny", the reason Claude reads is ``refusal_message(reason)``."""
     if decision is None:
         return {}
+    told = refusal_message(reason) if decision == "deny" else reason
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": decision,
-                                   "permissionDecisionReason": reason}}
+                                   "permissionDecisionReason": told}}
 
 
 def is_own_result(msg: Any) -> bool:
@@ -314,8 +412,41 @@ def origin_text(origin: Any) -> str:
 # Text shown in the terminal (pure)
 # ----------------------------------------------------------------------------------------------
 
-def one_line(text: str, width: int) -> str:
-    flat = " ".join(str(text).split())
+def _is_hidden(char: str) -> bool:
+    return unicodedata.category(char) in HIDDEN_CATEGORIES
+
+
+def _escaped(char: str) -> str:
+    code = ord(char)
+    return f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}" if code < 0x10000 else f"\\U{code:08x}"
+
+
+def visible(text: Any) -> str:
+    """Text as it may reach the terminal: every character that a terminal would not show as written
+    (HIDDEN_CATEGORIES, newline and tab apart) replaced by an escape such as \\x1b or \\u202e."""
+    return _NOT_PLAIN.sub(lambda m: _escaped(m.group()) if _is_hidden(m.group()) else m.group(), str(text))
+
+
+def hidden_characters(value: Any, found: dict[str, None] | None = None) -> list[str]:
+    """The distinct characters ``visible`` escapes, in the order they occur in a tool input's
+    strings (keys included, nested lists and mappings searched)."""
+    found = {} if found is None else found
+    if isinstance(value, str):
+        for char in _NOT_PLAIN.findall(value):
+            if _is_hidden(char):
+                found.setdefault(char)
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            hidden_characters(key, found)
+            hidden_characters(item, found)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            hidden_characters(item, found)
+    return list(found)
+
+
+def one_line(text: Any, width: int) -> str:
+    flat = " ".join(visible(text).split())
     return flat if len(flat) <= width else flat[: max(width - 3, 1)] + "..."
 
 
@@ -343,13 +474,19 @@ def summarize_tool_call(tool_name: str, tool_input: Mapping[str, Any], root: Pat
         detail = f"{len(tool_input['todos'])} items"
     else:
         detail = next((v for v in tool_input.values() if isinstance(v, str) and v), "")
-    detail = one_line(detail, max(width - len(tool_name) - 2, 10))
-    return f"{tool_name}: {detail}" if detail else tool_name
+    name = visible(tool_name)
+    detail = one_line(detail, max(width - len(name) - 2, 10))
+    return f"{name}: {detail}" if detail else name
+
+
+def _lines(text: Any) -> list[str]:
+    """The lines of a text, split only at newlines (every other line break is shown escaped)."""
+    return visible(text).splitlines()
 
 
 def _preview(text: Any, prefix: str, full: bool, limit: int = PREVIEW_LINES) -> list[str]:
     """The lines of a text, each after ``prefix``: all of them when ``full``, else a cut preview."""
-    lines = str(text).splitlines() or [""]
+    lines = _lines(text) or [""]
     if full:
         return [prefix + line for line in lines]
     shown = [prefix + (line if len(line) <= PREVIEW_WIDTH else line[: PREVIEW_WIDTH - 3] + "...")
@@ -360,7 +497,7 @@ def _preview(text: Any, prefix: str, full: bool, limit: int = PREVIEW_LINES) -> 
 
 
 def _text(value: Any, width: int, full: bool) -> str:
-    return " ".join(str(value).split()) if full else one_line(value, width)
+    return " ".join(visible(value).split()) if full else one_line(value, width)
 
 
 def describe_tool_request(tool_name: str, tool_input: Mapping[str, Any], root: Path = REPO_ROOT,
@@ -368,7 +505,8 @@ def describe_tool_request(tool_name: str, tool_input: Mapping[str, Any], root: P
     """The lines shown before asking whether a tool call may run.
 
     Commands are always shown whole. File contents, edits and prompts are cut to a preview unless
-    ``full``; the question then offers "a" to show all of it."""
+    ``full``; the question then offers "a" to show all of it. Characters a terminal would not show
+    as written are shown escaped, and a last line says so."""
     lines = [f"  ? Claude wants to use {tool_name}"]
     get = tool_input.get
     if tool_name in ("Bash", "PowerShell") and isinstance(get("command"), str):
@@ -379,7 +517,7 @@ def describe_tool_request(tool_name: str, tool_input: Mapping[str, Any], root: P
             lines.append(f"    (timeout: {get('timeout')} ms)")
     elif tool_name == "Write" and isinstance(get("file_path"), str):
         content = get("content") if isinstance(get("content"), str) else ""
-        count = len(content.splitlines())
+        count = len(_lines(content))
         lines.append(f"    file: {display_path(get('file_path'), root)} ({count} line{'' if count == 1 else 's'})")
         lines += _preview(content, "    + ", full)
     elif tool_name == "Edit" and isinstance(get("file_path"), str):
@@ -425,7 +563,14 @@ def describe_tool_request(tool_name: str, tool_input: Mapping[str, Any], root: P
             lines += _preview(pretty, "      ", full=True)
         else:
             lines.append(f"    input: {one_line(text, 600)}")
-    return lines
+    hidden = hidden_characters([tool_name, dict(tool_input)])
+    if hidden:
+        shown = ", ".join(_escaped(char) for char in hidden[:6]) + (", ..." if len(hidden) > 6 else "")
+        lines.append(f"    (the input contains characters a terminal would not show as written: {shown}; "
+                     "they are shown escaped)")
+    # Every line once more through visible(): values put in directly above (paths, URLs, models)
+    # must not reach the terminal raw either.
+    return [visible(line) for line in lines]
 
 
 def format_usd(amount: float | None) -> str:
@@ -629,7 +774,10 @@ def keep_ctrl_c_from_cli(anyio_module: Any = None, os_name: str = os.name) -> bo
 # ----------------------------------------------------------------------------------------------
 
 class Display:
-    """Prints the session: streamed text, one line per tool call, errors and costs."""
+    """Prints the session: streamed text, one line per tool call, errors and costs.
+
+    Everything goes through ``visible()`` on its way out, so nothing Claude, a tool or Claude Code
+    writes can move the cursor, erase or hide lines, or change how later text (a question) looks."""
 
     def __init__(self, sdk: Any, out: Any, root: Path = REPO_ROOT, requested_model: str | None = None) -> None:
         self.sdk = sdk
@@ -648,12 +796,14 @@ class Display:
     def write(self, text: str) -> None:
         if not text:
             return
+        text = visible(text)
         with self.lock:
             self.out.write(text)
             self.out.flush()
             self._mid_line = not text.endswith("\n")
 
     def line(self, text: str = "") -> None:
+        text = visible(text)
         with self.lock:
             if self._mid_line:
                 self.out.write("\n")
@@ -1124,7 +1274,7 @@ class Session:
         if isinstance(tool_use_id, str) and tool_use_id:
             self.display.refused.add(tool_use_id)
         self.display.line(f"  ! not allowed: {summarize_tool_call(tool_name, tool_input)} ({reason})")
-        result = self.sdk.PermissionResultDeny(message=message or f"Not allowed: {reason}.")
+        result = self.sdk.PermissionResultDeny(message=message or refusal_message(reason))
         if answer is not None and not answer.done():
             try:
                 answer.set_result(result)

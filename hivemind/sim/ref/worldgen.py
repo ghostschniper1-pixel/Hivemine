@@ -26,7 +26,9 @@ of evaluation and two seeds never share numbers):
 3. **Biomes** (draft 0.5; DESIGN.md 4.4): one per column from a smooth value-noise field [est]
    cut into bands along ``WorldGenConfig.biomes`` (default desert, plains, forest, birch forest,
    so a desert borders plains and a birch forest borders a forest); a region smaller than
-   ``MIN_BIOME_COLUMNS`` = 24 columns [est] joins its neighbours' biome, so no biome is a speck.
+   ``MIN_BIOME_COLUMNS`` = 24 columns [est] joins its neighbours' biome, so no biome is a speck
+   (also after the seas below have cut the land, except an island smaller than that, which has
+   no land biome around it to join).
    Each biome must be true of its column: ``BIOME_SURFACES`` decides the column's surface and
    plants (below), and every biome of the palette must list exactly the ore-table rows that
    ``WorldGenConfig.biome`` places (true of plains, forest, birch forest, desert and ocean;
@@ -357,23 +359,32 @@ def _neighbours(mask: np.ndarray) -> np.ndarray:
     return out & ~mask
 
 
-def merge_small_regions(bands: np.ndarray, min_columns: int) -> np.ndarray:
+def merge_small_regions(bands: np.ndarray, min_columns: int, fixed: np.ndarray | None = None) -> np.ndarray:
     """Give every 4-connected region of fewer than ``min_columns`` columns the band its
     neighbouring columns hold most often (ties: the lower band), smallest region first (ties: the
     first in row-major order), until none is left; a region with no neighbour (the whole world)
     stays. Each pass relabels the regions and merges only regions that touch no region merged
-    earlier in the pass, so every merge sees the regions as they are. Deterministic: it reads
-    only the bands."""
+    earlier in the pass, so every merge sees the regions as they are. ``fixed`` (bool, same
+    shape): columns that keep their band and are never counted as a neighbour (the seas, for
+    ``column_biomes``), so a region whose only neighbours are fixed stays. Deterministic: it reads
+    only the bands and ``fixed``."""
     bands = bands.copy()
+    free = np.ones(bands.shape, bool) if fixed is None else ~np.asarray(fixed, bool)
     while True:
-        labels, sizes = column_regions(bands)
-        small = sorted((n, r) for r, n in enumerate(sizes) if n < min_columns)
-        if not small or len(sizes) == 1:
+        labels, sizes = column_regions(np.where(free, bands, -1 - bands))  # fixed columns: their own regions
+        small = []
+        for r, n in enumerate(sizes):
+            if n < min_columns:
+                mask = labels == r
+                if free[mask].all() and (_neighbours(mask) & free).any():
+                    small.append((n, r))
+        if not small:
             return bands
+        small.sort()
         changed = np.zeros(bands.shape, bool)
         for _, r in small:
             mask = labels == r
-            around = _neighbours(mask)
+            around = _neighbours(mask) & free
             if changed[mask | around].any():
                 continue  # next pass, after relabelling
             values, counts = np.unique(bands[around], return_counts=True)
@@ -387,7 +398,10 @@ def column_biomes(rng: CounterRNG, cfg: WorldGenConfig, water_top: np.ndarray) -
     bands of ``biome_indices``, except that every sea-level water body (4-connected columns whose
     water stands at ``WATER_TOP``, not the dug ponds above it) of at least ``SEA_COLUMNS``
     columns takes ``cfg.sea_biome``. Smaller ones keep their land biome, as a pond in a plain is
-    plains in the game."""
+    plains in the game. The seas can cut land regions into pieces, so afterwards every land region
+    smaller than ``MIN_BIOME_COLUMNS`` joins a neighbouring land biome (``merge_small_regions``
+    with the seas fixed); only an island smaller than that with no land around it keeps its own.
+    The surface is built from these final biomes (``_strata``), so it is true of them."""
     biome = biome_indices(rng, cfg)
     if cfg.sea_biome is None:
         return biome
@@ -396,7 +410,7 @@ def column_biomes(rng: CounterRNG, cfg: WorldGenConfig, water_top: np.ndarray) -
     big = [r for r, n in enumerate(sizes) if n >= SEA_COLUMNS]
     if big:
         is_sea = np.isin(labels, big) & sea
-        biome = np.where(is_sea, len(cfg.biomes), biome)
+        biome = merge_small_regions(np.where(is_sea, len(cfg.biomes), biome), MIN_BIOME_COLUMNS, fixed=is_sea)
     return biome
 
 

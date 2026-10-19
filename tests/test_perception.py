@@ -16,6 +16,7 @@ import pytest
 
 from hivemind.lang.world_words import FACE_WORDS as WORLD_FACE_WORDS
 from hivemind.rules import load_concepts, load_rules
+from hivemind.sim.ref import debug_info as D
 from hivemind.sim.ref import perception as P
 from hivemind.sim.ref import worldgen as wg
 from hivemind.sim.ref.rng import CounterRNG, Purpose
@@ -295,12 +296,50 @@ def test_window_light_is_the_cells_own_light_where_seen():
 
 
 def test_head_inside_a_block_sees_nothing():
-    w = room()
-    w.set(10, FLOOR + 2, 10, ID["sand"])  # a fallen block at head height
-    win = P.voxel_window(w, FEET, "M")
-    assert not win.seen.any() and (win.classes == UNSEEN).all() and (win.light == 0).all()
-    pano = P.panorama(w, EYE, PANO)
-    assert (pano.block == ID["sand"]).all() and (pano.distance == 0).all() and (pano.face == P.NONE).all()
+    """A cell with collision (a fallen block) or lava at the eye blinds it: the game draws the
+    block's in-wall overlay or lava's fog over the screen [mem]."""
+    for cls in (ID["sand"], LAVA):
+        w = room()
+        w.set(10, FLOOR + 2, 10, cls)  # a fallen block (or lava) at head height
+        win = P.voxel_window(w, FEET, "M")
+        assert not win.seen.any() and (win.classes == UNSEEN).all() and (win.light == 0).all()
+        pano = P.panorama(w, EYE, PANO)
+        assert (pano.block == cls).all() and (pano.distance == 0).all() and (pano.face == P.NONE).all()
+        assert not P.entity_visible(w, EYE, (12.5, FLOOR + 1.0, 10.5), 1.95)
+    t = P.tables(w)
+    assert not t.eye_clear[LAVA] and not t.eye_clear[ID["sand"]] and not t.eye_clear[BARRIER]
+    assert not t.eye_clear[UNSEEN]
+
+
+def test_a_sign_or_banner_at_head_height_does_not_blind_the_eye():
+    """An opaque class without collision (signs, banners, the portal class) can hold the head while
+    the body stands in a free cell. The eye looks out of it: the window and the panorama are those
+    of an air cell there, except that the window shows the banner in the eye's own cell."""
+    banner, sign, portal = class_of("white_wall_banner"), class_of("oak_sign"), class_of("nether_portal")
+    t = P.tables(room())
+    for cls in (banner, sign, portal):
+        assert not t.see[cls] and C.collision_height[cls] == 0 and t.eye_clear[cls], C.block_class(cls).name
+    plain = world_with(fills=[(STONE, (11, 11), (61, 64), (0, 39))])  # a wall 0.5 east of the eye
+    hung = plain.copy()
+    hung.set(10, FLOOR + 2, 10, banner)  # a wall banner on it, at head height in the agent's cell
+    zombie = (8.5, FLOOR + 1.0, 10.5)
+    for w in (plain, hung):
+        w.mobs.alloc(cls=ZOMBIE, pos=zombie)
+    a, b = P.voxel_window(plain, FEET, "M"), P.voxel_window(hung, FEET, "M")
+    assert b.seen.sum() > 1000 and np.array_equal(a.seen, b.seen)
+    eye_cell = (10 - b.origin[0], FLOOR + 2 - b.origin[1], 10 - b.origin[2])
+    assert b.classes[eye_cell] == banner and a.classes[eye_cell] == AIR
+    other = np.ones(a.classes.shape, bool)
+    other[eye_cell] = False
+    assert np.array_equal(a.classes[other], b.classes[other])
+    pa, pb = P.panorama(plain, EYE, PANO), P.panorama(hung, EYE, PANO)
+    for name in ("block", "entity", "face", "distance"):
+        assert np.array_equal(getattr(pa, name), getattr(pb, name)), name  # the eye's cell is never a hit
+    assert (pb.entity == ZOMBIE).any() and P.entity_visible(hung, EYE, zombie, 1.95)
+    # The wall it hangs on still hides what lies behind it.
+    behind = hung.copy()
+    behind.set(12, FLOOR + 2, 10, DIAMOND)
+    assert P.voxel_window(behind, FEET, "M") == b and P.panorama(behind, EYE, PANO) == pb
 
 
 def test_corner_ties_are_deterministic():
@@ -438,6 +477,32 @@ def test_a_ray_that_starts_in_water_sees_the_pool():
     assert above.block[23, 0] == WATER and above.face[23, 0] == P.FACE_WORDS.index("top")
 
 
+@pytest.mark.parametrize("plant", ["kelp", "seagrass", "tall_seagrass"])
+def test_a_head_in_a_plant_under_water_starts_in_water(plant):
+    """Kelp and seagrass always stand in water (the data flags them liquid): a head in one is under
+    water, so its rays pass the water around it and see the pool and the plants, never water at
+    distance 0. A swimming ray that meets a plant cell stops there: the plant is a hit."""
+    cls = ID[plant]
+    pool = [(WATER, (4, 16), (57, 64), (4, 16))]
+    water = world_with(fills=pool, solid_to=64)
+    grown = world_with(fills=[*pool, (cls, (10, 10), (57, 64), (10, 10))], solid_to=64)  # a column through the head
+    feet = (10.5, 58.0, 10.5)  # eye 59.62, in cell (10, 59, 10)
+    eye = P.eye_of(feet)
+    assert grown.get(10, 59, 10) == cls and P.tables(grown).water[cls] and not P.tables(grown).open_water[cls]
+    p = P.panorama(grown, eye, PANO)
+    assert not (p.block == WATER).any() and (p.distance > 0).all()
+    assert p.block[23, 0] == cls and p.face[23, 0] == P.FACE_WORDS.index("top")  # the plant cell below the head
+    pw = P.panorama(water, eye, PANO)
+    away = p.block != cls  # the pixels whose rays leave the plant column: as from open water
+    assert away.sum() > 1500 and np.array_equal(p.block[away], pw.block[away])
+    assert np.array_equal(p.distance[away], pw.distance[away])
+    beside = world_with(fills=[*pool, (cls, (12, 12), (57, 64), (4, 16))], solid_to=64)  # a wall of plants east
+    pb = P.panorama(beside, eye, PANO)  # from open water
+    assert pb.block[7, 24] == cls and pb.face[7, 24] == P.FACE_WORDS.index("west")
+    assert pb.distance[7, 24] == pytest.approx(1.5 / math.cos(math.radians(1.875)) / math.cos(math.radians(1.875))
+                                               / 64.0, rel=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # The panorama: entities
 # ---------------------------------------------------------------------------
@@ -535,11 +600,15 @@ def test_sightings_from_the_window():
     assert s.nearest(DIAMOND) is None and s.tick == 5 and not s.xray
     assert s.of(IRON)[0].distance == pytest.approx(float(np.linalg.norm(np.add((14, FLOOR + 1, 10), 0.5) - EYE)))
     assert all((a.distance, a.pos) <= (b.distance, b.pos) for a, b in zip(s.items, s.items[1:]))
-    assert s.counts[STONE] == P.PER_CLASS == 8  # the floor: its 8 nearest blocks
-    full = P.sightings(C, EYE, 5, win, per_class=None)
+    # Every seen resource block is a sighting (DESIGN.md 6.1: it enters memory when it is seen);
+    # which places to keep is the notebook's eviction, not perception's.
     seen_stone = int((win.seen & (win.classes == STONE)).sum())
-    assert full.counts[STONE] == seen_stone and 400 < seen_stone < 21 * 21  # the ores hide a few floor cells
-    assert s.of(STONE) == full.of(STONE)[:8]
+    assert s.counts[STONE] == seen_stone and 400 < seen_stone < 21 * 21  # the ores hide a few floor cells
+    assert {h.pos for h in s.of(STONE)} == {tuple(int(v) for v in c) for c in
+                                            np.argwhere(win.seen & (win.classes == STONE)) + np.asarray(win.origin)}
+    capped = P.sightings(C, EYE, 5, win, per_class=8)  # an optional bound, used by nothing in the design
+    assert capped.counts[STONE] == 8 and capped.of(STONE) == s.of(STONE)[:8] and capped.of(IRON) == s.of(IRON)
+    assert P.perceive(w, FEET).sightings == P.sightings(C, EYE, w.tick, win, P.panorama(w, EYE, PANO))
 
 
 def test_sightings_s_window_only_m_window_and_panorama(open_world):
@@ -584,6 +653,7 @@ def test_xray_is_flagged_and_sees_what_is_hidden():
     assert xray.window.classes[12, FLOOR - 2 - 57, 12] == DIAMOND and xray.window.seen.all()
     assert np.array_equal(xray.window.classes, w.region(0, 57, 0, 21, 66, 21))
     assert xray.sightings.nearest(DIAMOND).pos == (12, FLOOR - 2, 12)
+    assert xray.sightings.counts[STONE] == P.XRAY_PER_CLASS == 8  # findBlocks' count: not 300,000 stone blocks
     assert xray.panorama == honest.panorama  # the panorama stays honest
     assert P.xray_sightings(w, EYE, per_class=1).nearest(STONE).pos == (10, FLOOR, 10)  # nearest, seen or not
 
@@ -689,11 +759,14 @@ def test_deterministic():
 # ---------------------------------------------------------------------------
 
 
+CAVE_VIEW = (11.5, 61.0, 10.5)  # in the cave scene's room, 1.5 west of its east wall (x 13)
+
+
 def _cave_behind_wall():
     """A dark room with a torch; one stone block east of it (x 13), a sealed cave (x 14-20)."""
     w = world_with(fills=[(AIR, (4, 12), (61, 64), (4, 16)), (AIR, (14, 20), (61, 64), (4, 16)),
                           (TORCH, (5, 5), (61, 61), (5, 5))], solid_to=75)
-    slot = w.alloc_agent(FEET, yaw=-90.0)  # facing the wall, 2.5 away
+    slot = w.alloc_agent(CAVE_VIEW, yaw=-90.0)  # facing the wall, 1.5 away
 
     def hide(w: World) -> None:
         for y in range(61, 65):
@@ -704,7 +777,7 @@ def _cave_behind_wall():
                 w.set(x, 60, z, DIAMOND)  # its floor
                 w.set(x, 65, z, ID["coal_ore"])  # its ceiling
         w.set(18, 61, 14, LAVA)  # a light source in the sealed cave
-        w.mobs.alloc(cls=ZOMBIE, pos=(14.5, 61.0, 10.5))  # just behind the wall, within reach
+        w.mobs.alloc(cls=ZOMBIE, pos=(14.5, 61.0, 10.5))  # just behind the wall: its box 2.7 away, within reach
 
     def reveal(w: World) -> None:
         w.set(13, 62, 10, AIR)  # a hole in the wall
@@ -835,8 +908,32 @@ def _behind_a_wall_of(member: str):
     return scene
 
 
+def _banner_at_head_height():
+    """A wall banner in the agent's own cell at head height, hung on a one-block wall (x 11) with a
+    sealed cave behind it (x 12-16): the eye looks out of the banner's cell, not through the wall.
+    F3 names the banner itself at distance 0 (the head inside a block, debug_info), so here the
+    window, the panorama and entity_visible are what can change."""
+    w = world_with(fills=[(AIR, (4, 10), (61, 64), (4, 16)), (AIR, (12, 16), (61, 64), (4, 16)),
+                          (class_of("white_wall_banner"), (10, 10), (62, 62), (10, 10))], solid_to=75)
+    slot = w.alloc_agent(FEET, yaw=-90.0)  # eye in the banner's cell, facing the wall 0.5 away
+
+    def hide(w: World) -> None:
+        for y in range(61, 65):
+            for z in range(4, 17):
+                w.set(17, y, z, IRON)  # the cave's far wall
+        for x in range(12, 17):
+            w.set(x, 60, 10, DIAMOND)  # its floor
+        w.mobs.alloc(cls=ZOMBIE, pos=(12.5, 61.0, 10.5))  # right behind the wall
+
+    def reveal(w: World) -> None:
+        w.set(11, 62, 10, AIR)  # a hole in the wall behind the banner
+
+    return w, slot, hide, reveal, [(12.5, 61.0, 10.5)]
+
+
 SCENES = {
     "cave behind a 1-block wall": _cave_behind_wall,
+    "cave behind the wall a banner at head height hangs on": _banner_at_head_height,
     "ores under the floor": _ores_under_floor,
     "entity behind a block": _entity_behind_block,
     "lava wall": _lava_wall,
@@ -901,8 +998,8 @@ def test_f3_is_unchanged_by_a_zombie_or_lava_behind_the_wall():
     assert base.block == STONE and base.block_face == "west" and base.entity is None and base.fluid is None
     zombie = w.copy()
     zombie.mobs = w.mobs.copy()
-    zombie.mobs.alloc(cls=ZOMBIE, pos=(14.5, 61.0, 10.5))  # 3.7 from the eye: behind the wall
-    zombie.mobs.alloc(cls=ZOMBIE, pos=(13.5, 61.0, 10.5))  # inside the wall's cell, 2.7 away
+    zombie.mobs.alloc(cls=ZOMBIE, pos=(14.5, 61.0, 10.5))  # 2.7 from the eye, within reach: behind the wall
+    zombie.mobs.alloc(cls=ZOMBIE, pos=(13.5, 61.0, 10.5))  # inside the wall's cell, 1.7 away
     assert P.perceive(zombie, agent=slot).f3 == base
     lava = w.copy()
     lava.set(14, 62, 10, LAVA)  # right behind the wall in the look direction, sealed in the cave
@@ -913,6 +1010,17 @@ def test_f3_is_unchanged_by_a_zombie_or_lava_behind_the_wall():
     assert P.perceive(zombie, agent=slot).f3.entity == ZOMBIE
     opened = P.perceive(lava, agent=slot).f3
     assert opened.fluid == "lava" and opened.block is None
+
+
+def test_only_the_wall_keeps_f3_from_naming_the_hidden_zombie():
+    """The cave scene's hidden zombie is within the entity reach in the look direction, so the
+    scene's F3 check can fail: once the hole is open, F3 names the zombie."""
+    w, slot, hide, reveal, _ = _cave_behind_wall()
+    hide(w)
+    assert P.perceive(w, agent=slot).f3.entity is None
+    reveal(w)
+    g = P.perceive(w, agent=slot).f3
+    assert g.entity == ZOMBIE and g.entity_distance < D.ENTITY_REACH
 
 
 # ---------------------------------------------------------------------------

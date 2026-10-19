@@ -1,6 +1,6 @@
 # Minecraft Hivemind
 
-Read DESIGN.md (the design) and docs/contracts.md (the interfaces between modules) before changing code.
+Read docs/HANDOFF.md (where things stand and what comes next), DESIGN.md (the design) and docs/contracts.md (the interfaces between modules) before changing code.
 
 - Python 3.11 or newer, NumPy only under `hivemind/`. Tests: `.venv/bin/python -m pytest` (Windows: `.venv\Scripts\python -m pytest`); slow tests run with `-m slow`. Node tests: `cd bridge && npm test` (Node 22 or newer).
 - Generated data in `data/` is committed and checked byte for byte. After changing the rules build, the class tables or the vocabulary, rebuild in this order and commit the results together: `python -m hivemind.rules.build_rules`, then `python -m hivemind.rules.classes`, then `python -m hivemind.lang.vocab` (each has `--check`).

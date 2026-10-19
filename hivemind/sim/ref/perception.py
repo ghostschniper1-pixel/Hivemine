@@ -8,7 +8,7 @@ blocks. The bridge runs the same functions on the blocks Mineflayer holds (bridg
     p = perceive(world, agent=slot, preset="M")   # at a decision: window, panorama, F3 group
     p.window.classes        # uint8 (21, 9, 21) [x, y, z]: class ids, 255 = unseen
     p.panorama.block        # int16 (24, 96) [row, column]: class of the block hit (M only)
-    p.sightings.items       # resource blocks seen, nearest 8 per class (for the notebook)
+    p.sightings.items       # every resource block seen, nearest first (for the notebook)
     p.f3.block, p.f3.time_word                                # the F3 group (debug_info.py)
     perceive(world, feet, tick, panorama=False, cache=cache)  # in-macro recasts (RaySchedule)
     perceive(world, feet, tick, xray=True)                    # ablation only: flagged ``xray``
@@ -32,10 +32,20 @@ Definitions (DESIGN.md 6.1, draft 0.5: surface-only vision):
   centre of a face of an opaque cell that points toward the eye (a face whose outward normal n
   has (eye - face centre) . n > 0; such a segment ends inside the neighbour across the face, so
   that neighbour must be see-through too; a cube has at most three such faces, and one clear
-  segment is enough). The eye's own cell is crossed by every segment, so with the head inside an
-  opaque cell (a fallen block, lava) nothing is seen. The test is conservative: a cell whose face
-  centres are hidden but whose corner shows is ``unseen`` in the window, while a panorama ray or
-  the look ray may still hit it, which is honest, because such a ray proves the eye sees it.
+  segment is enough). The test is conservative: a cell whose face centres are hidden but whose
+  corner shows is ``unseen`` in the window, while a panorama ray or the look ray may still hit
+  it, which is honest, because such a ray proves the eye sees it.
+- **The eye's own cell:** every segment and every ray starts in it, so it decides whether the eye
+  sees anything. The eye looks out of it (``eye_clear``) when it is see-through, or opaque but
+  without collision (signs, banners, the portal class: the head can be inside one while the body
+  stands in a free cell); such a cell is then passed like a see-through one, so a wall banner at
+  head height does not blind the agent [design]. What its board or cloth hides in the game is
+  not modelled (block shapes are not); from inside the cell that is part of the wall a sign or
+  banner hangs on, or a slice behind a hanging sign's board. Every other opaque cell blinds the
+  eye [design]: lava, whose fog hides everything a block away [mem], and a cell with collision
+  (a block fallen or placed into the head), over which the game draws its in-wall overlay [mem:
+  the overlay is drawn for a full collision cube; any collision counts here, which is
+  conservative for classes that merge shapes]. With the head in such a cell nothing is seen.
 - **Segments** are walked cell by cell with a 3-D DDA (Amanatides and Woo; ``trace_rays``): when a
   segment crosses two cell planes at once (an edge or a corner), it steps x before y before z, a
   fixed rule both sides share. The arithmetic is IEEE doubles in the order written.
@@ -56,10 +66,13 @@ Definitions (DESIGN.md 6.1, draft 0.5: surface-only vision):
   first thing it reaches within 64 blocks [est]:
 
   * a block: the first cell that is not air, entered at t <= 64 (water, lava, leaves, glass,
-    plants and the world-edge barrier count). The eye's own cell is never a hit; a ray that starts
-    in water (``water`` or ``bubble_column``) passes such cells until it first leaves them
-    [design]. Distance = t at which the ray enters the cell; the face is the side it enters
-    (a ray travelling south enters a ``north`` face [mem]).
+    plants and the world-edge barrier count). The eye's own cell is never a hit. A ray that starts
+    in water passes water cells (``water`` and ``bubble_column``) until it first leaves them
+    [design]; it starts in water when the eye's cell holds water, which includes the plants that
+    always stand in it (``kelp``, ``seagrass``, ``tall_seagrass``, flagged liquid in the data), so
+    a swimmer in a kelp forest sees the kelp and the pool, not the water around its head. Another
+    plant cell met by the swimming ray is a hit. Distance = t at which the ray enters the cell;
+    the face is the side it enters (a ray travelling south enters a ``north`` face [mem]).
   * an entity's box (``entity_boxes``: other live agents, mobs, dropped items), when the ray
     enters the box at a t with 0 <= t <= 64, strictly before it leaves the air cell it is in (so a
     block entered at the same t wins). Boxes that contain the eye are skipped. The face is the
@@ -70,31 +83,36 @@ Definitions (DESIGN.md 6.1, draft 0.5: surface-only vision):
   the last cell the ray crossed before the block (or the cell where it met the entity's box, or
   where it ended when nothing was hit).
 
-  The rule "the eye's own cell is never a hit" (DESIGN.md 6.1) is for a see-through eye cell
-  (water, short grass, a cobweb): the ray starts inside it and looks out. DESIGN.md does not say
-  what a head inside an opaque cell (a fallen block of sand, lava) sees. Here every pixel then
-  shows that cell at distance 0 with no face and that cell's light [design]: it is what the game
-  draws over the whole screen (the in-wall overlay [mem]), and the window shows nothing either,
-  since no segment leaves the eye's cell. Casting past it would show what the eye cannot see.
-- **Resource sightings** (``sightings``): the resource blocks (``concepts.resource``) among the
-  seen window cells and the panorama's block hits (entered within 64 blocks [est]), by cell, sorted by
-  distance from the eye to the cell centre (ties: x, y, z), the nearest ``PER_CLASS`` = 8 [est] of
-  each class (the notebook keeps 48 places, DESIGN.md 6.3). Preset S has no panorama, so its
-  sightings come from the window alone.
+  The rule "the eye's own cell is never a hit" (DESIGN.md 6.1) holds for every cell the eye
+  looks out of (``eye_clear``, above): the ray starts inside it and looks out. DESIGN.md does
+  not say what a head inside a cell that blinds it (a fallen block of sand, lava) sees. Here
+  every pixel then shows that cell at distance 0 with no face and that cell's light [design]: it
+  is what the game draws over the whole screen, and the window shows nothing either, since no
+  segment leaves the eye's cell. Casting past it would show what the eye cannot see.
+- **Resource sightings** (``sightings``): every resource block (``concepts.resource``) among the
+  seen window cells and the panorama's block hits (entered within 64 blocks [est]), one per cell,
+  sorted by distance from the eye to the cell centre (ties: x, y, z). All of them go to the
+  notebook, as DESIGN.md 6.1 says ("a resource block enters memory when it is seen"); which
+  places it keeps is the notebook's eviction (DESIGN.md 6.3), not perception's. ``per_class``
+  can keep only the nearest n of each class, for callers that want a bound; nothing in the
+  design uses it. Preset S has no panorama, so its sightings come from the window alone.
 - **Schedule** (DESIGN.md 6.1): the panorama is cast once per decision; during a macro the
   window (and its sightings) is recast every ``RECAST_PERIOD`` = 20 ticks [est] while the eye
   moves (``RaySchedule``). ``WindowCache`` reuses a window while the feet have not moved and no
   block that could change it has changed, giving exactly the same output.
 - **X-ray ablation** (DESIGN.md 6.1): the window shows every cell's true class, and sightings are
-  every resource block within 64 blocks [est] (exposed or not, no rays; what Mineflayer's
-  ``findBlocks`` gives), nearest 8 per class. The panorama stays as it is. Results carry
-  ``xray=True``; never used for an agent that is evaluated or deployed.
+  the resource blocks within 64 blocks [est] (exposed or not, no rays; what Mineflayer's
+  ``findBlocks`` gives), the nearest ``XRAY_PER_CLASS`` = 8 [est] of each class, because
+  ``findBlocks`` returns at most its ``count`` [mem] and every block within 64 is half a million
+  blocks of stone and dirt. The panorama stays as it is. Results carry ``xray=True``; never used
+  for an agent that is evaluated or deployed.
 
 Honesty: in normal mode a ray stops at the first opaque cell, so nothing here reads a cell no
-straight segment from the eye reaches through see-through cells, except to learn that it is not
-see-through, and no entity box is entered beyond the first block a ray meets. Changing such cells
-into other opaque classes that block light and emit none, or putting entities where no ray
-reaches, therefore never changes the window, the panorama, the sightings or the F3 group
+straight segment from the eye reaches through see-through cells (the eye's own cell passable
+when the eye looks out of it), except to learn that it is not see-through, and no entity box is
+entered beyond the first block a ray meets. Changing such cells into other opaque classes that
+block light and emit none, or putting entities where no ray reaches, therefore never changes
+the window, the panorama, the sightings or the F3 group
 (``tests/test_perception.py`` checks it in adversarial scenes and in generated cave worlds, from
 the surface and from inside caves; ``tests/test_debug_info.py`` checks the look ray). Light is
 the exception the design states: a light source out of sight changes the light of seen cells.
@@ -119,8 +137,8 @@ if TYPE_CHECKING:
 
 EYE_HEIGHT = 1.62  # [mem] standing player eye height
 ENTITY_RANGE = 32.0  # DESIGN.md 6.2: the entity table lists visible entities within 32 blocks
-PER_CLASS = 8  # [est] sightings kept per resource class per call (the notebook holds 48 places)
 XRAY_RANGE = 64.0  # DESIGN.md 6.1 [est]: x-ray memory from every resource block within 64 blocks
+XRAY_PER_CLASS = 8  # [est] the x-ray's nearest blocks per class (``findBlocks`` returns at most ``count`` [mem])
 RECAST_PERIOD = 20  # DESIGN.md 6.1 [est]: in-macro window recasts every 20 ticks while the eye moves
 NONE = -1  # "none" in the panorama's int arrays (no block, no entity, no agent, no face)
 DEFAULT_BOX = (0.6, 1.8)  # [est] width, height for entity classes whose size the data lacks (fallbacks)
@@ -276,8 +294,10 @@ def see_through_table(concepts: Concepts) -> np.ndarray:
 @dataclass(frozen=True)
 class _Tables:
     see: np.ndarray  # bool[256] see-through
+    eye_clear: np.ndarray  # bool[256]: an eye inside a cell of this class looks out of it (module docstring)
     resource: np.ndarray  # bool[256]
-    water: np.ndarray  # bool[256]: water and bubble columns (what a swimmer sees through, and F3's "water")
+    water: np.ndarray  # bool[256]: cells that hold water (open water and the plants that stand in it)
+    open_water: np.ndarray  # bool[256]: water and bubble columns, nothing else (what a swimmer's ray passes)
     lava: int
     player: int  # entity class of agents
     item: int  # entity class of dropped items
@@ -287,16 +307,30 @@ class _Tables:
 
 @lru_cache(maxsize=8)
 def _tables_for(concepts: Concepts) -> _Tables:
-    water = np.zeros(UNSEEN + 1, bool)
+    see = _see_through_for(concepts)
+    lava = concepts.block_class("lava").id
+    open_water = np.zeros(UNSEEN + 1, bool)
     for name in ("water", "bubble_column"):
-        water[concepts.block_class(name).id] = True
+        open_water[concepts.block_class(name).id] = True
+    # Water and the see-through classes the data flags liquid other than lava: kelp, seagrass and
+    # tall seagrass, which are always water-filled in the game [mem].
+    water = open_water | (concepts.liquid & see)
+    water[lava] = False
+    # An eye inside a see-through cell looks out of it, and so does one inside a cell without
+    # collision (signs, banners, portals [design]): the game draws its in-wall overlay over the
+    # screen only for a cell with a full collision cube [mem], and any collision counts here.
+    eye_clear = see | (concepts.collision_height == 0)
+    eye_clear[lava] = False  # [mem] lava's fog hides everything a block away
+    eye_clear[UNSEEN] = False
+    for a in (water, open_water, eye_clear):
+        a.setflags(write=False)
     n = 1 + max(c.id for c in concepts.entity_classes)
     width = np.full(n, DEFAULT_BOX[0])
     height = np.full(n, DEFAULT_BOX[1])
     for c in concepts.entity_classes:
         if c.width is not None and c.height is not None:
             width[c.id], height[c.id] = c.width, c.height
-    return _Tables(_see_through_for(concepts), concepts.resource.copy(), water, concepts.block_class("lava").id,
+    return _Tables(see, eye_clear, concepts.resource.copy(), water, open_water, lava,
                    concepts.entity_class("player").id, concepts.entity_class("item").id, width, height)
 
 
@@ -417,17 +451,26 @@ def trace_rays(see: np.ndarray, base: np.ndarray, eye: np.ndarray, ends: np.ndar
     return clear & np.all(cell == last_cells, axis=1)
 
 
+def _sight_mask(t: _Tables, region: np.ndarray, eye_local: np.ndarray) -> np.ndarray:
+    """The see-through mask of a region of classes for segments from an eye in cell ``eye_local``
+    of it: perception's table, except that the eye's own cell is passable when ``eye_clear`` says
+    the eye looks out of it (module docstring)."""
+    see = t.see[region]
+    i, j, k = (int(v) for v in eye_local)
+    see[i, j, k] = t.eye_clear[region[i, j, k]]
+    return see
+
+
 def line_of_sight(world: World, eye: Sequence[float], point: Sequence[float],
                   last_cell: Sequence[int] | None = None) -> bool:
     """Whether the segment from ``eye`` to ``point`` crosses only see-through cells (the cell
     containing ``point`` excluded when ``last_cell`` names the cell just before it)."""
-    see_table = tables(world).see
     eye = np.asarray(eye, float)
     point = np.asarray(point, float)
     lo = np.floor(np.minimum(eye, point)).astype(np.int64) - 1
     hi = np.floor(np.maximum(eye, point)).astype(np.int64) + 2
     region = world.region(int(lo[0]), int(lo[1]), int(lo[2]), int(hi[0]), int(hi[1]), int(hi[2]))
-    see = see_table[region]
+    see = _sight_mask(tables(world), region, np.floor(eye).astype(np.int64) - lo)
     if last_cell is None:
         # Walk all the way: the cell containing the point must be see-through too.
         nudged = point + (point - eye) * 1e-9
@@ -459,14 +502,14 @@ def seen_cells(world: World, eye: Sequence[float], origin: Sequence[int],
                shape: Sequence[int]) -> tuple[np.ndarray, int]:
     """Which cells of the box ``origin + [0, shape)`` are seen from ``eye`` (module docstring), as
     bool[shape], and the number of segments traced (a cost figure)."""
-    see_table = tables(world).see
     eye_arr = np.asarray(eye, float)
     o = np.asarray(origin, np.int64)
     s = np.asarray(shape, np.int64)
     ec = np.floor(eye_arr).astype(np.int64)
     lo = np.minimum(o, ec) - 1  # the box and the eye's cell, with a ring of neighbours
     hi = np.maximum(o + s, ec + 1) + 1
-    see = see_table[world.region(int(lo[0]), int(lo[1]), int(lo[2]), int(hi[0]), int(hi[1]), int(hi[2]))]
+    region = world.region(int(lo[0]), int(lo[1]), int(lo[2]), int(hi[0]), int(hi[1]), int(hi[2]))
+    see = _sight_mask(tables(world), region, ec - lo)
     off = o - lo
     box_see = see[off[0]:off[0] + s[0], off[1]:off[1] + s[1], off[2]:off[2] + s[2]].reshape(-1)
     cells = np.indices(tuple(int(v) for v in s)).reshape(3, -1).T + o[None, :]
@@ -723,8 +766,8 @@ def panorama(world: World, eye: Sequence[float], config: PanoramaConfig | None =
     shape = (cfg.rows, cfg.columns)
     ec = np.floor(eye_arr).astype(np.int64)
     eye_cls = world.get(int(ec[0]), int(ec[1]), int(ec[2]))
-    if not t.see[eye_cls]:
-        # The head is inside an opaque cell: it is all the eye sees (the eye-cell exception).
+    if not t.eye_clear[eye_cls]:
+        # The head is inside lava or a block: it is all the eye sees (the eye-cell exception).
         sky, blk = world.light_points(ec[None, :])
         return Panorama(tuple(float(v) for v in eye_arr), cfg, np.full(shape, eye_cls, np.int16),
                         np.full(shape, NONE, np.int16), np.full(shape, NONE, np.int16),
@@ -766,7 +809,7 @@ def panorama(world: World, eye: Sequence[float], config: PanoramaConfig | None =
     hit_axis = np.zeros(n, np.int64)
     front = cell.copy()  # the cell in front of the face (whose light the pixel shows)
     hit_cell = cell.copy()
-    swim = np.full(n, bool(t.water[eye_cls]))
+    swim = np.full(n, bool(t.water[eye_cls]))  # the head is in water, or in a plant standing in it
     active = np.ones(n, bool)
     steps = 0
     rows = np.arange(n)
@@ -794,7 +837,7 @@ def panorama(world: World, eye: Sequence[float], config: PanoramaConfig | None =
         local = cell[i2] - base[None, :]
         c = classes[local[:, 0], local[:, 1], local[:, 2]]
         sw = swim[i2]
-        wet = t.water[c]
+        wet = t.open_water[c]  # a plant in the water is a hit, as the pool's floor is
         swim[i2[sw & ~wet]] = False  # left the water the ray started in
         hit = ~(sw & wet) & (c != AIR)
         hi = i2[hit]
@@ -851,9 +894,9 @@ class Sighting:
 class Sightings:
     """The resource blocks sighted at one tick (sorted by distance, then x, y, z).
 
-    ``counts`` is the number sighted per class (at most ``per_class``). ``rays`` is a cost figure
-    (segments traced and panorama cells walked); it is left out of equality and must never reach
-    the notebook or the observation.
+    ``counts`` is the number sighted per class (at most ``per_class`` when one is given).
+    ``rays`` is a cost figure (segments traced and panorama cells walked); it is left out of
+    equality and must never reach the notebook or the observation.
     """
 
     tick: int
@@ -890,9 +933,9 @@ def _select(cells: np.ndarray, classes: np.ndarray, eye: np.ndarray, per_class: 
 
 
 def sightings(concepts: Concepts, eye: Sequence[float], tick: int, window: VoxelWindow | None,
-              pano: Panorama | None = None, *, per_class: int | None = PER_CLASS) -> Sightings:
+              pano: Panorama | None = None, *, per_class: int | None = None) -> Sightings:
     """Resource blocks among the seen window cells and the panorama's block hits (module
-    docstring), the nearest ``per_class`` of each class (None: all)."""
+    docstring): all of them, or the nearest ``per_class`` of each class when one is given."""
     resource = _tables_for(concepts).resource
     eye_arr = np.asarray(eye, float)
     parts_cells, parts_cls = [np.zeros((0, 3), np.int64)], [np.zeros(0, np.int64)]
@@ -921,9 +964,10 @@ def sightings(concepts: Concepts, eye: Sequence[float], tick: int, window: Voxel
 
 
 def xray_sightings(world: World, eye: Sequence[float], tick: int = 0, *, sight_range: float = XRAY_RANGE,
-                   per_class: int | None = PER_CLASS) -> Sightings:
-    """Ablation only: every resource block whose centre lies within ``sight_range`` of the eye,
-    seen or not (no rays), the nearest ``per_class`` of each class; flagged ``xray``."""
+                   per_class: int | None = XRAY_PER_CLASS) -> Sightings:
+    """Ablation only: the resource blocks whose centres lie within ``sight_range`` of the eye, seen
+    or not (no rays), the nearest ``per_class`` of each class (None: all of them, which is half a
+    million blocks of stone and dirt in a test world); flagged ``xray``."""
     resource = tables(world).resource
     eye_arr = np.asarray(eye, float)
     ec = np.floor(eye_arr).astype(np.int64)
@@ -981,7 +1025,7 @@ class Perception:
 def perceive(world: World, feet: Sequence[float] | None = None, tick: int | None = None, *,
              preset: str | PerceptionConfig = DEFAULT_PRESET, agent: int | None = None, panorama: bool = True,
              f3: bool = True, xray: bool = False, cache: WindowCache | None = None,
-             per_class: int | None = PER_CLASS) -> Perception:
+             per_class: int | None = None) -> Perception:
     """The window (through ``cache`` when one is given), the panorama when ``panorama`` is set and
     the preset has one (pass False for in-macro recasts), the sightings from both, and the F3
     group when ``agent`` is given and ``f3`` is set.
@@ -990,7 +1034,9 @@ def perceive(world: World, feet: Sequence[float] | None = None, tick: int | None
     for ``feet``, and the F3 group is computed for it (``feet`` must then be where the slot
     stands, so that the window and the F3 group describe one viewpoint). ``tick`` defaults to
     ``world.tick``. ``xray``: the ablation (module docstring), flagged in the result, its window
-    and its sightings; the panorama and the F3 group are the same as without it."""
+    and its sightings; the panorama and the F3 group are the same as without it. ``per_class``:
+    keep only the nearest n sightings of each class (honest sightings keep all by default, the
+    x-ray its ``XRAY_PER_CLASS``)."""
     cfg = config_of(preset)
     tick = world.tick if tick is None else tick
     if feet is None:
@@ -1012,7 +1058,7 @@ def perceive(world: World, feet: Sequence[float] | None = None, tick: int | None
     if panorama and cfg.panorama is not None:
         pano = _cast_panorama(world, eye, cfg.panorama, exclude_agent=agent)
     if xray:
-        seen = xray_sightings(world, eye, tick, per_class=per_class)
+        seen = xray_sightings(world, eye, tick, per_class=XRAY_PER_CLASS if per_class is None else per_class)
     else:
         seen = sightings(world.concepts, eye, tick, window, pano, per_class=per_class)
     return Perception(int(tick), feet_t, eye, cfg.name, window, pano, seen, xray, group)

@@ -403,8 +403,61 @@ def test_sea_columns_are_ocean_ponds_keep_their_land_biome():
     dry = wg.generate(2, wg.preset("default", size_x=64, size_z=64, surface_y=59.0, caves_per_chunk=0.0,
                                    ores=False, stone_blobs=False, pools_per_chunk=0.0, sea_biome=None))
     assert not (dry.biome_map == C.biome("ocean").id).any()
+    # The seas cut the land: the pieces left smaller than MIN_BIOME_COLUMNS that touch other land
+    # join a neighbouring land biome, and no other land column changes its biome.
+    cut = np.where(ocean, C.biome("ocean").id, dry.biome_map)
+    labels, sizes = wg.column_regions(cut)
+    specks = np.zeros_like(ocean)
+    for r, n in enumerate(sizes):
+        piece = labels == r
+        if n < wg.MIN_BIOME_COLUMNS and not ocean[piece].any() and (wg._neighbours(piece) & ~ocean).any():
+            specks |= piece
+    assert np.array_equal((dry.biome_map != w.biome_map) & ~ocean, specks)
     differs = (dry.blocks != w.blocks).any(axis=1)  # e.g. sandstone under a sea floor in a desert band
-    assert not differs[~ocean].any()  # nothing else changes when the seas keep their land biome
+    assert not differs[~ocean & ~specks].any()  # nothing else changes when the seas keep their land biome
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_no_land_biome_is_a_speck_beside_the_sea(seed):
+    """A low world, whose seas cut the land bands into pieces: every land region of the final
+    biome map has at least MIN_BIOME_COLUMNS columns, except an island with no land around it,
+    and each column's surface is still true of its biome. (Seeds 0 and 1 left desert and forest
+    regions of 1 to 13 columns along the coasts before the land was merged again.)"""
+    cfg = wg.preset("default", surface_y=62.0, caves_per_chunk=0.0, ores=False, stone_blobs=False, vegetation=0.0)
+    w = wg.generate(seed, cfg)
+    ocean = w.biome_map == C.biome("ocean").id
+    assert ocean.sum() > 1000 and (~ocean).sum() > 1000
+    labels, sizes = wg.column_regions(w.biome_map)
+    for r, n in enumerate(sizes):
+        piece = labels == r
+        if n < wg.MIN_BIOME_COLUMNS:
+            assert not ocean[piece].any() and not (wg._neighbours(piece) & ~ocean).any(), (seed, n)  # an island
+    h = w.meta["surface"]
+    xs, zs = np.meshgrid(np.arange(w.size_x), np.arange(w.size_z), indexing="ij")
+    top = w.blocks[xs, h - MIN_Y, zs]
+    desert = w.biome_map == C.biome("desert").id
+    assert np.isin(top[desert], [ID["sand"], ID["gravel"]]).all()
+    green = np.isin(w.biome_map, list(_ids_of(("plains", "forest", "birch_forest"))))
+    assert not np.isin(top[green], [ID["sandstone"]]).any()
+    assert np.isin(top[green], [ID["grass_block"], ID["sand"], ID["gravel"]]).all()  # sand on beaches
+
+
+def test_merge_small_regions_keeps_fixed_columns():
+    b = np.zeros((8, 8), np.int64)
+    b[:, 4:] = 1
+    sea = np.zeros((8, 8), bool)
+    sea[3:5, :] = True  # a strait across the middle
+    sea[2, 0] = sea[2, 2] = True  # two inlets of it
+    b[sea] = 9
+    b[2, 1] = 1  # a speck of band 1 between the inlets: three sea neighbours, one land
+    out = wg.merge_small_regions(b, 4, fixed=sea)
+    assert (out[sea] == 9).all()  # fixed columns keep their band
+    assert out[2, 1] == 0  # the speck joined its land neighbour, not the sea's band 9
+    assert wg.merge_small_regions(b, 4)[2, 1] == 9  # without ``fixed`` the sea's band would win
+    assert (out[~sea] == np.where(np.arange(8)[None, :] < 4, 0, 1).repeat(8, 0)[~sea]).all()
+    island = np.full((6, 6), 9, np.int64)
+    island[2:4, 2:4] = 1  # a 4-column island with only fixed columns around it
+    assert np.array_equal(wg.merge_small_regions(island, 10, fixed=island == 9), island)
 
 
 # -- spawn ---------------------------------------------------------------------------------------

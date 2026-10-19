@@ -225,6 +225,48 @@ def test_entity_behind_the_targeted_block_or_lava_is_never_named(cls):
         assert P.entity_visible(w, P.eye_of(FEET), (13.5, 61.0, 10.5), 1.95)
 
 
+def test_a_wall_beyond_the_block_reach_still_stops_the_entity_pick():
+    """With an entity reach larger than the block reach (both are parameters), a wall between the
+    two reaches is not the targeted block, yet the entity pick stops at it, as the game's pick
+    casts its block ray to the larger reach [mem]: nothing behind a wall is named."""
+    for cls in (STONE, GLASS, LEAVES, LAVA):
+        w = world_with([wall(cls, 13)])  # west face 2.5 east of the eye
+        zombie(w, 14.5)  # box from x 14.2: 3.7 away, behind the wall
+        g = D.debug_info(w, w.alloc_agent(FEET, yaw=EAST), reach=2.0, entity_reach=4.0)
+        assert g.entity is None and g.block is None and g.fluid is None, cls  # lava at 2.5: beyond the reach too
+    open_ground = world_with()
+    zombie(open_ground, 14.5)
+    g = D.debug_info(open_ground, open_ground.alloc_agent(FEET, yaw=EAST), reach=2.0, entity_reach=4.0)
+    assert g.entity == ZOMBIE and g.entity_distance == pytest.approx(3.7)  # positive control: no wall
+    front = world_with([wall(STONE, 13)])
+    zombie(front, 12.5)  # box from x 12.2: 1.7 away, in front of the wall
+    g = D.debug_info(front, front.alloc_agent(FEET, yaw=EAST), reach=1.0, entity_reach=4.0)
+    assert g.entity == ZOMBIE and g.block is None  # the wall at 2.5 is beyond the block reach of 1.0
+    water = world_with([wall(WATER, 12), wall(STONE, 14)])
+    zombie(water, 13.5)  # in the water behind the first water cell
+    g = D.debug_info(water, water.alloc_agent(FEET, yaw=EAST), reach=1.0, entity_reach=4.0)
+    assert g.fluid is None and g.block is None and g.entity == ZOMBIE  # water at 1.5: passed, not named
+
+
+@pytest.mark.parametrize("plant", ["kelp", "seagrass", "tall_seagrass"])
+def test_a_plant_in_water_is_the_targeted_block_and_its_water_the_fluid(plant):
+    """Kelp and seagrass always stand in water: F3's fluid line names the water of the first cell its
+    fluid pick hits [mem], so the plant is the targeted block and ``water`` the targeted fluid."""
+    cls = ID[plant]
+    g = f3(world_with([wall(cls, 12), wall(STONE, 14)]))  # from the air
+    assert (g.block, g.block_face, g.fluid) == (cls, "west", "water")
+    assert g.block_distance == pytest.approx(1.5) and g.fluid_distance == pytest.approx(1.5)
+    pool = (WATER, (5, 15), (61, 64), (5, 15))
+    head = f3(world_with([pool, (cls, (10, 10), (61, 64), (10, 10))]))  # the head inside the plant
+    assert (head.block, head.block_distance, head.fluid, head.fluid_distance) == (cls, 0.0, "water", 0.0)
+    swim = f3(world_with([pool, wall(cls, 12)]))  # the head in open water, a plant ahead
+    assert (swim.fluid, swim.fluid_distance) == ("water", 0.0) and swim.block == cls
+    assert swim.block_distance == pytest.approx(1.5)
+    behind = world_with([pool, wall(cls, 12)])
+    zombie(behind, 13.5)  # 2.7 away, behind the plant: the plant is a targeted block, so it stops the pick
+    assert f3(behind).entity is None
+
+
 def test_entity_in_water_is_targeted():
     w = world_with([(WATER, (11, 14), (61, 64), (0, 39))])
     zombie(w, 12.5)

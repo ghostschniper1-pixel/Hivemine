@@ -31,27 +31,34 @@ builder turns into words: the facing and face words are direction and face conce
   x, y, z), t in blocks, starting with the eye's own cell (t = 0). Ranges are strict, as the
   game's ``Vec3.closerThan`` (distance < range) [mem]:
 
-  * ``water`` (or a bubble column) is passed; the first one met is the **targeted fluid**
-    ``water``.
+  * a cell that holds water is the **targeted fluid** ``water`` if it is the first fluid met:
+    ``water`` and bubble columns, which the ray passes, and the plants that always stand in water
+    (``kelp``, ``seagrass``, ``tall_seagrass``: perception's ``water`` table), which are also the
+    targeted block. F3's fluid line names the fluid of the first cell its fluid pick hits, a
+    block or a fluid, so a plant in water shows ``water`` [mem].
   * ``lava`` stops the ray (it is not see-through, DESIGN.md 6.1: a stated deviation from F3); if
     no fluid came first it is the targeted fluid ``lava``.
   * any other cell that is not air is the **targeted block**: class, distance t (where the ray
     enters it) and the face word of the side entered. Glass, leaves and plants are targeted too
     (each class is taken as a full cell; block shapes are not modelled). If it is the eye's own
-    cell (the head inside a block), t = 0 and the face is the game's choice for a ray that starts
-    inside a shape, ``Direction.getNearest(d).getOpposite()`` (ties: down, up, north, south,
-    west, east) [mem].
-  * a cell entered at 4.5 blocks or more (the block reach [mem]; F3 itself picks to 20 [mem])
-    ends the ray with no block. A fluid counts only if it comes before the targeted block, or
-    within 4.5 when there is none.
+    cell (the head inside a block, or inside a sign or banner, which the window and the panorama
+    look out of), t = 0 and the face is the game's choice for a ray that starts inside a shape,
+    ``Direction.getNearest(d).getOpposite()`` (ties: down, up, north, south, west, east) [mem].
+  * a block or fluid entered at 4.5 blocks or more (the block reach [mem]; F3 itself picks to 20
+    [mem]) is not named. A fluid counts only if it comes before the targeted block, or within
+    4.5 when there is none.
   * the **targeted entity** is the first entity box the ray enters within 3.0 blocks (the entity
-    reach [mem]) and strictly nearer than the targeted block's entry point or a lava cell: other
-    live agents (players) and mobs. Dropped items are not pickable in the game [mem], and the
-    agent's own box is skipped. A box that contains the eye counts at distance 0, as in the
-    game's pick (``ProjectileUtil.getEntityHitResult`` [mem]).
+    reach [mem]) and strictly nearer than the first cell the ray cannot pass (the targeted
+    block's entry point, or a lava cell): other live agents (players) and mobs. Dropped items are
+    not pickable in the game [mem], and the agent's own box is skipped. A box that contains the
+    eye counts at distance 0, as in the game's pick (``ProjectileUtil.getEntityHitResult``
+    [mem]). The cells are walked out to the larger of the two reaches, so that a wall beyond the
+    block reach still stops the entity pick when the entity reach is the larger (the game's
+    ``GameRenderer.pick`` casts its block ray to the larger reach, takes an entity only in front
+    of that hit, then filters each by its own reach [mem]).
 
-  None of it can name something behind a wall: the ray stops at the first opaque cell, and at
-  glass or leaves, which are targeted blocks.
+  None of it can name something behind a wall, whatever the two reaches: the ray stops at the
+  first opaque cell, and at glass, leaves and plants, which are targeted blocks.
 - **Time:** the tick within the day (``world.time_of_day``) and its word: ``day`` 0-11999,
   ``dusk`` 12000-12999, ``night`` 13000-22999, ``dawn`` 23000-23999 [design, from [15]]; the day
   number floor(day time / 24000) [mem: F3's Local Difficulty "Day N"], where the day time is the
@@ -212,21 +219,21 @@ def look_targets(world: World, eye: Sequence[float], direction: Sequence[float],
     t_delta = [abs(v) for v in inv]
     t_max = [((cell[k] + 1 if d[k] > 0 else cell[k]) - e[k]) * inv[k] if d[k] != 0 else math.inf for k in range(3)]
     block = block_t = block_face = fluid = fluid_t = None
-    stop_t = math.inf  # where the ray stops: the targeted block's entry point or a lava cell
+    stop_t = math.inf  # where the ray stops: the first cell it cannot pass, within reach or not
     t_in, axis = 0.0, -1  # the eye's own cell first
-    while t_in < reach:
+    while t_in < max(reach, entity_reach):  # the game picks blocks out to both reaches [mem]
         c = world.get(cell[0], cell[1], cell[2])
-        if t.water[c]:
-            if fluid is None:
-                fluid, fluid_t = "water", t_in
-        elif c == t.lava:
-            if fluid is None:
+        if t.water[c] and fluid is None and t_in < reach:  # water, or a plant standing in it
+            fluid, fluid_t = "water", t_in
+        if c == t.lava:
+            if fluid is None and t_in < reach:
                 fluid, fluid_t = "lava", t_in
             stop_t = t_in
             break
-        elif c != AIR:
-            block, block_t = c, t_in
-            block_face = FACE_WORDS[_inside_face(d) if axis < 0 else entered_face(axis, step[axis])]
+        if c != AIR and not t.open_water[c]:
+            if t_in < reach:
+                block, block_t = c, t_in
+                block_face = FACE_WORDS[_inside_face(d) if axis < 0 else entered_face(axis, step[axis])]
             stop_t = t_in
             break
         axis = min(range(3), key=lambda k: t_max[k])  # first minimum: x before y before z
