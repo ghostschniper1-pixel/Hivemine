@@ -11,7 +11,8 @@ billed to that key's account, not to a claude.ai plan.
 Both read the same saved key. `tools/claude-api.ps1` saves it, encrypted for your Windows account
 (DPAPI), in `%APPDATA%\hivemind\anthropic-api-key`, and the way it is sent (API key or bearer
 token) in `%APPDATA%\hivemind\anthropic-auth-mode`. Neither script prints the key or writes it to
-your user environment.
+your user environment. While a launcher runs, though, the key is in the environment of Claude
+Code and of every command it runs, so a command you approve can read it (see Permissions below).
 
 Remote Control and cloud sessions cannot use an API key: they always run on the claude.ai plan.
 Only local runs, such as these two launchers, bill the key.
@@ -61,14 +62,30 @@ py -3 -m venv .venv
   repository root: type a message at `you>`, `/exit` quits (or Ctrl+Z then Enter). Claude Code's own
   slash commands, such as `/compact`, are passed on.
 - Ctrl+C interrupts the current turn and the session goes on; a second Ctrl+C quits.
-- The model is `claude-opus-5-5` (`--model` changes it). The project's `CLAUDE.md` is loaded
-  (`setting_sources=["project"]`); your user settings in `~\.claude\settings.json` (their permission
-  rules, hooks and MCP servers) are not.
-- Permissions: tools that only read files inside the repository (Read, Grep, Glob and similar) run
-  without asking. Everything else (Bash, Edit, Write, WebFetch, ...) shows what it would do and asks
-  `Allow? [y/n]`; anything but `y` says no. Without a terminal (input redirected) the answer is no.
-  Claude Code itself already lets some harmless calls through without asking (some read-only shell
-  commands, for example `echo`), so not every Bash call reaches the question.
+- The model is `claude-opus-5-5` (`--model` changes it).
+- Settings: no settings file is loaded (`setting_sources=[]`): not your user settings in
+  `~\.claude\settings.json`, nor the repository's `.claude\settings.json`, `.claude\settings.local.json`
+  or `.mcp.json`. So no hooks, permission rules, environment, MCP servers or skills come from them;
+  `--check` names the ones it ignores. The repository's `CLAUDE.md` is given to Claude Code with its
+  system prompt instead (added after Claude Code's own).
+- Permissions: a hook of the runner sees every tool call before Claude Code's own rules. Read
+  inside the repository runs without asking. Every other call shows what it would do and asks
+  `Allow? [y/n]` (or `a` first, to show all of a long file or prompt), every Bash command included,
+  also the ones Claude Code would run without asking, such as `git status`. Anything but `y` says
+  no; without a terminal (input redirected) the answer is no. Claude Code 2.1.301 has no Grep or
+  Glob tool: it searches through Bash, so searches ask as well.
+- Approved commands run with the key in their environment (Claude Code passes it on to Bash and
+  to everything Bash starts). Do not approve a command that prints the environment (`env`,
+  `printenv`, `set`, `Get-ChildItem Env:`) or sends it anywhere: its output goes to the model and
+  into Claude Code's transcript.
+- What the question shows is what the call would do: characters a terminal does not show as
+  written (escape sequences, carriage returns, right-to-left overrides) are shown escaped, such as
+  `\x1b[2K`, with a note under the call, so a file's content cannot hide lines of the question.
+- Refused without asking: agents with `isolation` (a git worktree on a new branch, or a remote
+  run) and anything with `run_in_background`. Switched off: background tasks, scheduled prompts
+  (cron), git worktrees, messages to other Claude sessions and AskUserQuestion (the tools listed by
+  `--check`). The runner can ask only while one of your prompts runs; a question that comes at
+  another time (a turn Claude Code starts by itself) is answered no, with a note.
 - Before the first prompt is sent, the runner checks that Claude Code uses the key from the
   environment; if Claude Code reports another credential (such as your claude.ai login), it stops
   before anything is billed.
@@ -101,6 +118,10 @@ The printed numbers are an estimate, not an invoice: the Console is the bill.
 ## Tests
 
 `tools/agent.py` has offline tests: `.venv\Scripts\python -m pytest tests\test_agent_runner.py`.
-With the SDK installed, `.venv\Scripts\python -m pytest -m slow tests\test_agent_runner.py` also runs
-the real SDK and its Claude Code end to end against a small fake API on your own machine, with a
-made-up key: no model call reaches Anthropic and nothing is billed.
+They use a stand-in for the SDK that plays scripted turns (hook first, then the question), and,
+with the SDK installed, check that the runner and the stand-in use only what the real SDK has.
+`.venv\Scripts\python -m pytest -m slow tests\test_agent_runner.py` also runs the real SDK and its
+Claude Code end to end against a small fake API on your own machine, with a made-up key: no model
+call reaches Anthropic and nothing is billed. It checks that the key is the one sent, that
+`CLAUDE.md` reaches the model with the system prompt, and that a Write outside the repository, a
+`git status` and an agent in a git worktree are all refused when there is no terminal to ask.
