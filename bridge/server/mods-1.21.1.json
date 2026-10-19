@@ -1,53 +1,58 @@
 {
   "game_version": "1.21.1",
-  "note": "Pins for the server side of DESIGN.md 11.2 (Fabric 1.21.1 + Lithium + Carpet + harness mod) and the pregeneration tool. Modrinth, Fabric maven and Mojang were not reachable when this file was written (2026-10-16), so every version and hash is TODO-pin. On the owner's PC (bridge/server/README.md section 4, step 4): start the instance once, run `python bridge/server/servertool.py check-mods --dir <instance>`, which prints the Java version line and the sha256 (and server.jar's sha1) of every jar, and copy the values and versions here. check-mods reports NOT FROZEN, and fails, until every TODO-pin entry below is filled in (Java, server jar, loader, launcher and every mod). Once pinned, it fails on any missing, changed or extra jar and on another Java. Changing a pinned value is a change of the frozen config: measure again (DESIGN.md 11.2).",
+  "note": "Pins for the server side of DESIGN.md 11.2 (Fabric 1.21.1 + Lithium + Carpet + harness mod) and the pregeneration tool. Pinned on 2026-10-19 from check-mods on the owner's PC (instance inst-0, first start and stop). check-mods fails on another Java and on any missing, changed or extra jar. It reports NOT FROZEN until the harness mod exists (M2), by design. Changing a pinned value is a change of the frozen config: measure again (DESIGN.md 11.2).",
   "java": {
     "major": 21,
     "why": "Minecraft 1.20.5 and later need Java 21 [mem]",
-    "version": "TODO-pin (the version line of `java -version`, exactly as check-mods prints it after 'java:')"
+    "version": "openjdk version \"21.0.12.1\" 2026-08-18 LTS",
+    "build": "Eclipse Temurin JDK 21.0.12.1 (winget install EclipseAdoptium.Temurin.21.JDK)"
   },
   "server_jar": {
-    "file": "server.jar",
-    "source": "Mojang, downloaded by the Fabric server launcher, or from the 1.21.1 entry of https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
-    "sha1": "TODO-pin: compare with downloads.server.sha1 in Mojang's 1.21.1 version JSON",
-    "sha256": "TODO-pin"
+    "file": ".fabric/server/1.21.1-server.jar",
+    "source": "Mojang's 1.21.1 server jar, as the Fabric launcher caches and runs it. The launcher keeps it in .fabric/server/1.21.1-server.jar (and a remapped copy in versions/1.21.1/server-1.21.1.jar, not pinned). Same file as https://piston-data.mojang.com/v1/objects/59353fb40c36d304f2035d51e7d6e6baa98dc05c/server.jar (version JSON https://piston-meta.mojang.com/v1/packages/499680d659b7a0ccb2fa9a809c345c5baf2ace7d/1.21.1.json); the data generator runs on a copy of that file",
+    "sha1": "59353fb40c36d304f2035d51e7d6e6baa98dc05c",
+    "sha256": "e3bc55693e93cda0188f2e60aea28113fc647c5e85a15fa3d1b347349231b4bb"
   },
   "loader": {
     "name": "fabric-loader",
-    "version": "TODO-pin",
-    "installer_version": "TODO-pin",
-    "launcher_file": "TODO-pin (the jar that starts the server, in the instance folder: fabric-server-mc.1.21.1-loader.<version>-launcher.<version>.jar, or fabric-server-launch.jar from the installer)",
-    "launcher_sha256": "TODO-pin",
-    "source": "https://fabricmc.net/use/server/"
+    "version": "0.19.5",
+    "installer_version": "1.1.2",
+    "launcher_file": "fabric-server-mc.1.21.1-loader.0.19.5-launcher.1.1.2.jar",
+    "launcher_sha256": "809d99b16dd4d4b57384d128724ab0d6560f859aaba989dc6750d8437a447ed0",
+    "source": "https://meta.fabricmc.net/v2/versions/loader/1.21.1/0.19.5/1.1.2/server/jar"
   },
   "mods": [
     {
       "name": "lithium",
-      "version": "TODO-pin (latest release for 1.21.1)",
-      "sha256": "TODO-pin",
-      "source": "https://modrinth.com/mod/lithium",
-      "why": "server performance with patches tested for vanilla parity [25]"
+      "version": "0.15.4",
+      "sha256": "92329d98c57f5a22091a0adb509fdb1d60113a5602c708b799b13134bad13baa",
+      "source": "https://cdn.modrinth.com/data/gvQqBUqZ/versions/N08Z8wog/lithium-fabric-0.15.4%2Bmc1.21.1.jar",
+      "why": "server performance with patches tested for vanilla parity [25]",
+      "file": "lithium-fabric-0.15.4+mc1.21.1.jar"
     },
     {
       "name": "carpet",
-      "version": "TODO-pin (latest release for 1.21.1)",
-      "sha256": "TODO-pin",
-      "source": "https://modrinth.com/mod/carpet (versions API [26])",
-      "why": "spawn tracking, mob caps, TPS logging, /profile, /player fake players [27]; keep antiCheatDisabled=false"
+      "version": "1.4.147",
+      "sha256": "079fc8a4e073eb24b010ffcc588e59f93b984143e17d8ef19fbb0b6aff0f19d9",
+      "source": "https://cdn.modrinth.com/data/TQTTVgYE/versions/f2mvlGrg/fabric-carpet-1.21-1.4.147%2Bv240613.jar",
+      "why": "spawn tracking, mob caps, TPS logging, /profile, /player fake players [27]; keep antiCheatDisabled=false",
+      "file": "fabric-carpet-1.21-1.4.147+v240613.jar"
     },
     {
       "name": "chunky",
-      "version": "TODO-pin (latest Fabric release for 1.21.1)",
-      "sha256": "TODO-pin",
-      "source": "https://modrinth.com/plugin/chunky",
-      "why": "world pregeneration (DESIGN.md 4.4) [mem]; idle otherwise"
+      "version": "1.4.23",
+      "sha256": "3412b170247dde7351e0945d857e713bedf6fae05ab300aa74d06ffbde0ca07e",
+      "source": "https://cdn.modrinth.com/data/fALzjamp/versions/RVFHfo1D/Chunky-Fabric-1.4.23.jar",
+      "why": "world pregeneration (DESIGN.md 4.4); idle otherwise",
+      "file": "Chunky-Fabric-1.4.23.jar"
     },
     {
       "name": "fabric-api",
-      "version": "TODO-pin (latest release for 1.21.1)",
-      "sha256": "TODO-pin",
-      "source": "https://modrinth.com/mod/fabric-api",
-      "why": "required by Chunky's Fabric build [mem]; remove this entry if the pinned Chunky does not need it"
+      "version": "0.116.17+1.21.1",
+      "sha256": "79ac44b40780acbd884b34c50be1e39af682847e5f5cb3b1fddeeaa768dce800",
+      "source": "https://cdn.modrinth.com/data/P7dR8mSH/versions/Mys3P7lK/fabric-api-0.116.17%2B1.21.1.jar",
+      "why": "required by the pinned Chunky build (its Fabric metadata lists Fabric API as a dependency)",
+      "file": "fabric-api-0.116.17+1.21.1.jar"
     },
     {
       "name": "hivemind-harness",

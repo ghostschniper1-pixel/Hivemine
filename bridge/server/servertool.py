@@ -456,8 +456,14 @@ def _rule_text(value: Any) -> str:
 
 
 def gamerule_defaults(path: Path = GAMERULE_DEFAULTS) -> dict[str, str]:
-    """{rule: vanilla default} for every 1.21.1 gamerule (names checked, defaults [mem]; see the file)."""
+    """{rule: vanilla default} for every 1.21.1 gamerule (names checked; defaults see defaults_origin)."""
     return {rule: _rule_text(v) for rule, v in json.loads(path.read_text("utf-8"))["rules"].items()}
+
+
+def defaults_origin(path: Path = GAMERULE_DEFAULTS) -> str:
+    """How check-gamerules labels a rule left at its default: verified on a real server, or still [mem]."""
+    verified = json.loads(path.read_text("utf-8")).get("defaults_verified")
+    return f"vanilla default, verified {verified}" if verified else "vanilla default [mem]"
 
 
 def frozen_gamerules(control: str, path: Path = GAMERULES) -> dict[str, str]:
@@ -482,7 +488,8 @@ def expected_gamerules(control: str) -> dict[str, tuple[str, str]]:
     unknown = sorted(set(frozen) - set(defaults))
     if unknown:
         raise SystemExit(f"{GAMERULES.name} sets {unknown}, which are not 1.21.1 gamerules ({GAMERULE_DEFAULTS.name})")
-    want = {rule: (value, "vanilla default [mem]") for rule, value in defaults.items()}
+    origin = defaults_origin()
+    want = {rule: (value, origin) for rule, value in defaults.items()}
     want.update({rule: (value, "frozen") for rule, value in frozen.items()})
     return want
 
@@ -508,8 +515,8 @@ def cmd_check_gamerules(args: argparse.Namespace) -> int:
         problems += not ok
         print(f"{'ok  ' if ok else 'DIFF'} difficulty = {want_difficulty} (frozen)   server: {reply!r}")
     if problems:
-        print(f"note: on a fresh world, a DIFF on a 'vanilla default' rule means {GAMERULE_DEFAULTS.name} is wrong "
-              f"(its defaults are [mem]); otherwise the world was changed")
+        print(f"note: on a fresh world, a DIFF on a 'vanilla default' rule means {GAMERULE_DEFAULTS.name} is wrong; "
+              f"otherwise the world was changed")
     print(f"{'FAIL' if problems else 'PASS'} {len(want) + 1} checks, {problems} problems")
     return 1 if problems else 0
 
@@ -661,6 +668,7 @@ class Check:
     compared: int = 0
     diffs: list[str] = field(default_factory=list)
     skipped: str | None = None
+    tolerated: list[str] = field(default_factory=list)  # differences explicitly allowed, each with its reason
 
     @property
     def status(self) -> str:
@@ -674,7 +682,10 @@ class Check:
         """Print the outcome and return the status."""
         status = self.status
         if status == "PASS":
-            print(f"PASS {self.name} ({self.compared} compared)")
+            extra = f", {len(self.tolerated)} tolerated" if self.tolerated else ""
+            print(f"PASS {self.name} ({self.compared} compared{extra})")
+            for t in self.tolerated[:max_examples]:
+                print(f"     tolerated: {t}")
         elif status == "SKIP":
             print(f"SKIP {self.name}: {self.skipped}")
         else:
@@ -717,8 +728,32 @@ def _has_data(c: Check, gen: Path) -> bool:
     return False
 
 
+# JSON lists the game treats as sets, keyed by a path fragment of the file and the keys leading to the list.
+# The vanilla generator writes them in hash-set order, which need not match mcmeta's: on the owner's PC
+# (2026-10-19) the four flat-world presets differed only in the order of settings.structure_overrides, a set of
+# structure-set ids. Such files are compared with those lists sorted, and reported as tolerated, not as equal.
+UNORDERED_LISTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("/worldgen/flat_level_generator_preset/", ("settings", "structure_overrides")),
+)
+
+
+def _with_sets_sorted(rel_key: str, data: Any) -> Any:
+    """A copy of a data file with the lists of UNORDERED_LISTS that apply to it sorted."""
+    data = json.loads(json.dumps(data))
+    for fragment, keys in UNORDERED_LISTS:
+        if fragment not in f"/{rel_key}":
+            continue
+        node = data
+        for k in keys[:-1]:
+            node = node.get(k) if isinstance(node, dict) else None
+        if isinstance(node, dict) and isinstance(node.get(keys[-1]), list):
+            node[keys[-1]] = sorted(node[keys[-1]], key=lambda v: json.dumps(v, sort_keys=True))
+    return data
+
+
 def check_against_mcmeta(c: Check, gen: Path, mcmeta: Path, paths: list[str]) -> None:
-    """The generator's data files must equal the pinned mcmeta 1.21.1-data files (JSON-equal)."""
+    """The generator's data files must equal the pinned mcmeta 1.21.1-data files (JSON-equal), except for the
+    order of the set-like lists in UNORDERED_LISTS, which is reported as tolerated."""
     if not _has_data(c, gen):
         return
     if not mcmeta.is_dir():
@@ -730,8 +765,14 @@ def check_against_mcmeta(c: Check, gen: Path, mcmeta: Path, paths: list[str]) ->
             c.diffs.append(f"{rel}/{key}.json only in {'generator' if key in mine else 'mcmeta'}")
         for key in sorted(set(mine) & set(theirs)):
             c.compared += 1
-            if _load(mine[key]) != _load(theirs[key]):
-                c.diffs.append(f"{rel}/{key}.json differs")
+            a, b = _load(mine[key]), _load(theirs[key])
+            if a == b:
+                continue
+            name = f"{rel}/{key}"
+            if _with_sets_sorted(name, a) == _with_sets_sorted(name, b):
+                c.tolerated.append(f"{name}.json: same up to the order of a set-like list (UNORDERED_LISTS)")
+            else:
+                c.diffs.append(f"{name}.json differs")
 
 
 def check_loot_tables(c: Check, gen: Path, rules: dict) -> None:

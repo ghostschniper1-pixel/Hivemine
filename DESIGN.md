@@ -2,7 +2,7 @@
 
 Design document for two teams of 10–20 learning Minecraft agents.
 
-Draft 0.5, 2026-10-16. Status: M0 done (rules build, class tables, vocabulary, bridge config); M1 under way (language layer, world, perception, navigation, inventory, crafting, loot); see the repository. Nothing is trained yet. Written to be picked up after the current project (WAI). Draft 0.2 applied an engineering review and an ML review of draft 0.1. Draft 0.3 adds section 9.1, the owner's emergent-language arm. Draft 0.4 applies the owner's requests of 2026-10-16: natural language for all actions and observations (sections 5, 6.2, 9), explicit memory (6.3), inert ports for a later LLM (6.5), container verbs (5, 10), and a goal section shared by the agent and a later LLM, with the plan for wiring the two into one AI (6.6, M11). Draft 0.5 applies the owner's second round of requests of 2026-10-16: surface-only vision (6.1), a semantic panorama and a bigger network preset (6.2, 6.4, 13), and the debug screen's facts as inputs, with biomes (6.2). It also records the M1 review's findings (4.2, 4.3, 5). The interfaces between modules are fixed in `docs/contracts.md` (cited below as "contracts").
+Draft 0.5, 2026-10-16. Status: M0 done (rules build, class tables, vocabulary, bridge config), and checked against the real game on the owner's PC on 2026-10-19 (4.1, 11.2); M1 under way (language layer, world, perception, navigation, inventory, crafting, loot); see the repository. Nothing is trained yet. Written to be picked up after the current project (WAI). Draft 0.2 applied an engineering review and an ML review of draft 0.1. Draft 0.3 adds section 9.1, the owner's emergent-language arm. Draft 0.4 applies the owner's requests of 2026-10-16: natural language for all actions and observations (sections 5, 6.2, 9), explicit memory (6.3), inert ports for a later LLM (6.5), container verbs (5, 10), and a goal section shared by the agent and a later LLM, with the plan for wiring the two into one AI (6.6, M11). Draft 0.5 applies the owner's second round of requests of 2026-10-16: surface-only vision (6.1), a semantic panorama and a bigger network preset (6.2, 6.4, 13), and the debug screen's facts as inputs, with biomes (6.2). It also records the M1 review's findings (4.2, 4.3, 5). The interfaces between modules are fixed in `docs/contracts.md` (cited below as "contracts").
 
 **Labels.** [n] points to the References. **[mem]** means written from memory and not checked against a source; verify it against the pinned game version before relying on it. **[est]** means an estimate that must be measured. Everything else is a design choice or comes from a cited source.
 
@@ -201,6 +201,8 @@ The `hivemind/`, `data/` and `bridge/` directories exist in the repository; `sim
 | Real game, via the bridge and the harness mod | Final authority | Slow |
 
 The build script (`hivemind/rules/`) takes loot, recipes, tags and worldgen from the generator's output (mcmeta `1.21.1-data`), item properties from the item components and minecraft-data, and everything else from minecraft-data. Where sources overlap it cross-checks them and fails on any disagreement: recipes in both; stack sizes, durability and food; harvest tools against tool rules plus the `needs_*_tool` tags; tool speeds. Known differences in representation are listed in the build script, each with a reason. The exact upstream commits are pinned in `data/sources.json` (contracts section 1). The built `data/rules-1.21.1.json` is committed, so the project builds offline.
+
+**Checked against the real game** (owner's PC, 2026-10-19; `bridge/server/servertool.py check-generator` on the vanilla 1.21.1 data generator run with `--reports`). The generator's output agrees with the rules on every loot table (1,082), recipe (1,290: ids, results, cooking time, experience), block and item tag (331, resolved), block state range (1,060 blocks), item stack size, durability and food (1,333 items), and protocol id (2,523 blocks, items and entity types). The last check confirms that the entity ids, taken from minecraft-data's 1.20.5 files, are right for 1.21.1. Its 3,894 data files equal mcmeta's except four flat-world presets, which list `structure_overrides` (a set of structure sets) in another order; the check now compares that list as a set and reports the four as tolerated.
 
 ### 4.2 Exact, approximate, skipped
 
@@ -954,6 +956,14 @@ Python conductor (asyncio) ── TCP, u32 length + msgpack ── Node hosts ×
 ### 11.2 Server config (frozen at M0, before any measurement)
 
 Every statistic (spawns, ore exposure, furnace timing, despawns) is measured under this exact config. Any change means measuring again.
+
+**Verified on the owner's PC** (2026-10-19, instance `inst-0`, first start and clean stop):
+- `server.properties`: all 61 frozen keys as rendered; the server rewrote the file but added or removed no key, so the template's key list is right for 1.21.1.
+- Gamerules: all 51 rules and the difficulty read back over RCON on a fresh world (52 checks, no difference), so the vanilla defaults in `bridge/server/gamerule-defaults-1.21.1.json`, written from memory, are confirmed.
+- Carpet's `antiCheatDisabled` is false and the tick target is 20 TPS.
+- The game and RCON ports listen on 127.0.0.1 only, and the firewall block rules of `bridge/server/README.md` section 5 are in place.
+- Pins (`bridge/server/mods-1.21.1.json`): Java Eclipse Temurin 21.0.12.1; Mojang's 1.21.1 server jar (SHA-1 `59353fb4…`, as Mojang publishes it); Fabric loader 0.19.5 with installer 1.1.2; Lithium 0.15.4; Carpet 1.4.147; Chunky 1.4.23, which needs Fabric API 0.116.17+1.21.1. Only the harness mod (M2) is still unpinned.
+- The Fabric launcher keeps the vanilla jar in `.fabric/server/1.21.1-server.jar`, not in the instance folder, and that is where the pins point.
 
 | Setting | Value | Why |
 |---|---|---|

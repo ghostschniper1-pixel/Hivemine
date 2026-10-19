@@ -82,8 +82,18 @@ def test_gamerule_defaults_cover_every_rule() -> None:
     assert proposed and set(proposed) <= set(defaults)
     assert set(table["bridge_depends_on"]) <= set(defaults)
     want = st.expected_gamerules("none")
-    assert want["showDeathMessages"] == ("true", "vanilla default [mem]")
+    # Verified on a fresh 1.21.1 world on the owner's PC (2026-10-19), so no longer labelled [mem].
+    assert table["defaults_verified"] == "2026-10-19"
+    assert want["showDeathMessages"] == ("true", "vanilla default, verified 2026-10-19")
     assert want["keepInventory"] == ("false", "frozen")
+
+
+def test_unverified_defaults_are_labelled_mem(tmp_path: Path) -> None:
+    table = json.loads(st.GAMERULE_DEFAULTS.read_text("utf-8"))
+    table["defaults_verified"] = None
+    path = tmp_path / "defaults.json"
+    path.write_text(json.dumps(table), encoding="utf-8")
+    assert st.defaults_origin(path) == "vanilla default [mem]"
 
 
 @pytest.mark.skipif(not LANGUAGE.exists(), reason="data/sources/ not fetched")
@@ -241,12 +251,26 @@ def test_check_mods_passes_when_everything_is_pinned(tmp_path: Path, instance: t
     assert check_mods(tmp_path, *instance) == 0
 
 
-def test_shipped_pins_are_not_frozen(tmp_path: Path, instance: tuple[Path, dict],
-                                     capsys: pytest.CaptureFixture) -> None:
+def test_shipped_pins_wait_only_for_the_harness_mod(tmp_path: Path, instance: tuple[Path, dict],
+                                                    capsys: pytest.CaptureFixture) -> None:
+    """Pinned on the owner's PC on 2026-10-19; only the harness mod (M2) is still TODO."""
     inst, _ = instance
     assert st.main(["check-mods", "--dir", str(inst)]) == 1
-    out = capsys.readouterr().out
-    assert "NOT FROZEN" in out and "server_jar.sha256" in out and "java.version" in out
+    not_frozen = [line for line in capsys.readouterr().out.splitlines() if "NOT FROZEN" in line]
+    assert len(not_frozen) == 1
+    todo = not_frozen[0].split(": ", 2)[-1].split(", ")
+    assert todo == ["mods.hivemind-harness.version", "mods.hivemind-harness.sha256"]
+
+
+def test_shipped_pins_are_well_formed() -> None:
+    pins = json.loads((st.HERE / "mods-1.21.1.json").read_text("utf-8"))
+    assert re.fullmatch(r'openjdk version "21\.[0-9.]+" \S+ LTS', pins["java"]["version"])
+    assert re.fullmatch(r"[0-9a-f]{40}", pins["server_jar"]["sha1"])
+    hashes = [pins["server_jar"]["sha256"], pins["loader"]["launcher_sha256"]]
+    hashes += [m["sha256"] for m in pins["mods"] if m["name"] != "hivemind-harness"]
+    assert all(re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes)
+    assert len(set(hashes)) == len(hashes)
+    assert pins["loader"]["launcher_file"].startswith(f"fabric-server-mc.1.21.1-loader.{pins['loader']['version']}-")
 
 
 @pytest.mark.parametrize("field", [
@@ -515,6 +539,51 @@ def test_check_generator_catches_each_changed_value(generated: tuple[Path, Path,
     out = capsys.readouterr().out
     # Generator data changes also differ from the mcmeta copy, so one or two checks fail.
     assert out.count("FAIL ") >= 2 and out.rstrip().splitlines()[-1].startswith("FAIL generator cross-check")
+
+
+FLAT_PRESET = {"display": "minecraft:sand", "settings": {
+    "biome": "minecraft:desert", "features": True, "lakes": False,
+    "layers": [{"block": "minecraft:bedrock", "height": 1}, {"block": "minecraft:sand", "height": 8}],
+    "structure_overrides": ["minecraft:desert_pyramids", "minecraft:mineshafts", "minecraft:villages"]}}
+FLAT_REL = "data/minecraft/worldgen/flat_level_generator_preset/desert.json"
+
+
+def _flat_presets(gen: Path, mcmeta: Path, change) -> None:
+    """The generator's copy of a flat preset changed by `change`; mcmeta keeps the original."""
+    mine = json.loads(json.dumps(FLAT_PRESET))
+    change(mine["settings"])
+    _write(gen / FLAT_REL, mine)
+    _write(mcmeta / FLAT_REL, FLAT_PRESET)
+
+
+def test_set_order_in_flat_presets_is_tolerated_and_reported(generated: tuple[Path, Path, Path],
+                                                            capsys: pytest.CaptureFixture) -> None:
+    """Seen on the owner's PC: the generator lists structure_overrides in another order than mcmeta."""
+    gen, mcmeta, rules = generated
+    _flat_presets(gen, mcmeta, lambda s: s["structure_overrides"].reverse())
+    assert check_generator(gen, mcmeta, rules) == 0
+    out = capsys.readouterr().out
+    assert "1 tolerated" in out and "flat_level_generator_preset/desert.json: same up to the order" in out
+
+
+@pytest.mark.parametrize("change", ["layer order", "structure set"])
+def test_other_flat_preset_differences_still_fail(generated: tuple[Path, Path, Path], change: str,
+                                                  capsys: pytest.CaptureFixture) -> None:
+    gen, mcmeta, rules = generated
+    if change == "layer order":  # the order of layers is the terrain: never tolerated
+        _flat_presets(gen, mcmeta, lambda s: s["layers"].reverse())
+    else:  # a different set, not a reordering
+        _flat_presets(gen, mcmeta, lambda s: s["structure_overrides"].pop())
+    assert check_generator(gen, mcmeta, rules) == 1
+    assert "flat_level_generator_preset/desert.json differs" in capsys.readouterr().out
+
+
+def test_set_order_is_tolerated_only_where_listed(generated: tuple[Path, Path, Path]) -> None:
+    gen, mcmeta, rules = generated
+    rel = "data/minecraft/worldgen/placed_feature/ore_iron_upper.json"
+    _write(mcmeta / rel, {"feature": "minecraft:ore_iron", "placement": ["a", "b"]})
+    _write(gen / rel, {"feature": "minecraft:ore_iron", "placement": ["b", "a"]})
+    assert check_generator(gen, mcmeta, rules) == 1
 
 
 def test_missing_reports_make_the_run_incomplete(generated: tuple[Path, Path, Path],

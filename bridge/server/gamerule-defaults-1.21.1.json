@@ -1,9 +1,9 @@
 {
   "game_version": "1.21.1",
-  "note": "Every gamerule of Java Edition 1.21.1 with its vanilla default. `servertool.py check-gamerules` reads all of them back over RCON and expects these values, with the active lines of gamerules-1.21.1.mcfunction (and a control) applied on top, so that 'everything else stays at the vanilla default' is checked, not assumed. NAMES and TYPES are checked: they are the 51 children of the `gamerule` command in misode/mcmeta 1.21.1-summary (commit 7cffbcdad5fa36f22acef6bd4b869ecad4ca3fd9, commands/data.json), with parser brigadier:bool or brigadier:integer. The pinned language.json also has gamerule.entitiesWithPassengersCanUsePortals, which is not in that command tree, so it is not listed. DEFAULT VALUES are from memory [mem] (minecraft.wiki and Mojang were not reachable on 2026-10-16). On the first fresh 1.21.1 world, run check-gamerules before changing anything else: a DIFF on a rule that is not frozen means the value here is wrong. Fix it, set defaults_verified to the date and commit.",
+  "note": "Every gamerule of Java Edition 1.21.1 with its vanilla default. `servertool.py check-gamerules` reads all of them back over RCON and expects these values, with the active lines of gamerules-1.21.1.mcfunction (and a control) applied on top, so that 'everything else stays at the vanilla default' is checked, not assumed. NAMES and TYPES are checked: they are the 51 children of the `gamerule` command in misode/mcmeta 1.21.1-summary (commit 7cffbcdad5fa36f22acef6bd4b869ecad4ca3fd9, commands/data.json), with parser brigadier:bool or brigadier:integer. The pinned language.json also has gamerule.entitiesWithPassengersCanUsePortals, which is not in that command tree, so it is not listed. DEFAULT VALUES were written from memory on 2026-10-16 and VERIFIED on 2026-10-19 on the owner's PC: check-gamerules on a fresh 1.21.1 world (Fabric 0.19.5, the pins in mods-1.21.1.json) read all 51 rules and the difficulty back with 52 checks and no difference. If a later check shows a DIFF on a rule that is not frozen, the world was changed.",
   "names_source": "misode/mcmeta 1.21.1-summary 7cffbcdad5fa36f22acef6bd4b869ecad4ca3fd9 commands/data.json",
-  "defaults_source": "[mem]",
-  "defaults_verified": null,
+  "defaults_source": "verified on a fresh 1.21.1 world, owner's PC, 2026-10-19 (check-gamerules: 52 checks PASS)",
+  "defaults_verified": "2026-10-19",
   "rules": {
     "announceAdvancements": true,
     "blockExplosionDropDecay": true,
