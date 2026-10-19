@@ -25,15 +25,13 @@ Each is written into DESIGN.md with its reason; the decision numbers are in DESI
 - **Chests (D21).** `store` and `take` are in the vocabulary now, switched on at the team stage (M9).
 - **LLM later, as one AI (D20, D22, D23).** Inert LLM ports and a shared goal section are reserved now. Coupling an LLM is milestone M11, kept last so that training starts sooner.
 - **Surface-only vision (D15).** The agent sees only blocks in its line of sight. X-ray exists only as a labelled ablation and is never used for agents that are evaluated or deployed.
-- **Two network sizes (D24).** S (about 5M parameters) and M (about 25–30M, the default), compared at equal wall-clock time at M5.
+- **Two network sizes (D24).** S (about 5M parameters) and M (about 25–30M, the default), compared at equal wall-clock time at M5. On 2026-10-19 the owner accepted M's estimated cost: about 150 MFLOP per decision, and about 10 weeks of machine time for the team plan.
+- **No panorama in S (D25).** Confirmed on 2026-10-19: S stays the lean baseline.
 - **The other inputs.** M gets a 360-degree semantic panorama (D25). Both sizes get the debug-screen (F3) facts (D26) and biomes.
 - **Models.** Use Claude Opus 5.5 for work and tests, not Claude Fable 5.1 unless absolutely needed.
 - **Own server only.** Agents play only on the owner's firewalled server (DESIGN.md 11.6).
 
-**Open questions for the owner.**
-1. Keep the panorama out of S? The cloud session recommends yes: S stays the lean baseline.
-2. Accept M's cost? It is about 150 MFLOP per decision and about 10 weeks of machine time for the team plan, against 8–9 estimated. The cloud session recommends accepting it, because the S-versus-M comparison at M5 decides anyway.
-3. Two proposed gamerules must be settled before the M3 measurements: `doWeatherCycle false` and `spawnChunkRadius 0` (`bridge/server/gamerules-1.21.1.mcfunction`).
+**Open question for the owner.** Two proposed gamerules must be settled before the M3 measurements: `doWeatherCycle false` (the simulator has no rain) and `spawnChunkRadius 0` (otherwise spawn chunks tick with no agent nearby, unlike the simulator). They are in `bridge/server/gamerules-1.21.1.mcfunction`.
 
 ## 3. Status by milestone
 
